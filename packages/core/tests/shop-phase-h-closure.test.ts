@@ -558,6 +558,211 @@ describe("Round 2: 商館で返せない購入を、返金キューへ出さな�
   });
 });
 
+describe("Round 3: 金銭の決着が終わるまで、期限では失効させない", () => {
+  /** 代替支払 + provenance。商館では返せないが、決着はまだ終わっていない */
+  function altPaid(ctx: Ctx, userId = "u-alt3"): number {
+    const id = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,paid_alt_kind,paid_alt_amount,status,delivery_state,delivery_snapshot_json)
+         VALUES (?,?,1,0,'invite',5,'active','pending',?) RETURNING id`,
+      )
+      .pluck()
+      .get(
+        ctx.item.id,
+        userId,
+        JSON.stringify({ delivery: "auto", delivery_kind: "add_role", delivery_data: { role_id: ROLE } }),
+      ) as number;
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_purchase_fulfillment_provenance (purchase_id,delivery_mode,stock_consumed,captured_at,source)
+         VALUES (?, 'auto', 0, 1, 'storefront')`,
+      )
+      .run(id);
+    return id;
+  }
+  const overdue = (ctx: Ctx, id: number) => ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(id);
+  const inHandoff = (ctx: Ctx, id: number) => ctx.shop.listRefundHandoffs({ limit: 500 }).some((r) => r.purchaseId === id);
+
+  it("Scenario A — land の返金復旧は、期限が来ても失効しない（既存契約）", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    overdue(ctx, p.id);
+
+    expect(queues(ctx, p.id).refund).toBe(true);
+    expect(ctx.shop.expireIfDue(p.id, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
+
+    // 返金が終わってはじめて終端へ進める
+    const quote = ctx.shop.quoteRefundRetry(p.id);
+    expect(ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: quote.token, actor: STAFF }).refunded).toBe(true);
+    expect(ctx.shop.getPurchase(p.id)!.status).toBe("refunded");
+    ctx.db.close();
+  });
+
+  it("Scenario B — 商館では返せない購入も、期限では失効させない（今回の本体）", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+    overdue(ctx, id);
+
+    // 商館の仕事ではないが、運営への引き継ぎには出ている
+    expect(queues(ctx, id).refund).toBe(false);
+    expect(inHandoff(ctx, id)).toBe(true);
+
+    // **ここが修正点。** 「商館で返せない」を「決着が済んだ」と読み替えない
+    expect(ctx.shop.expireIfDue(id, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    expect(ctx.shop.expireOverdue(STAFF).expired.map((r) => r.id)).not.toContain(id);
+    expect(ctx.shop.getPurchase(id)!.status).toBe("active");
+    // 引き継ぎ一覧から消えない（消えると誰も気づけないまま未返金が残る）
+    expect(inHandoff(ctx, id)).toBe(true);
+    ctx.db.close();
+  });
+
+  it("Scenario C — claim → 解放 → 引き継ぎ → 失効も止まったまま", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    const claim = ctx.shop.claimExternalDelivery({ purchaseId: id, deliveryKind: "add_role", actor: "system" }) as {
+      token: string;
+    };
+    ctx.shop.markExternalDeliveryUncertain({ purchaseId: id, token: claim.token, reason: "x", actor: "system" });
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+    overdue(ctx, id);
+
+    // 1〜5: claim が守っている
+    expect(ctx.shop.expireIfDue(id, STAFF)).toEqual({ expired: false, reason: "delivery_in_flight" });
+    expect(inHandoff(ctx, id)).toBe(false);
+
+    // 6〜7: claim を解放すると引き継ぎへ現れる
+    ctx.shop.releaseExternalDelivery({ purchaseId: id, token: claim.token, reason: "operator", actor: STAFF });
+    expect(inHandoff(ctx, id)).toBe(true);
+
+    // 8〜11: 守りが claim から金銭決着へ**切れ目なく**引き継がれる
+    expect(ctx.shop.expireIfDue(id, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    expect(ctx.shop.getPurchase(id)!.status).toBe("active");
+    expect(inHandoff(ctx, id)).toBe(true);
+    expect(queues(ctx, id).refund).toBe(false);
+    ctx.db.close();
+  });
+
+  it("Scenario D — 守られた行で LIMIT を埋めず、通常の期限切れへ到達する", () => {
+    const ctx = setup();
+    // 古い順に: 代替支払の引き継ぎ / land の返金復旧 / 普通の期限切れ
+    const alt = altPaid(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: alt, amount: 0, reason: "delivery_failed", actor: "system" });
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(alt);
+
+    const land = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: land.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=2 WHERE id=?").run(land.id);
+
+    const plain = buy(ctx, "u-plain3").id;
+    ctx.shop.beginDelivery(plain);
+    ctx.shop.markDeliverySucceeded(plain, "system:test");
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=3 WHERE id=?").run(plain);
+
+    const result = ctx.shop.expireOverdue(STAFF);
+
+    // 守られた2件は候補を占有せず、後ろの普通の期限切れへ到達している
+    expect(result.expired.map((r) => r.id)).toEqual([plain]);
+    expect(ctx.shop.getPurchase(alt)!.status).toBe("active");
+    expect(ctx.shop.getPurchase(land.id)!.status).toBe("active");
+    expect(ctx.shop.getPurchase(plain)!.status).toBe("expired");
+    // 候補選択と最終判断が同じ理由で止める
+    expect(ctx.shop.expireIfDue(alt, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    expect(ctx.shop.expireIfDue(land.id, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    ctx.db.close();
+  });
+
+  it("Scenario D2 — 守られた行が200件あっても、後ろの期限切れへ到達する", () => {
+    const ctx = setup();
+    // **候補選択が LIMIT 前に除外していないと、ここで枠が埋まって後続へ届かない。**
+    // 最終判断（expireIfDue）だけを直しても starvation は消えない
+    const guarded: number[] = [];
+    for (let i = 0; i < 200; i += 1) {
+      const id = ctx.db
+        .prepare(
+          `INSERT INTO shop_purchases (item_id,user_id,purchased_at,expires_at,paid_land,paid_alt_kind,paid_alt_amount,status,delivery_state,delivery_snapshot_json)
+           VALUES (?,?,?,?,0,'invite',5,'active','pending',?) RETURNING id`,
+        )
+        .pluck()
+        .get(
+          ctx.item.id,
+          `u-starve-${i}`,
+          i + 1,
+          i + 1,
+          JSON.stringify({ delivery: "auto", delivery_kind: "add_role", delivery_data: { role_id: ROLE } }),
+        ) as number;
+      ctx.db
+        .prepare(
+          `INSERT INTO shop_purchase_fulfillment_provenance (purchase_id,delivery_mode,stock_consumed,captured_at,source)
+           VALUES (?, 'auto', 0, 1, 'storefront')`,
+        )
+        .run(id);
+      ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+      guarded.push(id);
+    }
+    expect(ctx.shop.countRefundHandoffs()).toBe(200);
+
+    // 後ろに普通の期限切れを1件置く
+    const plain = buy(ctx, "u-starve-plain").id;
+    ctx.shop.beginDelivery(plain);
+    ctx.shop.markDeliverySucceeded(plain, "system:test");
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=? WHERE id=?").run(100_000, plain);
+
+    const result = ctx.shop.expireOverdue(STAFF);
+
+    expect(result.expired.map((r) => r.id)).toContain(plain);
+    for (const id of guarded) expect(ctx.shop.getPurchase(id)!.status).toBe("active");
+    // 引き継ぎ一覧も減らない
+    expect(ctx.shop.countRefundHandoffs()).toBe(200);
+    ctx.db.close();
+  });
+
+  it("Scenario E — 決着が終われば保護は外れる（履歴があっても永久には守らない）", () => {
+    const ctx = setup();
+    // (1) 返金で決着 → 終端なので保護対象外
+    const refunded = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: refunded.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    const quote = ctx.shop.quoteRefundRetry(refunded.id);
+    ctx.shop.retryRefund({ purchaseId: refunded.id, expectedToken: quote.token, actor: STAFF });
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(refunded.id);
+    expect(ctx.shop.expireIfDue(refunded.id, STAFF)).toEqual({ expired: false, reason: "not_active" });
+
+    // (2) あとから提供が成功した → 返す理由が無いので普通に失効できる
+    const delivered = buy(ctx, "u-e2");
+    ctx.shop.recordRefundFailure({ purchaseId: delivered.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    ctx.shop.beginDelivery(delivered.id);
+    ctx.shop.markDeliverySucceeded(delivered.id, "system:test");
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(delivered.id);
+
+    expect(ctx.shop.expireIfDue(delivered.id, STAFF)).toEqual({ expired: true, reason: "expired" });
+    expect(ctx.shop.getPurchase(delivered.id)!.status).toBe("expired");
+    // 履歴そのものは消えない
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(delivered.id)).toBe(
+      1,
+    );
+    ctx.db.close();
+  });
+
+  it("3つの意味を取り違えない — 履歴 ≠ 商館の仕事 ≠ 決着が未了", () => {
+    const ctx = setup();
+    const alt = altPaid(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: alt, amount: 0, reason: "delivery_failed", actor: "system" });
+
+    // 履歴はある
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(alt)).toBe(1);
+    // 商館の仕事ではない
+    expect(queues(ctx, alt).refund).toBe(false);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    // **しかし決着は終わっていない**——だから失効させない、運営へ渡す
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(alt);
+    expect(ctx.shop.expireIfDue(alt, STAFF)).toEqual({ expired: false, reason: "refund_pending" });
+    expect(ctx.shop.countRefundHandoffs()).toBe(1);
+    ctx.db.close();
+  });
+});
+
 describe("Hardening 3: 「提供済みなので返さない」を失敗として記録しない", () => {
   it("提供済みの購入への古い返金やり直しは、1つも書かずに拒む", () => {
     const ctx = setup();

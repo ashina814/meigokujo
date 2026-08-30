@@ -3567,7 +3567,10 @@ export class Shop {
       throw new ShopError("ERR_CLAIM_STALE", { purchaseId: input.purchaseId });
     }
     if (purchase.status === "refunded") return { refunded: true, amount: purchase.paid_land ?? 0 };
-    if (this.refundFailureOpen(input.purchaseId)) {
+    // **「収束したか」であって「商館が返せるか」ではない。** 代替支払の購入も、
+    // 決着が義務を記録した時点で収束している。商館の予約語で見ると「収束していない」
+    // ことになり、説明できない状態として弾いてしまう。
+    if (this.refundSettlementPending(input.purchaseId)) {
       return { failed: true, code: "ERR_REFUND_PENDING", message: "refund obligation already recorded" };
     }
     // 閉じた claim なのに、決着もされていない。何が起きたか説明できないので書かない
@@ -3634,29 +3637,52 @@ export class Shop {
     return purchase.paid_alt_kind === null && purchase.paid_alt_amount === null;
   }
 
-  private static refundFailureSql(): string {
-    // **提供済みなら「返金の未完了」ではない。** `delivery_state` だけを見ると、
-    // 正常に提供できた購入（active + delivered）が返金待ちとして残り続ける。
-    // 提供済みの判定は既存の authoritative evidence をそのまま使う。
-    //
-    // **生きている claim が守っている間も出さない。** claim がある購入への返金は
-    // `ERR_DELIVERY_IN_FLIGHT` で必ず拒まれるので、キューに出すと「押しても必ず
-    // 失敗するボタン」になり、押すたびに失敗記録だけが積まれる。確認待ちの件数と
-    // 二重に数えることにもなる。claim が解ければ、そのまま復旧キューへ現れる。
-    // 失効はこの間 claim 側の guard が止めるので、守りに切れ目はできない。
+  /**
+   * **利用者への金銭的な決着がまだ終わっていない購入。**
+   *
+   * ここに当てはまる間は、**期限が来ても `expired` へ動かしてはいけない**。
+   * `refund()` は active からしか動けないので、失効させると復旧導線そのものが消える。
+   *
+   * **「商館で返せるか」は条件にしない。** 代替支払のように商館の generic refund が
+   * 扱えない購入でも、利用者から見れば「払ったのに何も受け取れていない」ことは同じで、
+   * 決着が終わっていないという事実は変わらない。誰が処理するかと、
+   * 決着が済んだかどうかは別の問いなので、authority も分ける。
+   *
+   * live claim は `expireIfDue()` 側の `delivery_in_flight` guard が先に止めるので、
+   * ここでは見ない（claim が解ければそのままこちらの保護へ引き継がれる）。
+   */
+  private static refundSettlementPendingSql(): string {
     return `p.status = 'active'
       AND p.delivered_at IS NULL
       AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
+      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+  }
+
+  /** 上と同じ判定を1件へ。失効の guard と候補選択が同じ意味を使う */
+  private refundSettlementPending(purchaseId: number): boolean {
+    return (
+      this.db
+        .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundSettlementPendingSql()} LIMIT 1`)
+        .get(purchaseId) !== undefined
+    );
+  }
+
+  /**
+   * **商館スタッフが「返金をやり直す」で終わらせられる購入。**
+   *
+   * 金銭の決着が未了（`refundSettlementPendingSql()`）のうち、
+   *   - 生きている claim が無い … claim 中の返金は必ず `ERR_DELIVERY_IN_FLIGHT` で拒まれる
+   *   - 商館の generic refund で戻せる支払い … 代替支払は必ず拒まれる
+   * ものだけ。どちらも「押しても絶対に成功しないボタン」を作らないための条件で、
+   * **決着が済んだかどうかとは関係がない**。外れたものは §handoff 側で人へ渡す。
+   */
+  private static refundFailureSql(): string {
+    return `${Shop.refundSettlementPendingSql()}
       AND NOT EXISTS (
         SELECT 1 FROM shop_external_delivery_attempts a
          WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
       )
-      -- **商館で返せない支払いは、商館の仕事にしない。** 代替支払を含む購入は
-      -- generic refund が必ず ERR_ALT_REFUND_UNSUPPORTED で拒むので、キューへ出すと
-      -- 「押しても絶対に成功しないボタン」になり、押すたびに失敗記録だけが積まれる。
-      -- 履歴は消さず、refundHandoffSql() の方（運営判断が必要）で発見できるようにする。
-      AND ${Shop.genericRefundSupportedSql()}
-      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+      AND ${Shop.genericRefundSupportedSql()}`;
   }
 
   /**
@@ -3670,15 +3696,12 @@ export class Shop {
    * こちらは「返す先の資源を generic refund が知らない」。
    */
   private static refundHandoffSql(): string {
-    return `p.status = 'active'
-      AND p.delivered_at IS NULL
-      AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
+    return `${Shop.refundSettlementPendingSql()}
       AND NOT EXISTS (
         SELECT 1 FROM shop_external_delivery_attempts a
          WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
       )
-      AND NOT ${Shop.genericRefundSupportedSql()}
-      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+      AND NOT ${Shop.genericRefundSupportedSql()}`;
   }
 
   /** 商館では返せない返金案件。運営へ渡すために出す */
@@ -4692,12 +4715,14 @@ export class Shop {
     // 除外条件は `expireIfDue()` が使うものと**同じ関数から作る**。
     // 「返金失敗の履歴が1件でもあるか」を手書きすると意味がズレる——提供が後から
     // 成功して義務が閉じた購入まで永久に候補から外れ、失効も剥奪判断も進まなくなる。
+    // **商館の予約語（`refundFailureSql()`）ではなく金銭決着の方**を使う。前者は
+    // 「商館が返せるか」なので、代替支払の購入が候補に入って失効してしまう。
     const due = this.db
       .prepare(
         `SELECT p.id FROM shop_purchases p
           WHERE p.status = 'active' AND p.expires_at IS NOT NULL AND p.expires_at <= ?
             AND NOT ${Shop.externalDeliveryLiveSql()}
-            AND NOT (${Shop.refundFailureSql()})
+            AND NOT (${Shop.refundSettlementPendingSql()})
           ORDER BY p.expires_at
           LIMIT ?`,
       )
@@ -4752,12 +4777,17 @@ export class Shop {
       if (this.externalDeliveryInFlight(purchaseId)) {
         return { expired: false, reason: "delivery_in_flight" };
       }
-      // **返すべき金がまだ戻っていない購入を失効させない。**
+      // **金銭の決着が終わっていない購入を失効させない。**
       //
       // `refund()` は active からしか refunded へ動けない。ここで expired にすると、
       // 返金の未完了が一覧から消えるだけでなく**復旧そのものが不可能**になる。
       // 期限より先に「利用者の金を返す」を終わらせる。
-      if (this.refundFailureOpen(purchaseId)) {
+      //
+      // **見るのは「商館で返せるか」ではなく「決着が済んだか」。** 商館の
+      // `refundFailureOpen()` を使うと、代替支払のように商館では返せない購入が
+      // 「商館の仕事ではない」という理由だけで失効し、運営への引き継ぎ一覧
+      // （`status='active'` を要求する）からも消える——未返金のまま導線が全部消える。
+      if (this.refundSettlementPending(purchaseId)) {
         return { expired: false, reason: "refund_pending" };
       }
 
