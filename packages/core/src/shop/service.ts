@@ -345,6 +345,28 @@ export interface OperatorResolutionRow {
 }
 
 /**
+ * **Bot自身が外部効果の成立を独立に確認できた**証拠の出所。
+ *
+ * 名前は「どうやって確かめたか」を表す。増やすときは、その手順が
+ * **返金拒否という不可逆判断に耐えられるか**を先に問うこと。
+ *
+ * - `timed_access_role_added_and_refetched`
+ *   … 期限つきアクセスの巡回が「ロールが無いことを確認 → 自分で付与 →
+ *     force refetch で在席を再確認 → 失効競合を通過 → 帰属が一意」まで到達した
+ */
+export type VerifiedDeliveryEvidenceSource = "timed_access_role_added_and_refetched";
+
+export interface VerifiedDeliveryEvidenceRow {
+  id: number;
+  purchase_id: number;
+  source: VerifiedDeliveryEvidenceSource;
+  writer: string;
+  effect_target: string | null;
+  detail: string | null;
+  observed_at: number;
+}
+
+/**
  * 決着画面を開いた時点の事実と、選べる決着。
  *
  * `token` は**その時点の事実の指紋**。確定時に作り直して一致しなければ、
@@ -459,10 +481,15 @@ export interface ShopSafetySnapshot {
   };
   /** 提供したかどうか。`evidence` が authoritative で、`state` は経過にすぎない */
   fulfillment: {
+    /** 工程の状態。**証拠ではない**（旧行は移行時の推測値） */
     state: string | null;
     deliveredAt: number | null;
+    /** 提供済みと言えるか（正本） */
     evidence: boolean;
+    /** そのうち「Botが外部効果の成立を独立に確認した」記録があるか */
+    verifiedExternal: boolean;
     provenance: boolean;
+    /** 剥奪対象。**`evidence` からは決まらない**（購入時の不変な証拠だけが決める） */
     roleGrant: RoleGrantTarget;
   };
   /** 外部へ投げた副作用の場所取り。生きている間は返金も失効も止まる */
@@ -2203,6 +2230,20 @@ export class Shop {
   )`;
 
   /**
+   * **Bot自身が外部効果の成立を独立に確認した**記録。
+   *
+   * 運営の確認（人）と対になる、writer 側の一次証拠。工程状態
+   * （`delivery_state`）が何であってもこれは別次元の事実なので、
+   * 移行の推測値に握り潰されない。
+   *
+   * 積んでよい条件は writer 側が持つ（`recordVerifiedDeliveryEvidence`）。
+   * ここは「積まれているか」だけを見る。
+   */
+  private static readonly VERIFIED_EXTERNAL_DELIVERY_SQL = `EXISTS (
+    SELECT 1 FROM shop_verified_delivery_evidence v WHERE v.purchase_id = p.id
+  )`;
+
+  /**
    * **「この購入は提供された」と言える証拠の正本。**
    *
    * 4つとも独立した durable evidence で、どれか1つあれば足りる。
@@ -2217,6 +2258,7 @@ export class Shop {
        WHERE f.purchase_id = p.id AND p.delivery_state = 'delivered'
     )
     OR ${Shop.OPERATOR_DELIVERED_SQL}
+    OR ${Shop.VERIFIED_EXTERNAL_DELIVERY_SQL}
   )`;
 
   /**
@@ -3232,6 +3274,101 @@ export class Shop {
 
 
   // ── 運営による決着（Phase H）────────────────────────────────────────────────
+
+  // ── Bot が独立に確認した外部配送の証拠（Phase I）──────────────────────────
+
+  /**
+   * **外部効果が実際に成立したことを、writer 自身が確認できた**という事実を積む。
+   *
+   * `completeDeliveryWith()` とは**別の operation**。あちらは「配送を実行して工程を
+   * 進める」ので二重実行を禁じる guard を持ち、`delivery_state='delivered'` の前で
+   * 早期 return する。旧購入ではその値が移行の推測でしかないため、
+   * **推測が本物の観測を握り潰す**（本番 #58）。こちらは工程を進めないので、
+   * その guard に依存しないし、依存してはいけない。
+   *
+   * ここでは:
+   *   - 外部副作用を1つも実行しない
+   *   - `delivery_state` を書き換えない
+   *   - `delivered_at` を捏造しない
+   *   - `shop_delivered`（配送完了処理が走った印）を捏造しない
+   *
+   * **`status='active'` のときだけ積む。** 返金・失効・取消が確定した購入へ後から
+   * 証拠を足すと、「終わった購入に提供済みの証拠」という矛盾を作る。積めなかった
+   * ことは失敗の証拠ではないので、呼び出し側は throw ではなく `false` を受け取る。
+   *
+   * 冪等。同じ `(purchase, source)` は何度呼んでも1行に収束する。
+   */
+  recordVerifiedDeliveryEvidence(input: {
+    purchaseId: number;
+    source: VerifiedDeliveryEvidenceSource;
+    writer: string;
+    /** 観測した効果の対象（ロールIDなど）。**剥奪対象の authority ではない** */
+    effectTarget?: string | null;
+    detail?: Record<string, unknown>;
+  }): boolean {
+    const run = (): boolean => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      if (purchase.status !== "active") return false;
+      const ts = now();
+      const changed = this.db
+        .prepare(
+          `INSERT INTO shop_verified_delivery_evidence
+             (purchase_id, source, writer, effect_target, detail, observed_at)
+           VALUES (?,?,?,?,?,?)
+           ON CONFLICT(purchase_id, source) DO NOTHING`,
+        )
+        .run(
+          input.purchaseId,
+          input.source,
+          input.writer,
+          input.effectTarget ?? null,
+          input.detail ? JSON.stringify(input.detail) : null,
+          ts,
+        ).changes;
+      // **実際に積まれた1回だけ**記録する。再試行のたびに event が増えると、
+      // 「何回確認したか」を事件録から数えられなくなる
+      if (changed !== 1) return false;
+      this.events.log("shop_delivery_evidence_recorded", {
+        actor: input.writer,
+        target: purchase.user_id,
+        payload: {
+          purchaseId: input.purchaseId,
+          source: input.source,
+          effectTarget: input.effectTarget ?? null,
+          ...(input.detail ?? {}),
+        },
+      });
+      return true;
+    };
+    return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+  }
+
+  /** この購入に積まれている、Bot が確認した外部配送の証拠（新しい順）。 */
+  verifiedDeliveryEvidence(purchaseId: number): VerifiedDeliveryEvidenceRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM shop_verified_delivery_evidence WHERE purchase_id = ? ORDER BY observed_at DESC, id DESC",
+      )
+      .all(purchaseId) as VerifiedDeliveryEvidenceRow[];
+  }
+
+  /**
+   * この (利用者, ロール) を与える有効な期限つき契約が、**この購入ただ1つ**か。
+   *
+   * ロールの付与は1回で、同じロールを与える契約が複数あると
+   * 「**どの購入の効果なのか**」が決まらない。あとから買った契約が、
+   * 既にあったロールへ相乗りしているだけかもしれない。
+   *
+   * 証拠は返金拒否という不可逆判断に使うので、**帰属が証明できないなら何も書かない**。
+   * 「証拠が無い」は「提供されていない」ではない——ただ言えることが無いだけ。
+   *
+   * 現在の商品設定は見ない。`listActiveTimedAccess()` と同じ authority を使う。
+   */
+  timedAccessAttributionUnique(purchaseId: number, userId: string, roleId: string): boolean {
+    const holders = this.listActiveTimedAccess(userId).filter((g) => g.roleId === roleId);
+    return holders.length === 1 && holders[0]!.purchase.id === purchaseId;
+  }
 
   /** 運営が「提供されていない」と確認した記録があるか。 */
   operatorConfirmedNoEffect(purchaseId: number): boolean {
@@ -5088,6 +5225,7 @@ export class Shop {
         state: purchase.delivery_state ?? null,
         deliveredAt: purchase.delivered_at,
         evidence,
+        verifiedExternal: this.verifiedDeliveryEvidence(purchaseId).length > 0,
         provenance: this.fulfillmentProvenance(purchaseId) !== undefined,
         roleGrant: this.roleGrantTarget(purchase),
       },
