@@ -85,13 +85,24 @@ describe("A. 返金の復旧待ちは「履歴があること」ではない", (
     const ctx = setup();
     const p = buy(ctx);
     ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
-    expect(snap(ctx, p.id).refund).toEqual({ recoveryOpen: true, failureHistory: 1 });
+    expect(snap(ctx, p.id).refund).toEqual({
+      failureHistory: 1,
+      settlementPending: true,
+      recoveryOpen: true,
+      operationsHandoff: false,
+    });
 
     deliver(ctx, p.id);
 
     const after = snap(ctx, p.id);
     // 履歴は消えない（append-only）。復旧キューから外れるだけ
-    expect(after.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
+    // 提供が成功したので、決着そのものが終わっている（4つとも同時に閉じる）
+    expect(after.refund).toEqual({
+      failureHistory: 1,
+      settlementPending: false,
+      recoveryOpen: false,
+      operationsHandoff: false,
+    });
     expect(after.fulfillment.evidence).toBe(true);
     expect(ctx.shop.countRefundFailures()).toBe(0);
     expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(false);
@@ -177,6 +188,89 @@ describe("A2. 提供済みの証拠は、一覧と1件判定で同じ定義", ()
     // 与えた証拠が無いので剥奪キューへ載せない（与えていないものを取り上げない）
     expect(ctx.shop.pendingRoleRevocations().map((r) => r.purchase_id)).not.toContain(id);
     expect(snap(ctx, id).revocation.status).toBeNull();
+    ctx.db.close();
+  });
+});
+
+describe("A3. 返金の4つの意味を、1つの語へ潰さない", () => {
+  /** 代替支払 + provenance。商館では返せないが、決着は終わっていない */
+  function altPaid(ctx: Ctx, userId = "u-alt-sm"): number {
+    const id = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,paid_alt_kind,paid_alt_amount,status,delivery_state,delivery_snapshot_json)
+         VALUES (?,?,1,0,'invite',5,'active','pending',?) RETURNING id`,
+      )
+      .pluck()
+      .get(
+        ctx.item.id,
+        userId,
+        JSON.stringify({ delivery: "auto", delivery_kind: "add_role", delivery_data: { role_id: ROLE } }),
+      ) as number;
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_purchase_fulfillment_provenance (purchase_id,delivery_mode,stock_consumed,captured_at,source)
+         VALUES (?, 'auto', 0, 1, 'storefront')`,
+      )
+      .run(id);
+    return id;
+  }
+
+  it("代替支払: 商館では返せないが、決着は終わっていない", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+
+    const s = snap(ctx, id);
+    // **この4つが同時に成り立つのが正しい状態**
+    expect(s.refund).toEqual({
+      failureHistory: 1,
+      settlementPending: true,
+      recoveryOpen: false,
+      operationsHandoff: true,
+    });
+    // `recoveryOpen=false` を「決着が済んだ」と読まない——失効も止まる
+    expect(s.expiry.blockedBy).toBe("refund_pending");
+    expect(s.contradictions).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("land 払い: 商館の仕事になり、運営への引き継ぎには出ない", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+
+    expect(snap(ctx, p.id).refund).toEqual({
+      failureHistory: 1,
+      settlementPending: true,
+      recoveryOpen: true,
+      operationsHandoff: false,
+    });
+    expect(snap(ctx, p.id).expiry.blockedBy).toBe("refund_pending");
+    ctx.db.close();
+  });
+
+  it("live claim 中: 決着は未了だが、商館の仕事でも引き継ぎでもない", () => {
+    const ctx = setup();
+    const id = altPaid(ctx, "u-alt-sm2");
+    const token = claim(ctx, id);
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+
+    const s = snap(ctx, id);
+    expect(s.refund).toEqual({
+      failureHistory: 1,
+      settlementPending: true,
+      recoveryOpen: false,
+      operationsHandoff: false,
+    });
+    // claim 側の guard が先に効く
+    expect(s.expiry.blockedBy).toBe("delivery_in_flight");
+
+    // claim を解けば引き継ぎへ移り、守りは金銭決着へ切れ目なく引き継がれる
+    ctx.shop.releaseExternalDelivery({ purchaseId: id, token, reason: "operator", actor: STAFF });
+    const after = snap(ctx, id);
+    expect(after.refund.operationsHandoff).toBe(true);
+    expect(after.refund.settlementPending).toBe(true);
+    expect(after.expiry.blockedBy).toBe("refund_pending");
     ctx.db.close();
   });
 });
@@ -484,7 +578,13 @@ describe("矛盾は隠さず、直しもしない", () => {
       const s = snap(ctx, p.id);
       expect(s.contradictions).toContain(`terminal_with_refund_failure_history_without_delivery_evidence:${status}`);
       // **復旧キューには載らない。** それは「返す必要が無い」という意味ではない
-      expect(s.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
+      // terminal なので**どの導線にも載らない**。だが「返した」証明にはならない
+      expect(s.refund).toEqual({
+        failureHistory: 1,
+        settlementPending: false,
+        recoveryOpen: false,
+        operationsHandoff: false,
+      });
       expect(ctx.shop.countRefundFailures()).toBe(0);
       // 勝手に「返金済み」とも「未返金」とも書かない。台帳も購入も動かさない
       expect(ctx.shop.getPurchase(p.id)!.status).toBe(status);
@@ -502,7 +602,12 @@ describe("矛盾は隠さず、直しもしない", () => {
 
     const s = snap(ctx, p.id);
     expect(s.contract.status).toBe("refunded");
-    expect(s.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
+    expect(s.refund).toEqual({
+      failureHistory: 1,
+      settlementPending: false,
+      recoveryOpen: false,
+      operationsHandoff: false,
+    });
     expect(s.contradictions).toEqual([]);
     ctx.db.close();
   });
@@ -519,7 +624,12 @@ describe("矛盾は隠さず、直しもしない", () => {
     const s = snap(ctx, p.id);
     expect(s.contract.status).toBe("expired");
     expect(s.fulfillment.evidence).toBe(true);
-    expect(s.refund).toEqual({ recoveryOpen: false, failureHistory: 1 });
+    expect(s.refund).toEqual({
+      failureHistory: 1,
+      settlementPending: false,
+      recoveryOpen: false,
+      operationsHandoff: false,
+    });
     expect(s.contradictions).toEqual([]);
     ctx.db.close();
   });
@@ -530,7 +640,12 @@ describe("矛盾は隠さず、直しもしない", () => {
     ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
 
     const s = snap(ctx, p.id);
-    expect(s.refund).toEqual({ recoveryOpen: true, failureHistory: 1 });
+    expect(s.refund).toEqual({
+      failureHistory: 1,
+      settlementPending: true,
+      recoveryOpen: true,
+      operationsHandoff: false,
+    });
     expect(s.contradictions).toEqual([]);
     expect(ctx.shop.quoteRefundRetry(p.id).open).toBe(true);
     ctx.db.close();

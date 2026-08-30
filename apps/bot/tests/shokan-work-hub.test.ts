@@ -244,6 +244,49 @@ describe("仕事の入口は1つ", () => {
 });
 
 describe("商館で処理できない仕事を押し付けない", () => {
+  it("商館で返せない返金は、仕事に数えず・押せるボタンも出さず・運営へ渡すと分かる", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    // 代替支払を含む購入。generic refund では戻せないので、押せる操作を作らない
+    const id = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,paid_alt_kind,paid_alt_amount,status,delivery_state,delivery_snapshot_json)
+         VALUES (?,?,1,0,'invite',5,'active','pending',?) RETURNING id`,
+      )
+      .pluck()
+      .get(ctx.auto.id, USER, JSON.stringify({ delivery: "auto", delivery_kind: "add_role", delivery_data: { role_id: "r-vip" } })) as number;
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_purchase_fulfillment_provenance (purchase_id,delivery_mode,stock_consumed,captured_at,source)
+         VALUES (?, 'auto', 0, 1, 'storefront')`,
+      )
+      .run(id);
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+    expect(ctx.shop.countRefundHandoffs()).toBe(1);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+
+    // **仕事の件数には入らない**（商館スタッフには返せない）
+    const top = panelDesc(ctx, await shokanModule);
+    expect(top).toContain("対応が必要な仕事はありません");
+    // **しかしトップから存在は分かる**
+    expect(top).toContain("運営判断が必要: 1件");
+
+    const hub = vi.fn(async () => undefined);
+    await handleShokanButton(press("shokan:work", hub), ctx.services);
+    const f = fields(hub);
+    // 剥奪の話と混ぜない
+    expect(f).toContain("商館では返せない返金");
+    expect(f).toContain("利用者へ返せていない購入");
+    expect(f).toContain("運営へ");
+    // 押せば必ず失敗するボタンを出さない
+    const ids = (payload(hub)?.components ?? []).flatMap((r: any) => (r.components ?? []).map((c: any) => c.data?.custom_id ?? ""));
+    expect(ids.some((x: string) => x.startsWith("shokan:refund-open"))).toBe(false);
+    expect(ids.some((x: string) => x.startsWith("shokan:refund-pre"))).toBe(false);
+    // 内部のコード名は出さない
+    expect(f).not.toContain("ERR_ALT_REFUND_UNSUPPORTED");
+    ctx.db.close();
+  });
+
   it("剥奪の確認は仕事の件数に入れず、誰へ渡すかを書く", async () => {
     const { handleShokanButton } = await shokanModule;
     const ctx = setup();

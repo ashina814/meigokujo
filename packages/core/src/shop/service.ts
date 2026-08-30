@@ -365,6 +365,11 @@ export interface OperatorResolutionQuote {
   readonly refundableAmount: number;
   /** 返金まで一気に確定してよいか（代替支払など、generic refund が扱えないものは false） */
   readonly refundSupported: boolean;
+  /**
+   * 「提供できていない → もう一度配る」を出してよいか。
+   * **決着後に実際に配送やり直しキューへ載る購入だけ** true。
+   */
+  readonly retrySupported: boolean;
   readonly allowedDecisions: readonly OperatorDecision[];
   readonly token: string;
 }
@@ -463,14 +468,26 @@ export interface ShopSafetySnapshot {
   /** 外部へ投げた副作用の場所取り。生きている間は返金も失効も止まる */
   externalClaim: { token: string; state: "in_flight" | "uncertain"; startedAt: number } | null;
   /**
-   * 返金。**履歴があること**と**いま復旧待ちであること**を分けて持つ。
+   * 返金。**4つの別々の事実**を分けて持つ。1つの語へ潰さない。
    *
-   * `recoveryOpen` は「いま返金のやり直しキューに載っているか」であって、
-   * **「利用者へ返す義務が存在しない」ことの証明ではない**。terminal な購入では
-   * 常に false になるので、`false` を「返す必要が無い」と一般化してはいけない。
-   * 未返金が疑われる terminal 状態は `contradictions` 側で surface する。
+   * - `failureHistory` … 過去に返金処理が失敗した durable evidence（append-only）
+   * - `settlementPending` … 利用者への金銭決着が**まだ終わっていない**。
+   *   失効を止める authority はこれ。商館が処理できるかは問わない
+   * - `recoveryOpen` … **商館**が「返金をやり直す」で終わらせられる
+   *   （settlement pending ＋ live claim なし ＋ generic refund 可）
+   * - `operationsHandoff` … **運営**へ渡すしかない
+   *   （settlement pending ＋ live claim なし ＋ generic refund 不可）
+   *
+   * **`recoveryOpen === false` を「決着が済んだ」と読んではいけない。**
+   * 代替支払では `recoveryOpen=false` / `settlementPending=true` /
+   * `operationsHandoff=true` が正しい状態として同時に成り立つ。
    */
-  refund: { recoveryOpen: boolean; failureHistory: number };
+  refund: {
+    failureHistory: number;
+    settlementPending: boolean;
+    recoveryOpen: boolean;
+    operationsHandoff: boolean;
+  };
   /** 人が確認して決着させる案件かどうか */
   operatorCase: { unresolved: boolean; decided: "delivered" | "no_effect" | null };
   /** 期限。止まっているなら、その理由まで */
@@ -2772,7 +2789,7 @@ export class Shop {
       //
       // **提供状況より先に見る。** どちらも資産を動かさずに止めるが、こちらの方が
       // 理由として具体的（何で払ったかは提供状況と無関係に分かっている）。
-      if (purchase.paid_alt_kind !== null || purchase.paid_alt_amount !== null) {
+      if (!Shop.genericRefundSupportedRow(purchase)) {
         throw new ShopError("ERR_ALT_REFUND_UNSUPPORTED", { purchaseId });
       }
       // 「証拠が無い＝未提供」でもない。**不明は不明として止める。**
@@ -3241,8 +3258,10 @@ export class Shop {
     const item = this.getItem(purchase.item_id);
     const amount = purchase.paid_land ?? 0;
     // 代替支払を含む購入は generic refund の対象外（Phase C）。ここでも返金は出さない。
-    const refundSupported =
-      purchase.paid_alt_kind === null && purchase.paid_alt_amount === null && purchase.status === "active";
+    const refundSupported = Shop.genericRefundSupportedRow(purchase) && purchase.status === "active";
+    // **「もう一度配る」は、実際に配れるときだけ。** `delivery_kind` が読めることは
+    // 「配り直せる」の証明ではない（購入時 provenance が無い旧購入でも読める）。
+    const retrySupported = this.deliveryRetryEligible(purchaseId);
     // **決着済みには何も足せない。** UIがボタンを出さないことは authority ではないので、
     // ここで空にしたうえで確定側でも拒む。
     const allowed: OperatorDecision[] = kind === null ? [] : ["delivered", "no_effect", "still_unknown"];
@@ -3264,6 +3283,7 @@ export class Shop {
       stuckSince: claim?.started_at ?? purchase.purchased_at,
       refundableAmount: amount,
       refundSupported,
+      retrySupported,
       allowedDecisions: allowed,
       token: this.operatorResolutionToken(purchase, kind, claim),
     };
@@ -3649,7 +3669,10 @@ export class Shop {
       throw new ShopError("ERR_CLAIM_STALE", { purchaseId: input.purchaseId });
     }
     if (purchase.status === "refunded") return { refunded: true, amount: purchase.paid_land ?? 0 };
-    if (this.refundFailureOpen(input.purchaseId)) {
+    // **「収束したか」であって「商館が返せるか」ではない。** 代替支払の購入も、
+    // 決着が義務を記録した時点で収束している。商館の予約語で見ると「収束していない」
+    // ことになり、説明できない状態として弾いてしまう。
+    if (this.refundSettlementPending(input.purchaseId)) {
       return { failed: true, code: "ERR_REFUND_PENDING", message: "refund obligation already recorded" };
     }
     // 閉じた claim なのに、決着もされていない。何が起きたか説明できないので書かない
@@ -3719,19 +3742,129 @@ export class Shop {
    * `status = 'refunded'` だけ。terminal へ落ちたまま失敗履歴だけが残っている購入は、
    * `safetySnapshot().contradictions` が監査対象として surface する。
    */
-  private static refundFailureSql(): string {
-    // **提供済みなら復旧の対象ではない。** `delivery_state` だけを見ると、
-    // 正常に提供できた購入（active + delivered）がキューに残り続ける。
-    // 提供済みの判定は既存の authoritative evidence をそのまま使う。
+  /**
+   * **商館の generic refund で返せる支払いか。**
+   *
+   * `paid_alt_*` を含む購入は generic refund の対象外——何をどこへ戻すべきかを
+   * generic refund は知らないし、`paid_alt_*` は「実際にその資源が減った」証拠でもない。
+   * `refundWith()` の拒否条件と**同じ定義**を、一覧・件数・画面でも使う。
+   * `paid_land` の値から推測しない。
+   */
+  private static genericRefundSupportedSql(): string {
+    return "(p.paid_alt_kind IS NULL AND p.paid_alt_amount IS NULL)";
+  }
+
+  /** 上と同じ判定を1行へ当てる */
+  private static genericRefundSupportedRow(purchase: PurchaseRow): boolean {
+    return purchase.paid_alt_kind === null && purchase.paid_alt_amount === null;
+  }
+
+  /**
+   * **利用者への金銭的な決着がまだ終わっていない購入。**
+   *
+   * ここに当てはまる間は、**期限が来ても `expired` へ動かしてはいけない**。
+   * `refund()` は active からしか動けないので、失効させると復旧導線そのものが消える。
+   *
+   * **「商館で返せるか」は条件にしない。** 代替支払のように商館の generic refund が
+   * 扱えない購入でも、利用者から見れば「払ったのに何も受け取れていない」ことは同じで、
+   * 決着が終わっていないという事実は変わらない。誰が処理するかと、
+   * 決着が済んだかどうかは別の問いなので、authority も分ける。
+   *
+   * live claim は `expireIfDue()` 側の `delivery_in_flight` guard が先に止めるので、
+   * ここでは見ない（claim が解ければそのままこちらの保護へ引き継がれる）。
+   */
+  private static refundSettlementPendingSql(): string {
     return `p.status = 'active'
       AND p.delivered_at IS NULL
       AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
-      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+      AND ${Shop.refundFailureHistorySql()}`;
+  }
+
+  /** 上と同じ判定を1件へ。失効の guard と候補選択が同じ意味を使う */
+  private refundSettlementPending(purchaseId: number): boolean {
+    return (
+      this.db
+        .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundSettlementPendingSql()} LIMIT 1`)
+        .get(purchaseId) !== undefined
+    );
+  }
+
+  /**
+   * **商館スタッフが「返金をやり直す」で終わらせられる購入。**
+   *
+   * 金銭の決着が未了（`refundSettlementPendingSql()`）のうち、
+   *   - 生きている claim が無い … claim 中の返金は必ず `ERR_DELIVERY_IN_FLIGHT` で拒まれる
+   *   - 商館の generic refund で戻せる支払い … 代替支払は必ず拒まれる
+   * ものだけ。どちらも「押しても絶対に成功しないボタン」を作らないための条件で、
+   * **決着が済んだかどうかとは関係がない**。外れたものは §handoff 側で人へ渡す。
+   */
+  private static refundFailureSql(): string {
+    return `${Shop.refundSettlementPendingSql()}
+      AND NOT ${Shop.externalDeliveryLiveSql()}
+      AND ${Shop.genericRefundSupportedSql()}`;
+  }
+
+  /**
+   * **返すべき金が残っているが、商館では返せない購入。**
+   *
+   * 代替支払を含むので generic refund が扱えない。商館スタッフに処理 authority が
+   * 無いので「対応が必要な仕事」には数えないが、**黙って消さない**——誰も知らないまま
+   * 利用者の資産が戻らない、が最悪の結末なので、運営判断が必要な案件として出す。
+   *
+   * 剥奪の `blocked` とは別物。あちらは「与えたか証明できないので取り消せない」、
+   * こちらは「返す先の資源を generic refund が知らない」。
+   */
+  private static refundHandoffSql(): string {
+    return `${Shop.refundSettlementPendingSql()}
+      AND NOT ${Shop.externalDeliveryLiveSql()}
+      AND NOT ${Shop.genericRefundSupportedSql()}`;
+  }
+
+  /** 商館では返せない返金案件。運営へ渡すために出す */
+  listRefundHandoffs(opts: { limit?: number; offset?: number } = {}): Array<{
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    paidAltKind: string | null;
+    paidAltAmount: number | null;
+    paidLand: number | null;
+    failedAt: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT p.id AS purchaseId, p.user_id AS userId, i.name AS itemName,
+                p.paid_alt_kind AS paidAltKind, p.paid_alt_amount AS paidAltAmount, p.paid_land AS paidLand,
+                (SELECT MIN(f.failed_at) FROM shop_refund_failures f WHERE f.purchase_id = p.id) AS failedAt
+           FROM shop_purchases p
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.refundHandoffSql()}
+          ORDER BY failedAt ASC, p.id ASC
+          LIMIT ? OFFSET ?`,
+      )
+      .all(opts.limit ?? 25, Math.max(0, opts.offset ?? 0)) as Array<{
+      purchaseId: number;
+      userId: string;
+      itemName: string;
+      paidAltKind: string | null;
+      paidAltAmount: number | null;
+      paidLand: number | null;
+      failedAt: number;
+    }>;
+  }
+
+  countRefundHandoffs(): number {
+    return this.db
+      .prepare(`SELECT COUNT(*) FROM shop_purchases p WHERE ${Shop.refundHandoffSql()}`)
+      .pluck()
+      .get() as number;
   }
 
   /**
    * 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。
-   * 意味も同じ——「いま復旧キューに載るか」であって「返す義務が無い」ではない。
+   *
+   * 意味は「**いま商館が返金をやり直せるか**」。`false` は
+   * 「返す義務が無い」でも「金銭の決着が済んだ」でもない——代替支払や claim 保持中も
+   * `false` になる。失効を止めてよいかは `refundSettlementPending()` の方で判断する。
    */
   private refundFailureOpen(purchaseId: number): boolean {
     const row = this.db
@@ -3841,6 +3974,17 @@ export class Shop {
     try {
       return this.refund(input.purchaseId, "運営: 返金のやり直し", input.actor);
     } catch (error) {
+      // **「返してはいけない／ここでは返せない」は、返金の失敗ではない。**
+      //
+      // `refundWith()` が投げる `ShopError` は**すべて事前条件の拒否**で、資産は1つも
+      // 動いていない（提供済み・代替支払・配送中・結末が不明・既に終わっている・
+      // 別経路が先に確定した）。それを `retry_failed` として積むと、追記専用の監査に
+      // 「返金を試して失敗した」という嘘の証拠が残る。
+      //
+      // 逆に、台帳側の失敗（`LedgerError` や予期しない例外）は**本当に返せなかった**
+      // ということなので、必ず記録する。`ShopError` かどうかが境界で、コードを
+      // 個別に whitelist しているわけではない——`Ledger` は `ShopError` を投げない。
+      if (error instanceof ShopError) throw error;
       this.recordRefundFailure({
         purchaseId: input.purchaseId,
         amount: purchase.paid_land ?? 0,
@@ -4275,6 +4419,54 @@ export class Shop {
    * 呼び出し側が全種別を取ってから種別で filter すると、他種別の失敗が上限ぶん溜まった
    * だけで対象が1件も残らず、その種別の収束が永久に止まる。
    */
+  /**
+   * **配送のやり直しキューへ載る条件のうち、決着で動かない部分。**
+   *
+   * `delivery_state` と live claim は決着（`no_effect`）で必ず動くので、ここには
+   * 入れない。「いま出ているか」ではなく「**この購入は再配送してよい種類か**」を表す。
+   *
+   * 「もう一度配る」を画面に出してよいかの判断は、この定義をそのまま使う——
+   * `delivery_kind` が読めるかどうかで決めると、購入時の provenance が無い旧購入に
+   * 対して**実行されない約束**を出すことになる（決着させても
+   * `LEGACY_AUTO_OUTCOME_UNKNOWN_SQL` が真のままで、キューへ載らない）。
+   */
+  private static autoRetryBaseSql(): string {
+    return `p.status = 'active'
+      AND p.delivery_snapshot_json IS NOT NULL
+      -- 「再実行してよいか」は「配送したか」とは別の判断。結末が証明できない
+      -- 旧購入は、状態がどうであれ自動では流し直さない。
+      AND NOT EXISTS (
+        SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
+      )
+      -- **返金の復旧待ちを配送再試行へ混ぜない。** 返金しようとして失敗した購入は
+      -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
+      -- ここは**履歴**の方を使う（再配送してよいかの判断なので、一度でも返金を
+      -- 試した購入は自動の再配送から外す方が安全側）。
+      AND NOT ${Shop.refundFailureHistorySql()}
+      AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}`;
+  }
+
+  /**
+   * この購入を「もう一度配る」と言ってよいか。
+   *
+   * **決着した後に、実際に配送やり直しキューへ載るか**で決める。載らないなら、
+   * 画面にその選択肢を出してはいけない。決着だけ進んで再配送されず、確認キューからも
+   * 消える——つまり未処理のまま全部の仕事一覧から静かに消える、が起きる。
+   *
+   * live claim と `delivery_state` は決着で解ける／変わるので条件に入れない。
+   * 種別の判定は一覧と同じく購入時スナップショットだけを見る（現在の商品設定から
+   * 過去の配送内容を推測しない）。
+   */
+  deliveryRetryEligible(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(`SELECT p.delivery_snapshot_json AS snap FROM shop_purchases p WHERE p.id = ? AND ${Shop.autoRetryBaseSql()}`)
+      .get(purchaseId) as { snap: string | null } | undefined;
+    if (row === undefined) return false;
+    const snapshot = parseDeliverySnapshot(row.snap);
+    // 撤回された種別は運営にも再配送させない（面談を経ない復帰を作らない）
+    return snapshot !== null && AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind);
+  }
+
   listUndeliveredAuto(
     limit = 50,
     opts: { kinds?: readonly string[] } = {},
@@ -4284,22 +4476,12 @@ export class Shop {
         `SELECT p.*, i.name AS item_name
            FROM shop_purchases p
            JOIN shop_items i ON i.id = p.item_id
-          WHERE p.status = 'active'
-            AND p.delivery_snapshot_json IS NOT NULL
+          WHERE ${Shop.autoRetryBaseSql()}
             AND COALESCE(p.delivery_state, 'pending') IN ('pending','failed')
-            -- 「再実行してよいか」は「配送したか」とは別の判断。結末が証明できない
-            -- 旧購入は、状態がどうであれ自動では流し直さない。
-            AND NOT EXISTS (
-              SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
-            )
-            -- **返金の復旧待ちを配送再試行へ混ぜない。** 返金しようとして失敗した購入は
-            -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
-            AND NOT ${Shop.refundFailureHistorySql()}
             -- **確認待ちも混ぜない。** 外部へ投げたまま結果が分からない購入は、
             -- そもそも重ねて配れない（claimが塞ぐ）。両方のキューに出すと
             -- 「対応が必要」の件数が同じ購入を二重に数えることになる。
             AND NOT ${Shop.externalDeliveryLiveSql()}
-            AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
           ORDER BY p.purchased_at DESC`,
       )
       .all() as Array<PurchaseRow & { item_name: string }>;
@@ -4641,12 +4823,14 @@ export class Shop {
     // 「返金失敗の履歴が1件でもあるか」を手書きすると意味がズレる——提供が後から
     // 成功して復旧キューから外れた購入まで永久に候補から外れ、失効も剥奪判断も
     // 進まなくなる。
+    // **商館の述語（`refundFailureSql()`）ではなく金銭決着の方**を使う。前者は
+    // 「商館が返せるか」なので、代替支払の購入が候補に入って失効してしまう。
     const due = this.db
       .prepare(
         `SELECT p.id FROM shop_purchases p
           WHERE p.status = 'active' AND p.expires_at IS NOT NULL AND p.expires_at <= ?
             AND NOT ${Shop.externalDeliveryLiveSql()}
-            AND NOT (${Shop.refundFailureSql()})
+            AND NOT (${Shop.refundSettlementPendingSql()})
           ORDER BY p.expires_at
           LIMIT ?`,
       )
@@ -4708,6 +4892,11 @@ export class Shop {
     const claimRow = this.externalDeliveryClaim(purchaseId);
     const evidence = this.hasDeliveredEvidence(purchase);
     const recoveryOpen = this.refundFailureOpen(purchaseId);
+    const settlementPending = this.refundSettlementPending(purchaseId);
+    const operationsHandoff =
+      this.db
+        .prepare(`SELECT 1 FROM shop_purchases p WHERE p.id = ? AND ${Shop.refundHandoffSql()} LIMIT 1`)
+        .get(purchaseId) !== undefined;
     const failureHistory = this.db
       .prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id = ?")
       .pluck()
@@ -4748,9 +4937,17 @@ export class Shop {
       // 「提供済み」の証拠と「提供されていない」という人の判断が同時に立っている
       contradictions.push("delivered_evidence_vs_operator_no_effect");
     }
-    if (evidence && recoveryOpen) {
+    if (evidence && (recoveryOpen || settlementPending || operationsHandoff)) {
       // 正本の定義上ありえない組み合わせ。出たら定義がどこかでズレている
       contradictions.push("delivered_evidence_vs_open_refund_recovery");
+    }
+    if (recoveryOpen && operationsHandoff) {
+      // 商館の仕事と運営への引き継ぎは排他。両方に出るなら述語がズレている
+      contradictions.push("refund_recovery_and_handoff_both_open");
+    }
+    if ((recoveryOpen || operationsHandoff) && !settlementPending) {
+      // どちらも settlement pending の派生なので、親が false なのはありえない
+      contradictions.push("refund_actionable_without_settlement_pending");
     }
     if (evidence && unresolved) {
       contradictions.push("delivered_evidence_vs_unresolved_case");
@@ -4785,7 +4982,7 @@ export class Shop {
               state: claimRow.state as "in_flight" | "uncertain",
               startedAt: claimRow.started_at,
             },
-      refund: { recoveryOpen, failureHistory },
+      refund: { failureHistory, settlementPending, recoveryOpen, operationsHandoff },
       operatorCase: { unresolved, decided: decided ?? null },
       expiry: { expiresAt: purchase.expires_at, due, blockedBy },
       revocation: {
@@ -4806,13 +5003,18 @@ export class Shop {
    *
    * - `delivery_in_flight` … いま外部へ投げている最中／結果が分からない。ここで
    *   expired へ落とすと「失効済みなのにロールだけ付く」が成立する
-   * - `refund_pending` … 返金のやり直し待ち。**期限より先に金の決着を終わらせる。**
-   *   `refund()` は active からしか動けないので、ここで expired にすると復旧導線
-   *   そのものが消える（義務が消えるのではなく、押せるボタンが無くなる）
+   * - `refund_pending` … 金銭の決着がまだ終わっていない。**期限より先に金の決着を
+   *   終わらせる。** `refund()` は active からしか動けないので、ここで expired に
+   *   すると復旧導線そのものが消える（義務が消えるのではなく、押せるボタンが無くなる）
+   *
+   * **見るのは「商館で返せるか」ではなく「決着が済んだか」。** 商館の
+   * `refundFailureOpen()` を使うと、代替支払のように商館では返せない購入が
+   * 「商館の仕事ではない」という理由だけで失効し、運営への引き継ぎ一覧
+   * （`status='active'` を要求する）からも消える——未返金のまま導線が全部消える。
    */
   expiryBlockedBy(purchaseId: number): ExpiryBlockedReason | null {
     if (this.externalDeliveryInFlight(purchaseId)) return "delivery_in_flight";
-    if (this.refundFailureOpen(purchaseId)) return "refund_pending";
+    if (this.refundSettlementPending(purchaseId)) return "refund_pending";
     return null;
   }
 

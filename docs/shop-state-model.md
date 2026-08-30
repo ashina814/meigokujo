@@ -90,27 +90,47 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 
 ### 返金（Refund）
 
-**「履歴」と「いま復旧待ちか」を混ぜない。**
+**4つの別々の事実がある。1つの語へ潰さない。**
 
-| 問い | 正本 |
-|---|---|
-| 返金に失敗したことがあるか | `refundFailureHistorySql()`（`shop_refund_failures` に行がある） |
-| **いま返金のやり直しキューに載っているか** | `refundFailureSql()` = `active` かつ `delivered_at IS NULL` かつ delivered evidence なし かつ 履歴あり |
+| # | 概念 | 正本 | 意味 |
+|---|---|---|---|
+| 1 | **返金失敗の履歴** | `refundFailureHistorySql()` | 過去に返金処理が失敗した durable evidence（append-only） |
+| 2 | **金銭決着が未了** | `refundSettlementPendingSql()` | 利用者への決着がまだ終わっていない。**失効を止める authority**。誰が処理できるかは問わない |
+| 3 | **商館の返金復旧** | `refundFailureSql()` | 2のうち live claim なし ＋ generic refund 可。商館の「返金をやり直す」 |
+| 4 | **運営への引き継ぎ** | `refundHandoffSql()` | 2のうち live claim なし ＋ generic refund **不可**。商館では処理せず運営へ渡す |
+
+3と4は2の**派生**として定義する（`refundSettlementPendingSql()` をそのまま埋め込む）ので、
+意味がズレない。互いに排他で、2が false なら両方 false。
+
+```
+                    返金失敗の履歴（append-only・消えない）
+                              │
+                    ┌─────────┴─────────┐
+              決着が済んだ          決着が未了 ＝ settlement pending
+         （refunded / 提供成功）      │  → **失効させない**
+              仕事なし                │
+                          ┌──────────┼──────────┐
+                    live claim あり   │    live claim なし
+                    （claim が守る）   │          │
+                                ┌─────┴────┐  ┌──┴──────────┐
+                          generic refund 可   generic refund 不可
+                          → 商館「返金をやり直す」 → 運営「運営判断が必要」
+```
 
 履歴は append-only なので消えない。
 
-> **⚠ `refundFailureSql()` は「返す義務が無い」ことの証明ではない。**
+> **⚠ `refundFailureSql()`（＝ `recoveryOpen`）は「返す義務が無い」ことの証明ではない。**
 >
-> これは **いま復旧導線に載っているか**（`recoveryOpen`）であって、普遍的な
-> financial truth ではない。`status='active'` を条件に含むので、terminal な購入では
-> 常に false になる——`refund()` が active からしか動けないため、復旧導線に載せても
-> 意味が無いからそうなっている。
+> これは **いま商館の復旧導線に載っているか**であって、普遍的な financial truth では
+> ない。`status='active'` を条件に含むので terminal では常に false になり、
+> 代替支払や live claim 保持中も false になる。
 >
-> したがって `false` を「利用者へ返す義務が存在しない」と一般化してはいけない。
+> **`recoveryOpen === false` を「金銭の決着が終わった」と読んではいけない。**
+> 代替支払では次が正しい状態として同時に成り立つ:
+> `recoveryOpen = false` / `settlementPending = true` / `operationsHandoff = true`。
 
 購入が `refunded` になれば金は戻っている。`expired` / `cancelled` になっただけでは
-**戻ったことは証明されない**——復旧キューから落ちるだけで、事実は変わらない。
-この組み合わせは §6 の terminal anomaly として surface する。
+**戻ったことは証明されない**。この組み合わせは §6 の terminal anomaly として surface する。
 
 ### 人の判断（Human authority）
 
@@ -149,9 +169,12 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 | 購入が有効か | `shop_purchases.status` |
 | 外部配送が進行中／不明か | live external claim（`EXTERNAL_CLAIM_LIVE_STATES`。Core と DB索引で共有） |
 | 提供済みか | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()` |
-| いま返金のやり直しキューに載っているか | `refundFailureSql()` / `refundFailureOpen()` |
+| 一度でも返金に失敗したか | `refundFailureHistorySql()`（履歴。append-only） |
+| **金銭の決着が未了か（＝失効させてよいか）** | `refundSettlementPendingSql()` / `refundSettlementPending()` |
+| 商館が「返金をやり直す」で終わらせられるか | `refundFailureSql()` / `refundFailureOpen()` |
+| 運営へ渡すしかないか | `refundHandoffSql()` / `countRefundHandoffs()` |
+| 商館の generic refund で返せる支払いか | `genericRefundSupportedSql()` / `genericRefundSupportedRow()`（`refundWith()` の拒否条件と同一。`paid_land` から推測しない） |
 | 利用者へ返す義務が本当に無いか | **単一の述語では答えられない**。`refunded` が唯一の「戻った」証拠で、terminal anomaly は監査対象として surface する |
-| 一度でも返金に失敗したか | `refundFailureHistorySql()` |
 | legacy の「提供なし」を誰が証明できるか | `shop_operator_resolutions` の `no_effect`（人が外部を見た事実） |
 | この決着がどの claim を閉じるのか | `settleVerifiedFailure()` に渡す claim token |
 | 期限切れにしてよいか | `expireIfDue()`（最終）／`expiryBlockedBy()`（理由） |
@@ -233,14 +256,25 @@ uncertain / legacy unknown
 
 古い画面からの決定は通らない（`ERR_RESOLUTION_STALE`、0 mutation）。
 
-### 返金のやり直し
+### 返金のやり直し（商館）
 
 ```
-返金の復旧待ち（recoveryOpen）
-→ 運営が「返金をやり直す」
+商館の返金復旧（recoveryOpen）
+→ 商館スタッフが「返金をやり直す」
 → refunded            … 復旧完了（金が戻った）
-   もう一度失敗       … 失敗の事実を**追記**（履歴が積まれ、復旧待ちのまま）
-→ 後者はキューに残る
+   本当に失敗         … 失敗の事実を**追記**（履歴が積まれ、復旧待ちのまま）
+   authority の拒否   … **記録しない**（提供済み・代替支払など。資産は動いていない）
+→ 2つ目はキューに残る
+```
+
+### 商館では返せない返金（運営へ）
+
+```
+金銭決着が未了 + generic refund 不可（代替支払）
+→ 商館の復旧キューには出さない（押しても必ず失敗するため）
+→ 「運営判断が必要 — 商館では返せない返金」として surface
+→ 失効は止まったまま（settlement pending なので）
+→ 運営が資源を戻して決着させるまで active のまま残る
 ```
 
 ### 失効
@@ -248,7 +282,8 @@ uncertain / legacy unknown
 ```
 active + 期限到来
 → live claim があるか → あれば待つ（delivery_in_flight）
-→ 返金の復旧待ちか → あれば待つ（refund_pending）
+→ **金銭の決着が未了か** → あれば待つ（refund_pending）
+   ※「商館で返せるか」ではない。代替支払でも決着が終わるまで失効させない
 → どちらも無ければ expired
 → 剥奪の判断（契約が role を与えるか × 実際に与えた証拠があるか）
    → pending（巡回が剥がす）／unresolved（人が確認）／何もしない
@@ -269,7 +304,7 @@ active + 期限到来
 | 手動で提供する | 手動配送の未完了 | `pendingManualSql()` | `countPendingManual` / `listPendingManual` |
 | もう一度配る | 自動配送が pending / failed | `listUndeliveredAuto` | `listUndeliveredAuto` |
 | 提供状況を確認する | uncertain + legacy unknown | `unresolvedCandidateSql()` | `listUnresolvedCases` / `resolveOperatorCase` |
-| 返金をやり直す | 返金の復旧待ち | `refundFailureSql()` | `listRefundFailures` / `retryRefund` |
+| 返金をやり直す | 商館の返金復旧 | `refundFailureSql()` | `listRefundFailures` / `retryRefund` |
 
 合計が `merchantWorkTotal()`。**ここに入るものは必ず商館から辿れて、商館スタッフの
 権限で終わらせられる。**
@@ -279,6 +314,7 @@ active + 期限到来
 | 事象 | なぜ商館の仕事でないか | どう扱うか |
 |---|---|---|
 | 剥奪の `failed`（blocked） | 強制剥奪には別の authority が要る | 件数には入れず、**トップに存在と渡し先を出す** |
+| **商館では返せない返金**（代替支払） | generic refund が何をどれだけ戻すか判断できない | 件数には入れず、**別フィールドで存在・理由・渡し先を出す**。失効も止めたまま |
 | 剥奪の unresolved | 「何を与えたか証明できない」ので人の確認が要る | 現状は API のみ（画面未接続） |
 
 ### 二重計上しない
@@ -303,7 +339,9 @@ legacy や事故で、理論上あり得ない組み合わせが実在しうる�
 | `terminal_purchase_with_live_claim:<status>` | 終わった購入に生きた claim が残っている |
 | `terminal_with_refund_failure_history_without_delivery_evidence:<status>` | 終わった購入（`expired` / `cancelled`）に、返金を試して失敗した記録だけが残っている。**金の決着を人が監査する必要がある**——「返った」とも「未返金が確定した」とも言わない |
 | `delivered_evidence_vs_operator_no_effect` | 提供済みの証拠と「提供なし」の人の判断が同時に立っている |
-| `delivered_evidence_vs_open_refund_recovery` | 正本の定義上ありえない。出たら定義がどこかでズレている |
+| `delivered_evidence_vs_open_refund_recovery` | 提供済みの証拠があるのに返金の導線が開いている。正本の定義上ありえない |
+| `refund_recovery_and_handoff_both_open` | 商館の仕事と運営への引き継ぎは排他。両方に出るなら述語がズレている |
+| `refund_actionable_without_settlement_pending` | 3と4は2の派生なので、親が false なのはありえない |
 | `delivered_evidence_vs_unresolved_case` | 提供済みなのに「不明」の案件として残っている |
 | `active_purchase_with_pending_revocation` | 有効な契約からロールを剥がそうとしている |
 

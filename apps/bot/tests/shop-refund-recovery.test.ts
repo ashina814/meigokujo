@@ -244,6 +244,22 @@ describe("返金の未完了は別のキュー", () => {
     ctx.db.close();
   });
 
+  it("返金を試していない購入に、返金失敗の記録を残さない", async () => {
+    const { deliverOrRefund } = await refundModule;
+    const ctx = setup();
+    const p = buy(ctx);
+
+    const settled = await deliverOrRefund(ctx.client as never, ctx.services, unverifiableGuild() as never, p, "system:test");
+    expect(settled.refund).toBe("withheld");
+
+    // **追記専用の監査に、嘘の失敗証拠を残さない。** この経路は返金を試していない。
+    // キューに出ないことだけを見ていると、claim が塞いでいるおかげで隠れてしまう
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(p.id)).toBe(0);
+    expect(ctx.events.listByType("shop_refund_failed").length).toBe(0);
+    expect(ctx.events.listByType("shop_refund_withheld").length).toBe(1);
+    ctx.db.close();
+  });
+
   it("運営が返金をやり直すと、ちょうど一度だけ返金される", async () => {
     const { handleShokanButton } = await shokanModule;
     const ctx = setup();
