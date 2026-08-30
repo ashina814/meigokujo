@@ -344,6 +344,11 @@ export interface OperatorResolutionQuote {
   readonly refundableAmount: number;
   /** 返金まで一気に確定してよいか（代替支払など、generic refund が扱えないものは false） */
   readonly refundSupported: boolean;
+  /**
+   * 「提供できていない → もう一度配る」を出してよいか。
+   * **決着後に実際に配送やり直しキューへ載る購入だけ** true。
+   */
+  readonly retrySupported: boolean;
   readonly allowedDecisions: readonly OperatorDecision[];
   readonly token: string;
 }
@@ -3153,6 +3158,9 @@ export class Shop {
     // 代替支払を含む購入は generic refund の対象外（Phase C）。ここでも返金は出さない。
     const refundSupported =
       purchase.paid_alt_kind === null && purchase.paid_alt_amount === null && purchase.status === "active";
+    // **「もう一度配る」は、実際に配れるときだけ。** `delivery_kind` が読めることは
+    // 「配り直せる」の証明ではない（購入時 provenance が無い旧購入でも読める）。
+    const retrySupported = this.deliveryRetryEligible(purchaseId);
     // **決着済みには何も足せない。** UIがボタンを出さないことは authority ではないので、
     // ここで空にしたうえで確定側でも拒む。
     const allowed: OperatorDecision[] = kind === null ? [] : ["delivered", "no_effect", "still_unknown"];
@@ -3174,6 +3182,7 @@ export class Shop {
       stuckSince: claim?.started_at ?? purchase.purchased_at,
       refundableAmount: amount,
       refundSupported,
+      retrySupported,
       allowedDecisions: allowed,
       token: this.operatorResolutionToken(purchase, kind, claim),
     };
@@ -3613,9 +3622,19 @@ export class Shop {
     // **提供済みなら「返金の未完了」ではない。** `delivery_state` だけを見ると、
     // 正常に提供できた購入（active + delivered）が返金待ちとして残り続ける。
     // 提供済みの判定は既存の authoritative evidence をそのまま使う。
+    //
+    // **生きている claim が守っている間も出さない。** claim がある購入への返金は
+    // `ERR_DELIVERY_IN_FLIGHT` で必ず拒まれるので、キューに出すと「押しても必ず
+    // 失敗するボタン」になり、押すたびに失敗記録だけが積まれる。確認待ちの件数と
+    // 二重に数えることにもなる。claim が解ければ、そのまま復旧キューへ現れる。
+    // 失効はこの間 claim 側の guard が止めるので、守りに切れ目はできない。
     return `p.status = 'active'
       AND p.delivered_at IS NULL
       AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
+      AND NOT EXISTS (
+        SELECT 1 FROM shop_external_delivery_attempts a
+         WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
+      )
       AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
   }
 
@@ -3728,6 +3747,10 @@ export class Shop {
     try {
       return this.refund(input.purchaseId, "運営: 返金のやり直し", input.actor);
     } catch (error) {
+      // **「提供済みなので返さない」は失敗ではない。** 正しく拒んだだけなので、
+      // 追記専用の監査へ「返金を試して失敗した」という嘘の証拠を残さない。
+      // `refundOrRecordFailure()` と同じ扱いにそろえる。
+      if (error instanceof ShopError && error.code === "ERR_ALREADY_DELIVERED") throw error;
       this.recordRefundFailure({
         purchaseId: input.purchaseId,
         amount: purchase.paid_land ?? 0,
@@ -4174,6 +4197,54 @@ export class Shop {
    * 呼び出し側が全種別を取ってから種別で filter すると、他種別の失敗が上限ぶん溜まった
    * だけで対象が1件も残らず、その種別の収束が永久に止まる。
    */
+  /**
+   * **配送のやり直しキューへ載る条件のうち、決着で動かない部分。**
+   *
+   * `delivery_state` と live claim は決着（`no_effect`）で必ず動くので、ここには
+   * 入れない。「いま出ているか」ではなく「**この購入は再配送してよい種類か**」を表す。
+   *
+   * 「もう一度配る」を画面に出してよいかの判断は、この定義をそのまま使う——
+   * `delivery_kind` が読めるかどうかで決めると、購入時の provenance が無い旧購入に
+   * 対して**実行されない約束**を出すことになる（決着させても
+   * `LEGACY_AUTO_OUTCOME_UNKNOWN_SQL` が真のままで、キューへ載らない）。
+   */
+  private static autoRetryBaseSql(): string {
+    return `p.status = 'active'
+      AND p.delivery_snapshot_json IS NOT NULL
+      -- 「再実行してよいか」は「配送したか」とは別の判断。結末が証明できない
+      -- 旧購入は、状態がどうであれ自動では流し直さない。
+      AND NOT EXISTS (
+        SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
+      )
+      -- **返金の復旧待ちを配送再試行へ混ぜない。** 返金しようとして失敗した購入は
+      -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
+      AND NOT EXISTS (
+        SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id
+      )
+      AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}`;
+  }
+
+  /**
+   * この購入を「もう一度配る」と言ってよいか。
+   *
+   * **決着した後に、実際に配送やり直しキューへ載るか**で決める。載らないなら、
+   * 画面にその選択肢を出してはいけない。決着だけ進んで再配送されず、確認キューからも
+   * 消える——つまり未処理のまま全部の仕事一覧から静かに消える、が起きる。
+   *
+   * live claim と `delivery_state` は決着で解ける／変わるので条件に入れない。
+   * 種別の判定は一覧と同じく購入時スナップショットだけを見る（現在の商品設定から
+   * 過去の配送内容を推測しない）。
+   */
+  deliveryRetryEligible(purchaseId: number): boolean {
+    const row = this.db
+      .prepare(`SELECT p.delivery_snapshot_json AS snap FROM shop_purchases p WHERE p.id = ? AND ${Shop.autoRetryBaseSql()}`)
+      .get(purchaseId) as { snap: string | null } | undefined;
+    if (row === undefined) return false;
+    const snapshot = parseDeliverySnapshot(row.snap);
+    // 撤回された種別は運営にも再配送させない（面談を経ない復帰を作らない）
+    return snapshot !== null && AUTO_DELIVERABLE_KINDS.has(snapshot.delivery_kind);
+  }
+
   listUndeliveredAuto(
     limit = 50,
     opts: { kinds?: readonly string[] } = {},
@@ -4183,19 +4254,8 @@ export class Shop {
         `SELECT p.*, i.name AS item_name
            FROM shop_purchases p
            JOIN shop_items i ON i.id = p.item_id
-          WHERE p.status = 'active'
-            AND p.delivery_snapshot_json IS NOT NULL
+          WHERE ${Shop.autoRetryBaseSql()}
             AND COALESCE(p.delivery_state, 'pending') IN ('pending','failed')
-            -- 「再実行してよいか」は「配送したか」とは別の判断。結末が証明できない
-            -- 旧購入は、状態がどうであれ自動では流し直さない。
-            AND NOT EXISTS (
-              SELECT 1 FROM shop_delivery_replay_suppressions r WHERE r.purchase_id = p.id
-            )
-            -- **返金の復旧待ちを配送再試行へ混ぜない。** 返金しようとして失敗した購入は
-            -- 「もう一度配る」ではなく「返金をやり直す」案件。別のキューで扱う。
-            AND NOT EXISTS (
-              SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id
-            )
             -- **確認待ちも混ぜない。** 外部へ投げたまま結果が分からない購入は、
             -- そもそも重ねて配れない（claimが塞ぐ）。両方のキューに出すと
             -- 「対応が必要」の件数が同じ購入を二重に数えることになる。
@@ -4203,7 +4263,6 @@ export class Shop {
               SELECT 1 FROM shop_external_delivery_attempts a
                WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
             )
-            AND NOT ${Shop.LEGACY_AUTO_OUTCOME_UNKNOWN_SQL}
           ORDER BY p.purchased_at DESC`,
       )
       .all() as Array<PurchaseRow & { item_name: string }>;

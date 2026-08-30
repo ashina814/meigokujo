@@ -730,9 +730,12 @@ function renderCase(services: Services, purchaseId: number) {
   }
   const t = quote.token;
   // **「もう一度配れる」と証明できるときだけ、返金しない選択を出す。**
-  // 購入時の配送内容が残っていない旧購入では、何を配り直せばよいか誰も分からない。
-  // 現在の商品設定から推測して配ることは禁止なので、その選択肢は出さない。
-  const canRetryDelivery = quote.deliveryKind !== null;
+  //
+  // `delivery_kind` が読めることは証明にならない——購入時 provenance の無い旧購入でも
+  // スナップショットから読めてしまう。それを根拠に出すと、決着させても配送やり直しの
+  // キューへ載らず、確認キューからも消えて**未処理のまま全部の一覧から静かに消える**。
+  // Core の「決着後に実際にキューへ載るか」をそのまま使う。
+  const canRetryDelivery = quote.retrySupported;
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId(`shokan:case-pre:delivered:0:${purchaseId}:${t}`)
@@ -764,7 +767,7 @@ function renderCase(services: Services, purchaseId: number) {
     notes.push("この購入は商館からは返金できません（支払い方法が対象外です）。運営へ渡してください。");
   }
   if (!canRetryDelivery) {
-    notes.push("購入時の記録が無いため、**もう一度配ることはできません。**");
+    notes.push("購入時の記録が足りないため、**もう一度配ることはできません。**（何を配ればよいか証明できません）");
   }
   if (notes.length > 0) embed.addFields({ name: "できないこと", value: notes.join("\n"), inline: false });
   return { embeds: [embed], components: [row, backToCasesRow()] };

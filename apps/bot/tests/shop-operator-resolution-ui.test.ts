@@ -328,6 +328,35 @@ describe("運営の決着UI", () => {
     ctx.db.close();
   });
 
+  it("配送種別が読めても、再配送できない旧購入には「もう一度配る」を出さない", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const ctx = setup();
+    // **購入時スナップショットはあるが provenance が無い旧購入。**
+    // `delivery_kind` は読めてしまうが、結末を証明できないので自動では流し直さない。
+    // ここで「もう一度配る」を出すと、決着だけ進んで再配送されず、確認キューからも
+    // 消えて**未処理のまま全部の一覧から静かに消える**
+    const legacy = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,status,delivery_state,delivery_snapshot_json)
+         VALUES (?, ?, 1, 100, 'active', 'pending', ?) RETURNING id`,
+      )
+      .pluck()
+      .get(ctx.item.id, USER, JSON.stringify({ delivery: "auto", delivery_kind: "add_role", delivery_data: { role_id: "r-vip" } })) as number;
+    expect(ctx.shop.unresolvedCaseKind(legacy)).toBe("legacy_unknown");
+    // 種別は読める。それでも再配送は出さない、というのがこのテスト
+    expect(ctx.shop.quoteOperatorResolution(legacy).deliveryKind).toBe("add_role");
+
+    const detail = vi.fn(async () => undefined);
+    await handleShokanButton(press(`shokan:case:${legacy}`, detail), ctx.services);
+
+    const ids = buttonIds(detail);
+    expect(ids.some((id) => id.startsWith("shokan:case-pre:no_effect:0:"))).toBe(false);
+    expect(ids.some((id) => id.startsWith("shokan:case-pre:no_effect:1:"))).toBe(true);
+    const text = JSON.stringify(payload(detail)?.embeds ?? []);
+    expect(text).toContain("もう一度配ることはできません");
+    ctx.db.close();
+  });
+
   it("購入時の記録があれば「もう一度配る」を出す", async () => {
     const { handleShokanButton } = await shokanModule;
     const ctx = setup();
