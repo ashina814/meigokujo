@@ -56,18 +56,19 @@ function setup(opts: { legacy?: boolean } = {}) {
    * `delivered_at IS NULL` / `shop_delivered` なし / fulfillment provenance なし。
    * provenance は append-only なので、普通に買ってから消すことはできない。
    */
-  const buy = (opt: { legacy?: boolean } = {}): { id: number } => {
+  const buy = (opt: { legacy?: boolean; deliveryState?: string } = {}): { id: number } => {
     const id = db
       .prepare(
         `INSERT INTO shop_purchases
            (item_id,user_id,purchased_at,expires_at,paid_land,status,delivery_state,delivery_snapshot_json)
-         VALUES (?,?,1,?,1000,'active','delivered',?) RETURNING id`,
+         VALUES (?,?,1,?,1000,'active',?,?) RETURNING id`,
       )
       .pluck()
       .get(
         item.id,
         USER,
         Math.floor(Date.now() / 1000) + 30 * 24 * 3600,
+        opt.deliveryState ?? "delivered",
         opt.legacy
           ? null
           : JSON.stringify({
@@ -367,6 +368,94 @@ describe("競合", () => {
     const working = guildWith();
     await reconcileTimedAccessForGuild(working.guild, ctx.services);
     expect(evidenceOf(ctx, ctx.purchase.id)).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  /**
+   * **本来の Race F。** 通常の自動配送が外部へ投げている最中に巡回が走る。
+   *
+   * 現状の巡回は生きている claim を見ないので、`roles.add()` が二重に走りうるし、
+   * claim を握ったまま置き去りにする。これは Task #213 以前からある claim
+   * architecture 側の問題で、ここでは直さない（別タスク）。
+   *
+   * ここで守るのは **新しい authority をその矛盾へ混ぜないこと**——
+   * 誰の実行による効果か決まらない間は、提供済みの証拠を書かない。
+   */
+  it("F(本来): 通常配送が claim を握っている最中は、証拠を書かない", async () => {
+    const ctx = setup();
+    // 通常配送が進行中＝工程は pending。ここでなければ claim 自体が取れない
+    const id = ctx.buy({ deliveryState: "pending" }).id;
+    ctx.db.prepare("UPDATE shop_purchases SET status='expired' WHERE id=?").run(ctx.purchase.id);
+    const claimed = ctx.shop.claimExternalDelivery({
+      purchaseId: id,
+      deliveryKind: "add_role",
+      actor: "system:auto",
+    });
+    expect(claimed.ok).toBe(true); // 本当に claim を握れている
+
+    const discord = guildWith();
+    await reconcileTimedAccessForGuild(discord.guild, ctx.services);
+
+    // 巡回は従来どおりロールを復元する（この挙動はこのタスクでは変えない）
+    expect(discord.cache.has(ROLE)).toBe(true);
+    // **が、その効果をこの購入の提供済み証拠にはしない**
+    expect(allEvidence(ctx)).toBe(0);
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.verifiedExternal).toBe(false);
+    ctx.db.close();
+  });
+
+  it("F(本来): claim が決着したあとの巡回なら、証拠が立つ", async () => {
+    const ctx = setup();
+    const id = ctx.buy({ deliveryState: "pending" }).id;
+    ctx.db.prepare("UPDATE shop_purchases SET status='expired' WHERE id=?").run(ctx.purchase.id);
+    const claim = ctx.shop.claimExternalDelivery({
+      purchaseId: id,
+      deliveryKind: "add_role",
+      actor: "system:auto",
+    }) as { ok: true; token: string };
+    await reconcileTimedAccessForGuild(guildWith().guild, ctx.services);
+    expect(allEvidence(ctx)).toBe(0);
+
+    ctx.shop.releaseExternalDelivery({
+      purchaseId: id,
+      token: claim.token,
+      reason: "verified_no_effect",
+      actor: "system:auto",
+    });
+    // ロールは既にあるので add はされない＝証拠も立たない（added=false の規則）
+    await reconcileTimedAccessForGuild(guildWith([ROLE]).guild, ctx.services);
+    expect(allEvidence(ctx)).toBe(0);
+
+    // ロールが消えた状態で巡回すれば、自分で付け直して確認できる
+    await reconcileTimedAccessForGuild(guildWith().guild, ctx.services);
+    expect(evidenceOf(ctx, id)).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("互換経路で復元できても、購入時の証拠が無ければ提供済みにしない", async () => {
+    const ctx = setup();
+    // スナップショットも provenance も移行記録も無い旧購入。
+    // 運営の決着があるので互換経路では有効契約として見える
+    const id = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,expires_at,paid_land,status,delivery_state)
+         VALUES (?,?,1,?,1000,'active','pending') RETURNING id`,
+      )
+      .pluck()
+      .get(ctx.item.id, USER, Math.floor(Date.now() / 1000) + 30 * 24 * 3600) as number;
+    ctx.shop.resolveOperatorCase({
+      purchaseId: id,
+      decision: "delivered",
+      expectedToken: ctx.shop.quoteOperatorResolution(id).token,
+      actor: "operator:1",
+      note: "運営が確認済み",
+    });
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toEqual({ kind: "legacy_unknown" });
+
+    await reconcileTimedAccessForGuild(guildWith().guild, ctx.services);
+
+    // **現在の商品設定を根拠に、この購入の返金拒否 authority を作らない**
+    expect(evidenceOf(ctx, id)).toHaveLength(0);
     ctx.db.close();
   });
 

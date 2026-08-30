@@ -3278,7 +3278,12 @@ export class Shop {
   // ── Bot が独立に確認した外部配送の証拠（Phase I）──────────────────────────
 
   /**
-   * **外部効果が実際に成立したことを、writer 自身が確認できた**という事実を積む。
+   * **外部効果が実際に成立したことを、writer 自身が確認できた**という事実を積む低層。
+   *
+   * **private。** 「どの purchase へ帰属してよいか」という一番危ない判断を持たない
+   * ので、これを公開 API にすると gate を素通りして返金拒否 authority を作れてしまう。
+   * 呼べるのは、出所ごとの gate を持つ公開 operation
+   * （`recordTimedAccessVerifiedDelivery()` など）だけ。
    *
    * `completeDeliveryWith()` とは**別の operation**。あちらは「配送を実行して工程を
    * 進める」ので二重実行を禁じる guard を持ち、`delivery_state='delivered'` の前で
@@ -3298,7 +3303,7 @@ export class Shop {
    *
    * 冪等。同じ `(purchase, source)` は何度呼んでも1行に収束する。
    */
-  recordVerifiedDeliveryEvidence(input: {
+  private recordVerifiedDeliveryEvidence(input: {
     purchaseId: number;
     source: VerifiedDeliveryEvidenceSource;
     writer: string;
@@ -3344,6 +3349,70 @@ export class Shop {
     return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
   }
 
+  /**
+   * **期限つきアクセスの巡回が確認した外部効果を、この購入の提供済み証拠として積む。**
+   *
+   * 外部の事実（ロールが無かった／自分で付けた／force refetch で在席を再確認した／
+   * 失効競合を通過した）は Discord 側の writer が責任を持つ。
+   * **その効果をどの購入へ帰属してよいか**は、ここが1つの transaction で守る。
+   *
+   * すべて満たしたときだけ積む。1つでも欠けたら `false` を返して**何も書かない**。
+   *
+   *   1. 購入が存在する（無ければ throw）
+   *   2. `status='active'`
+   *   3. 購入者が一致する
+   *   4. **購入時の不変な証拠から与えるロールが確定している**（`roleGrantTarget` が `proven`）
+   *   5. その確定したロールが、実際に観測したロールと一致する
+   *   6. 生きている外部配送の場所取りが無い
+   *   7. この (利用者, ロール) を与える有効な契約がこの購入ただ1つ
+   *
+   * **4 が要。** `listActiveTimedAccess()` は互換のため、購入時スナップショットが
+   * 無い旧購入について**現在の商品設定**からロールを読む経路を持つ。それは
+   * 「ロールを復元してよいか」には使えても、「この購入が何を買ったか」の証拠には
+   * ならない。ここを通すと、**現在の商品設定を根拠に過去の購入の返金を拒む**
+   * ことになる。互換で復元することと、その効果を提供済みへ昇格させることは別。
+   *
+   * **6 の理由。** 生きている claim は「別の配送がいま外部へ投げている最中」を意味する。
+   * その最中に観測した効果が誰の実行によるものかは決まらないし、claim が残ったままの
+   * 購入へ提供済みを立てると `delivered_evidence_vs_unresolved_case` が成立する。
+   *
+   * 5 は照合のためだけに使う。**剥奪してよい対象を決めるのは今までどおり
+   * `roleGrantTarget()` だけ**で、証拠の `effect_target` はその authority ではない。
+   */
+  recordTimedAccessVerifiedDelivery(input: {
+    purchaseId: number;
+    userId: string;
+    roleId: string;
+    writer: string;
+    detail?: Record<string, unknown>;
+  }): boolean {
+    const run = (): boolean => {
+      const purchase = this.getPurchase(input.purchaseId);
+      if (!purchase) throw new ShopError("ERR_PURCHASE_NOT_FOUND", { purchaseId: input.purchaseId });
+      if (purchase.status !== "active") return false;
+      if (purchase.user_id !== input.userId) return false;
+
+      // 購入時の不変な証拠だけを見る。現在の商品設定へは絶対に落とさない
+      const target = this.roleGrantTarget(purchase);
+      if (target.kind !== "proven") return false;
+      if (target.roleId !== input.roleId) return false;
+
+      // 別の配送が外部へ投げている最中なら、観測した効果の主が決まらない
+      if (this.externalDeliveryClaim(input.purchaseId)) return false;
+
+      if (!this.timedAccessAttributionUnique(input.purchaseId, input.userId, input.roleId)) return false;
+
+      return this.recordVerifiedDeliveryEvidence({
+        purchaseId: input.purchaseId,
+        source: "timed_access_role_added_and_refetched",
+        writer: input.writer,
+        effectTarget: input.roleId,
+        detail: input.detail,
+      });
+    };
+    return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+  }
+
   /** この購入に積まれている、Bot が確認した外部配送の証拠（新しい順）。 */
   verifiedDeliveryEvidence(purchaseId: number): VerifiedDeliveryEvidenceRow[] {
     return this.db
@@ -3363,7 +3432,11 @@ export class Shop {
    * 証拠は返金拒否という不可逆判断に使うので、**帰属が証明できないなら何も書かない**。
    * 「証拠が無い」は「提供されていない」ではない——ただ言えることが無いだけ。
    *
-   * 現在の商品設定は見ない。`listActiveTimedAccess()` と同じ authority を使う。
+   * 数えるほうは `listActiveTimedAccess()` をそのまま使う——互換経路で拾われる契約も
+   * 「同じロールを与えうる契約」として**多めに数える**ほうが安全側だから。
+   * ただし**これだけでは証拠にできない**。互換経路は現在の商品設定からロールを読むので、
+   * 帰属先の購入が本当にそのロールを買ったかは別途
+   * `roleGrantTarget()` で確かめる（`recordTimedAccessVerifiedDelivery()`）。
    */
   timedAccessAttributionUnique(purchaseId: number, userId: string, roleId: string): boolean {
     const holders = this.listActiveTimedAccess(userId).filter((g) => g.roleId === roleId);

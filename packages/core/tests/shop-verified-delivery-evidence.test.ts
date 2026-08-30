@@ -78,14 +78,26 @@ function legacyTimedAccess(
     ) as number;
 }
 
-const record = (ctx: Ctx, id: number, roleId = ROLE) =>
-  ctx.shop.recordVerifiedDeliveryEvidence({
+/** 巡回が外部で確認できた、として記録を試みる */
+const record = (ctx: Ctx, id: number, roleId = ROLE, userId = USER) =>
+  ctx.shop.recordTimedAccessVerifiedDelivery({
     purchaseId: id,
-    source: SOURCE,
+    userId,
+    roleId,
     writer: WRITER,
-    effectTarget: roleId,
     detail: { itemId: ctx.item.id, verification: "force_refetch_role_present" },
   });
+
+/** 購入時の証拠が何も無い旧購入（スナップショットも provenance も移行記録も無い） */
+function legacyWithoutAnyTarget(ctx: Ctx): number {
+  return ctx.db
+    .prepare(
+      `INSERT INTO shop_purchases (item_id,user_id,purchased_at,expires_at,paid_land,status,delivery_state)
+       VALUES (?,?,1,?,?,'active','delivered') RETURNING id`,
+    )
+    .pluck()
+    .get(ctx.item.id, USER, Math.floor(Date.now() / 1000) + YEAR, PRICE) as number;
+}
 
 // ── §12 #58 regression ───────────────────────────────────────────────────────
 
@@ -320,6 +332,182 @@ describe("帰属が一意でなければ、何も推測しない", () => {
   });
 });
 
+// ── Round 1 §1/§4: 購入時の不変な証拠だけを帰属の根拠にする ──────────────────
+
+describe("互換で復元できることと、提供済みへ昇格できることは別", () => {
+  it("購入時の証拠が無い旧購入は、現在の商品設定が一致していても証拠にならない", () => {
+    const ctx = setup();
+    const id = legacyWithoutAnyTarget(ctx);
+    // 現在の商品は期限つき add_role で、ロールも一致している
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toEqual({ kind: "legacy_unknown" });
+
+    // 巡回が互換経路でロールを復元し、force refetch まで成功したとしても——
+    expect(record(ctx, id, ROLE)).toBe(false);
+
+    // **現在の商品設定を根拠に、過去の購入の返金を拒む authority を作らない**
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.verifiedExternal).toBe(false);
+    ctx.db.close();
+  });
+
+  it("購入時のロールと観測したロールが違えば書かない", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx, { roleId: "r-contracted" });
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toMatchObject({ roleId: "r-contracted" });
+
+    expect(record(ctx, id, "r-observed")).toBe(false);
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("購入時のロールと観測したロールが一致すれば書く（#58型）", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx);
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toEqual({
+      kind: "proven",
+      roleId: ROLE,
+      source: "purchase_snapshot",
+    });
+
+    expect(record(ctx, id, ROLE)).toBe(true);
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  it("購入者が違えば書かない", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx);
+    expect(record(ctx, id, ROLE, "u-someone-else")).toBe(false);
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  it("移行記録で対象は証明できても、契約として見えなければ書かない（安全側）", () => {
+    const ctx = setup();
+    const id = legacyWithoutAnyTarget(ctx);
+    // 期限つきアクセスの移行で「このロールを配った」と明示的に残っている
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_timed_access_legacy_runs
+           (migration_key, plan_json, actor_id, reason, started_at, completed_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run("test-migration", "[]", "staff", "test", 1, 1);
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_timed_access_legacy_imports
+           (purchase_id, migration_key, item_id, user_id, role_id, started_at, expires_at, reason, actor_id, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(id, "test-migration", ctx.item.id, USER, ROLE, 1, Math.floor(Date.now() / 1000) + YEAR, "test", "staff", 1);
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toMatchObject({
+      kind: "proven",
+      roleId: ROLE,
+      source: "timed_access_legacy_import",
+    });
+
+    // それでも書けない。スナップショットが無い購入が有効な期限つき契約として
+    // 見えるのは**互換経路だけ**で、その経路は「既に提供済みの証拠がある」ことを
+    // 前提にしている。まだ証拠が無い段階では帰属先として数えられない。
+    // **緩めない。** 対象が証明できることと、帰属が一意に決まることは別の問い
+    expect(ctx.shop.timedAccessAttributionUnique(id, USER, ROLE)).toBe(false);
+    expect(record(ctx, id, ROLE)).toBe(false);
+    ctx.db.close();
+  });
+
+  it("互換経路で見えていても、帰属の根拠は移行記録（現在の商品設定ではない）", () => {
+    const ctx = setup();
+    const id = legacyWithoutAnyTarget(ctx);
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_timed_access_legacy_runs
+           (migration_key, plan_json, actor_id, reason, started_at, completed_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run("m2", "[]", "staff", "test", 1, 1);
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_timed_access_legacy_imports
+           (purchase_id, migration_key, item_id, user_id, role_id, started_at, expires_at, reason, actor_id, created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(id, "m2", ctx.item.id, USER, ROLE, 1, Math.floor(Date.now() / 1000) + YEAR, "test", "staff", 1);
+    // 運営が確認済みなので、互換経路で有効契約として見えるようになった
+    ctx.shop.resolveOperatorCase({
+      purchaseId: id,
+      decision: "delivered",
+      expectedToken: ctx.shop.quoteOperatorResolution(id).token,
+      actor: "operator:1",
+      note: "確認済み",
+    });
+    expect(ctx.shop.timedAccessAttributionUnique(id, USER, ROLE)).toBe(true);
+
+    // **帰属の根拠は移行記録。** 現在の商品設定と違うロールを観測したら書かない
+    expect(record(ctx, id, "r-from-current-config")).toBe(false);
+    expect(record(ctx, id, ROLE)).toBe(true);
+    ctx.db.close();
+  });
+});
+
+// ── Round 1 §3: Race F — 通常配送と巡回の競合 ────────────────────────────────
+
+describe("通常配送が外部へ投げている最中は、観測を帰属しない", () => {
+  it("生きている claim があるあいだは証拠を書かない", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx, { deliveryState: "pending" });
+    ctx.shop.claimExternalDelivery({ purchaseId: id, deliveryKind: "add_role", actor: "system:auto" });
+
+    // 誰の実行による効果かが決まらない。**曖昧なまま提供済みにしない**
+    expect(record(ctx, id, ROLE)).toBe(false);
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    // claim を握ったままの購入へ提供済みを立てると、この矛盾が成立してしまう
+    expect(ctx.shop.safetySnapshot(id)!.contradictions).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("結果が分からないまま残っている claim でも書かない", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx, { deliveryState: "pending" });
+    const claim = ctx.shop.claimExternalDelivery({
+      purchaseId: id,
+      deliveryKind: "add_role",
+      actor: "system:auto",
+    }) as { token: string };
+    ctx.shop.markExternalDeliveryUncertain({
+      purchaseId: id,
+      token: claim.token,
+      reason: "final_fetch_failed",
+      actor: "system:auto",
+    });
+
+    expect(record(ctx, id, ROLE)).toBe(false);
+    expect(ctx.shop.safetySnapshot(id)!.contradictions).toEqual([]);
+    ctx.db.close();
+  });
+
+  it("claim が決着したあとなら書ける", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx, { deliveryState: "pending" });
+    const claim = ctx.shop.claimExternalDelivery({
+      purchaseId: id,
+      deliveryKind: "add_role",
+      actor: "system:auto",
+    }) as { token: string };
+    expect(record(ctx, id, ROLE)).toBe(false);
+
+    ctx.shop.releaseExternalDelivery({
+      purchaseId: id,
+      token: claim.token,
+      reason: "verified_no_effect",
+      actor: "system:auto",
+    });
+
+    expect(record(ctx, id, ROLE)).toBe(true);
+    expect(ctx.shop.safetySnapshot(id)!.contradictions).toEqual([]);
+    ctx.db.close();
+  });
+});
+
 // ── §9 / §10 canonical authority ─────────────────────────────────────────────
 
 describe("正本としての強さと、金銭への帰結", () => {
@@ -427,34 +615,23 @@ describe("剥奪の対象は、証拠からは決めない", () => {
     ctx.db.close();
   });
 
-  it("購入時の証拠が無ければ、証拠の `effect_target` からは剥がさない", () => {
+  it("証拠の `effect_target` は照合のためだけ — 剥奪対象は購入時の証拠が決める", () => {
     const ctx = setup();
-    // スナップショット無し＝購入時に何を与える契約だったか証明できない
-    const id = ctx.db
-      .prepare(
-        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,expires_at,paid_land,status,delivery_state)
-         VALUES (?,?,1,1,?,'active','delivered') RETURNING id`,
-      )
-      .pluck()
-      .get(ctx.item.id, USER, PRICE) as number;
-
-    // 証拠には roleId が入っている
-    expect(record(ctx, id, ROLE)).toBe(true);
+    const id = legacyTimedAccess(ctx, { expiresIn: 60 });
+    expect(record(ctx, id)).toBe(true);
     expect(ctx.shop.verifiedDeliveryEvidence(id)[0]!.effect_target).toBe(ROLE);
-    // それでも剥奪対象は不明のまま。**観測の副産物で契約内容を書き換えない**
-    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toEqual({ kind: "legacy_unknown" });
 
-    ctx.db.prepare("UPDATE shop_items SET kind='one_shot' WHERE id=?").run(ctx.item.id);
+    // 商品の現在設定を差し替えても、剥奪対象は購入時スナップショットのまま
+    ctx.db
+      .prepare("UPDATE shop_items SET delivery_data = ?, kind='one_shot' WHERE id = ?")
+      .run(JSON.stringify({ role_id: "r-changed" }), ctx.item.id);
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(id);
+
     expect(ctx.shop.expireIfDue(id, "system:cron").expired).toBe(true);
-    expect(
-      ctx.db.prepare("SELECT COUNT(*) FROM shop_role_revocations WHERE purchase_id=?").pluck().get(id),
-    ).toBe(0);
-    expect(
-      ctx.events.listByType("shop_role_revocation_unresolved").some((e) => {
-        const payload = JSON.parse(e.payload_json ?? "{}") as { purchaseId?: number; reason?: string };
-        return payload.purchaseId === id && payload.reason === "role_target_unknown";
-      }),
-    ).toBe(true);
+    const rev = ctx.db
+      .prepare("SELECT role_id FROM shop_role_revocations WHERE purchase_id=?")
+      .get(id) as { role_id: string } | undefined;
+    expect(rev?.role_id).toBe(ROLE);
     ctx.db.close();
   });
 

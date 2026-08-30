@@ -113,18 +113,17 @@ async function reconcileTimedAccessRoles(
         // `added=false`（元からロールがあった）はここへ来ない。**ロールの起源を
         // 証明していない**ので、提供済みの証拠にも未提供の証拠にもしない。
         //
-        // 最後に帰属を確かめる。同じロールを与える有効な契約が他にもあるなら、
-        // この1回の付与が**どの購入の効果か**を証明できないので何も書かない。
-        // 返金拒否に使う authority なので、曖昧なら安全側へ倒す。
-        if (services.shop.timedAccessAttributionUnique(grant.purchase.id, target, grant.roleId)) {
-          services.shop.recordVerifiedDeliveryEvidence({
-            purchaseId: grant.purchase.id,
-            source: "timed_access_role_added_and_refetched",
-            writer: "system:shop-timed-access",
-            effectTarget: grant.roleId,
-            detail: { itemId: grant.item.id, verification: "force_refetch_role_present" },
-          });
-        }
+        // **帰属してよいかは Core が決める。** 購入時の不変な証拠でロールが確定して
+        // いること・観測したロールと一致すること・同じロールを与える有効な契約が
+        // これ1つであること——を1つの transaction で確かめ、1つでも欠ければ
+        // 何も書かない。曖昧なまま書くと、返金を拒む authority を推測で作ることになる。
+        services.shop.recordTimedAccessVerifiedDelivery({
+          purchaseId: grant.purchase.id,
+          userId: target,
+          roleId: grant.roleId,
+          writer: "system:shop-timed-access",
+          detail: { itemId: grant.item.id, verification: "force_refetch_role_present" },
+        });
         services.events.log("shop_timed_access_restored", {
           actor: "system:shop-timed-access",
           target,
