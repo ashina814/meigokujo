@@ -115,8 +115,8 @@ function queueCounts(services: Services): {
     // 旧購入だけを別に見せる導線は持たない——同じ案件が「操作できる場所」と
     // 「見るだけの場所」の2箇所に出ると、どちらが正本か分からなくなる。
     stuck: services.shop.countUnresolvedCases(),
-    // **返金しようとして失敗した購入。** 「配れなかったので配り直す」ではなく
-    // 「返せなかったので返し直す」案件なので、処理失敗とは別に数える
+    // **返金が完了していない購入。** 「配れなかったので配り直す」ではなく
+    // 「返せていないので返し直す」案件なので、処理失敗とは別に数える
     refundOpen: services.shop.countRefundFailures(),
     // **どの巡回も触らない剥奪。** worker は pending しか拾わないので、
     // blocked として failed に落ちた行は人が見るまで永久に残る
@@ -247,7 +247,7 @@ function renderWorkHub(services: Services) {
       emoji: "💰",
       label: "返金をやり直す",
       count: c.refundOpen,
-      what: "返金しようとして失敗した購入です。お金がまだ戻っていません。",
+      what: "返金が完了していない購入です。お金がまだ戻っていません。",
     },
   ];
   const open = entries.filter((e) => e.count > 0);

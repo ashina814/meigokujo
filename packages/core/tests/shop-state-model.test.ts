@@ -624,7 +624,7 @@ describe("矛盾は隠さず、直しもしない", () => {
    * **金の決着を人が監査する必要がある**ということだけ。
    */
   for (const status of ["expired", "cancelled"] as const) {
-    it(`${status} + 返金失敗の履歴 + 提供の証拠なし → 監査が要ると報告する`, () => {
+    it(`${status} + 自動決着の対応記録 + 提供の証拠なし → 監査が要ると報告する`, () => {
       const ctx = setup();
       const p = buy(ctx);
       ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });

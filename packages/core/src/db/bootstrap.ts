@@ -1068,7 +1068,11 @@ CREATE TABLE IF NOT EXISTS shop_operator_resolutions (
 );
 CREATE INDEX IF NOT EXISTS idx_shop_operator_resolutions_purchase
   ON shop_operator_resolutions(purchase_id, resolved_at);
--- Phase H: 返金を**実際に試して失敗した**という事実。
+-- Phase H: **自動の返金・決着がその場で完了しなかった**という事実。
+--
+-- テーブル名は歴史的なもので、行は「実際に振替を試して失敗した」だけを表さない。
+-- generic refund が authority 上扱えない場合（代替支払）も、運営への引き継ぎを
+-- durable にするためにここへ積む。行だけから実際の試行有無は判断できない。
 --
 -- 「提供できたか確認できないので返金を試していない」(withheld) とは別物。
 -- 前者は利用者の資産が戻っていないので運営が復旧する必要があり、後者は確認待ち。

@@ -867,7 +867,7 @@ describe("返金義務が閉じた購入は、また失効できる", () => {
     return purchase.id;
   }
 
-  it("返金失敗の履歴があっても、提供が成功していれば期限で失効する", () => {
+  it("自動決着の対応記録があっても、提供が成功していれば期限で失効する", () => {
     const ctx = setup();
     const id = refundFailedThenDelivered(ctx);
 
