@@ -185,7 +185,7 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 | 外部配送が進行中／不明か | live external claim（`EXTERNAL_CLAIM_LIVE_STATES`。Core と DB索引で共有） |
 | 提供済みか | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()` |
 | 自動決着がその場で終わらなかったことがあるか | `refundSettlementIssueHistorySql()`（対応記録。append-only。**実際に返金を試したかは問わない**） |
-| **金銭の決着が未了か（＝失効させてよいか）** | `refundSettlementPendingSql()` / `refundSettlementPending()` |
+| **金銭の決着が未了か（＝失効を止めるか）** | `refundSettlementPendingSql()` / `refundSettlementPending()`。**true なら失効させない** |
 | 商館が「返金をやり直す」で終わらせられるか | `refundFailureSql()` / `refundFailureOpen()` |
 | 運営へ渡すしかないか | `refundHandoffSql()` / `countRefundHandoffs()` |
 | 商館の generic refund で返せる支払いか | `genericRefundSupportedSql()` / `genericRefundSupportedRow()`（`refundWith()` の拒否条件と同一。`paid_land` から推測しない） |

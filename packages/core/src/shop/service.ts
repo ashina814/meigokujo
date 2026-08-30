@@ -3824,7 +3824,13 @@ export class Shop {
    *   - 生きている claim が無い … claim 中の返金は必ず `ERR_DELIVERY_IN_FLIGHT` で拒まれる
    *   - 商館の generic refund で戻せる支払い … 代替支払は必ず拒まれる
    * ものだけ。どちらも「押しても絶対に成功しないボタン」を作らないための条件で、
-   * **決着が済んだかどうかとは関係がない**。外れたものは §handoff 側で人へ渡す。
+   * **決着が済んだかどうかとは関係がない**。
+   *
+   * **外れ先は条件ごとに違う。**
+   *   - live claim があって外れた … `refundHandoffSql()` でもない。claim / 提供状況の
+   *     確認経路が先に authority を持つ（claim が解ければ、そのままどちらかへ移る）
+   *   - live claim は無く generic refund だけが unsupported … `refundHandoffSql()` へ。
+   *     運営判断が必要な案件として渡す
    */
   private static refundFailureSql(): string {
     return `${Shop.refundSettlementPendingSql()}

@@ -1079,13 +1079,25 @@ CREATE INDEX IF NOT EXISTS idx_shop_operator_resolutions_purchase
 -- イベントだけだと仕事の一覧に出せないので、durable に残して商館の正本から引く。
 --
 -- **この表は append-only。** 行そのものは消えないし、書き換えもしない。
--- 「いまどの導線に属するか」は行ではなく purchase の状態・delivered evidence・
--- 支払い方法から**派生**して決まる:
---   refunded / delivered … 正常に決着した。どの導線にも出ない
---   active + 未提供       … 決着が未了。商館の返金復旧か運営への引き継ぎへ
---   expired / cancelled   … 通常の導線からは外れる。**ただしそれだけでは決着済みと言わない**
---                           （issue history + terminal + delivered evidence なしは
---                            safetySnapshot の anomaly として surface する）
+-- 「いまどの導線に属するか」は行ではなく、purchase の状態・delivered evidence・
+-- **生きている external claim**・支払い方法から**派生**して決まる:
+--
+--   issue history
+--   ├ refunded / delivered
+--   │  → 正常に決着した。通常の導線には出ない
+--   │
+--   ├ active + 未提供
+--   │  ├ live claim あり
+--   │  │  → claim / 提供状況の確認が先に authority を持つ
+--   │  │     merchant recovery = false / operations handoff = false
+--   │  │
+--   │  └ live claim なし
+--   │     ├ generic refund supported   → 商館の返金復旧
+--   │     └ generic refund unsupported → operations handoff（運営判断）
+--   │
+--   └ expired / cancelled
+--      → 通常の導線からは外れる。**ただしそれだけでは決着済みと断定しない**
+--        （issue history + delivered evidence なしは safetySnapshot の anomaly）
 --
 -- 「通常の導線から外れた」ことと「金銭の決着が済んだ」ことを同じ語で言わない。
 CREATE TABLE IF NOT EXISTS shop_refund_failures (
