@@ -105,6 +105,7 @@ function queueCounts(services: Services): {
   stuck: number;
   refundOpen: number;
   blockedRevocations: number;
+  refundHandoffs: number;
 } {
   return {
     pending: services.shop.countPendingManual(),
@@ -120,6 +121,9 @@ function queueCounts(services: Services): {
     // **どの巡回も触らない剥奪。** worker は pending しか拾わないので、
     // blocked として failed に落ちた行は人が見るまで永久に残る
     blockedRevocations: services.shop.countBlockedRoleRevocations(),
+    // **商館では返せない返金。** 代替支払を含むので generic refund が扱えない。
+    // 商館の仕事には数えないが、放置すると利用者の資産が戻らないので必ず見せる
+    refundHandoffs: services.shop.countRefundHandoffs(),
   };
 }
 
@@ -132,6 +136,16 @@ function queueCounts(services: Services): {
  */
 function merchantWorkTotal(c: { pending: number; failed: number; stuck: number; refundOpen: number }): number {
   return c.pending + c.failed + c.stuck + c.refundOpen;
+}
+
+/**
+ * **商館では終わらせられない案件の総数。**
+ *
+ * 仕事の件数には入れない（押せる操作が無いので）が、存在は必ず見せる。
+ * 自動では進まないので、人へ渡さない限り永久に止まる。
+ */
+function operationsOnly(c: { blockedRevocations: number; refundHandoffs: number }): number {
+  return c.blockedRevocations + c.refundHandoffs;
 }
 
 /** 表示しきれなかった分の注記。押せないボタンを並べる代わりに件数で伝える */
@@ -165,15 +179,15 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
   const subPending = services.subAccounts.countByStatus("pending");
   const embed = new EmbedBuilder()
     .setTitle("🛠 冥界商館 管理")
-    .setColor(work > 0 ? 0xdc2626 : counts.blockedRevocations > 0 ? 0xf59e0b : 0x64748b)
+    .setColor(work > 0 ? 0xdc2626 : operationsOnly(counts) > 0 ? 0xf59e0b : 0x64748b)
     .setDescription(
       [
         work > 0 ? `**対応が必要な仕事: ${work}件**` : "対応が必要な仕事はありません。",
         // **商館スタッフの仕事には数えないが、存在は必ず見せる。**
         // 自動では進まず、人へ渡さない限り永久に止まるので、トップから発見できないと
         // 「誰も知らないまま止まり続ける」になる
-        counts.blockedRevocations > 0
-          ? `🧭 運営判断が必要: ${counts.blockedRevocations}件（商館では処理できません → 「対応が必要」で内容を確認）`
+        operationsOnly(counts) > 0
+          ? `🧭 運営判断が必要: ${operationsOnly(counts)}件（商館では処理できません → 「対応が必要」で内容を確認）`
           : "",
         oroleLegacy > 0 ? `オリジナルロールのカルテ移行待ち: ${oroleLegacy}件` : "",
         subPending > 0 ? `サブ垢の審査待ち: ${subPending}件` : "",
@@ -187,9 +201,9 @@ export function shopAdminPanelMessage(services: Services): MessageCreateOptions 
   const row = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder()
       .setCustomId("shokan:work")
-      .setLabel(work > 0 ? `対応が必要 ${work}` : counts.blockedRevocations > 0 ? "対応が必要（運営判断あり）" : "対応が必要")
+      .setLabel(work > 0 ? `対応が必要 ${work}` : operationsOnly(counts) > 0 ? "対応が必要（運営判断あり）" : "対応が必要")
       .setEmoji("📥")
-      .setStyle(work > 0 || counts.blockedRevocations > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
+      .setStyle(work > 0 || operationsOnly(counts) > 0 ? ButtonStyle.Primary : ButtonStyle.Secondary),
     new ButtonBuilder().setCustomId("shokan:list").setLabel("商品設定").setEmoji("📦").setStyle(ButtonStyle.Secondary),
     new ButtonBuilder()
       .setCustomId("shokan:orole")
@@ -245,10 +259,26 @@ function renderWorkHub(services: Services) {
         ? "対応が必要な仕事はありません。"
         : open.map((e) => `${e.emoji} **${e.label}　${e.count}件**\n-# ${e.what}`).join("\n\n"),
     );
+  if (c.refundHandoffs > 0) {
+    // **返せていない金がある。** 商館の返金は LD しか戻せないので操作を出さない。
+    // 剥奪の blocked とは別の話なので、フィールドも分ける
+    const rows = services.shop.listRefundHandoffs({ limit: 5 });
+    embed.addFields({
+      name: "🧭 運営判断が必要 — 商館では返せない返金（商館では処理できません）",
+      value: [
+        `**利用者へ返せていない購入が ${c.refundHandoffs}件あります。**`,
+        "支払いに land 以外が含まれるため、商館の返金では戻せません（何をどれだけ戻すかを商館が判断できません）。",
+        ...rows.map((r) => `・購入 #${r.purchaseId} — ${r.itemName} / <@${r.userId}>（${altPaymentLabel(r)}）`),
+        ...(c.refundHandoffs > rows.length ? [`・ほか ${c.refundHandoffs - rows.length}件`] : []),
+        "**運営へ「商館で返せない返金がある」と伝えてください。**",
+      ].join("\n"),
+      inline: false,
+    });
+  }
   if (c.blockedRevocations > 0) {
     // 商館では処理できない。**数字だけ出して終わりにしない**ので、誰へ渡すかまで書く
     embed.addFields({
-      name: "🧭 運営判断が必要（商館では処理できません）",
+      name: "🧭 運営判断が必要 — 期限切れの後片付け（商館では処理できません）",
       value: [
         `期限切れの後片付け ${c.blockedRevocations}件 が自動では進みません。`,
         "購入時に何を渡したのか証明できないため、商館側から取り消す操作は用意していません。",
@@ -678,6 +708,16 @@ function renderStuckDeliveries(services: Services, offset = 0) {
     new ButtonBuilder().setCustomId("shokan:hub").setLabel("← 商館ハブ").setStyle(ButtonStyle.Secondary),
   );
   return { embeds: [embed], components: cases.length > 0 ? [open, nav] : [backButton()] };
+}
+
+/** 何で払ったのかを、内部のキー名を出さずに書く */
+function altPaymentLabel(row: { paidAltKind: string | null; paidAltAmount: number | null; paidLand: number | null }): string {
+  const parts: string[] = [];
+  if (row.paidLand !== null && row.paidLand > 0) parts.push(fmtLd(row.paidLand));
+  if (row.paidAltKind !== null) {
+    parts.push(row.paidAltAmount !== null ? `${row.paidAltKind} ${row.paidAltAmount}` : row.paidAltKind);
+  }
+  return parts.length > 0 ? `支払い: ${parts.join(" ＋ ")}` : "支払い方法が land 以外";
 }
 
 function stuckReasonLabel(reason: string): string {

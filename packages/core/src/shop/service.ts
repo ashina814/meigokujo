@@ -2687,7 +2687,7 @@ export class Shop {
       //
       // **提供状況より先に見る。** どちらも資産を動かさずに止めるが、こちらの方が
       // 理由として具体的（何で払ったかは提供状況と無関係に分かっている）。
-      if (purchase.paid_alt_kind !== null || purchase.paid_alt_amount !== null) {
+      if (!Shop.genericRefundSupportedRow(purchase)) {
         throw new ShopError("ERR_ALT_REFUND_UNSUPPORTED", { purchaseId });
       }
       // 「証拠が無い＝未提供」でもない。**不明は不明として止める。**
@@ -3156,8 +3156,7 @@ export class Shop {
     const item = this.getItem(purchase.item_id);
     const amount = purchase.paid_land ?? 0;
     // 代替支払を含む購入は generic refund の対象外（Phase C）。ここでも返金は出さない。
-    const refundSupported =
-      purchase.paid_alt_kind === null && purchase.paid_alt_amount === null && purchase.status === "active";
+    const refundSupported = Shop.genericRefundSupportedRow(purchase) && purchase.status === "active";
     // **「もう一度配る」は、実際に配れるときだけ。** `delivery_kind` が読めることは
     // 「配り直せる」の証明ではない（購入時 provenance が無い旧購入でも読める）。
     const retrySupported = this.deliveryRetryEligible(purchaseId);
@@ -3618,6 +3617,23 @@ export class Shop {
    * **解消は purchase の状態で決まる。** 返金・失効・提供済みのいずれかになれば
    * 自動的にこの一覧から消えるので、記録を後から書き換える必要が無い。
    */
+  /**
+   * **商館の generic refund で返せる支払いか。**
+   *
+   * `paid_alt_*` を含む購入は generic refund の対象外——何をどこへ戻すべきかを
+   * generic refund は知らないし、`paid_alt_*` は「実際にその資源が減った」証拠でもない。
+   * `refundWith()` の拒否条件と**同じ定義**を、一覧・件数・画面でも使う。
+   * `paid_land` の値から推測しない。
+   */
+  private static genericRefundSupportedSql(): string {
+    return "(p.paid_alt_kind IS NULL AND p.paid_alt_amount IS NULL)";
+  }
+
+  /** 上と同じ判定を1行へ当てる */
+  private static genericRefundSupportedRow(purchase: PurchaseRow): boolean {
+    return purchase.paid_alt_kind === null && purchase.paid_alt_amount === null;
+  }
+
   private static refundFailureSql(): string {
     // **提供済みなら「返金の未完了」ではない。** `delivery_state` だけを見ると、
     // 正常に提供できた購入（active + delivered）が返金待ちとして残り続ける。
@@ -3635,7 +3651,73 @@ export class Shop {
         SELECT 1 FROM shop_external_delivery_attempts a
          WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
       )
+      -- **商館で返せない支払いは、商館の仕事にしない。** 代替支払を含む購入は
+      -- generic refund が必ず ERR_ALT_REFUND_UNSUPPORTED で拒むので、キューへ出すと
+      -- 「押しても絶対に成功しないボタン」になり、押すたびに失敗記録だけが積まれる。
+      -- 履歴は消さず、refundHandoffSql() の方（運営判断が必要）で発見できるようにする。
+      AND ${Shop.genericRefundSupportedSql()}
       AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+  }
+
+  /**
+   * **返すべき金が残っているが、商館では返せない購入。**
+   *
+   * 代替支払を含むので generic refund が扱えない。商館スタッフに処理 authority が
+   * 無いので「対応が必要な仕事」には数えないが、**黙って消さない**——誰も知らないまま
+   * 利用者の資産が戻らない、が最悪の結末なので、運営判断が必要な案件として出す。
+   *
+   * 剥奪の `blocked` とは別物。あちらは「与えたか証明できないので取り消せない」、
+   * こちらは「返す先の資源を generic refund が知らない」。
+   */
+  private static refundHandoffSql(): string {
+    return `p.status = 'active'
+      AND p.delivered_at IS NULL
+      AND NOT ${Shop.DELIVERED_EVIDENCE_SQL}
+      AND NOT EXISTS (
+        SELECT 1 FROM shop_external_delivery_attempts a
+         WHERE a.purchase_id = p.id AND a.state IN ('in_flight','uncertain')
+      )
+      AND NOT ${Shop.genericRefundSupportedSql()}
+      AND EXISTS (SELECT 1 FROM shop_refund_failures f WHERE f.purchase_id = p.id)`;
+  }
+
+  /** 商館では返せない返金案件。運営へ渡すために出す */
+  listRefundHandoffs(opts: { limit?: number; offset?: number } = {}): Array<{
+    purchaseId: number;
+    userId: string;
+    itemName: string;
+    paidAltKind: string | null;
+    paidAltAmount: number | null;
+    paidLand: number | null;
+    failedAt: number;
+  }> {
+    return this.db
+      .prepare(
+        `SELECT p.id AS purchaseId, p.user_id AS userId, i.name AS itemName,
+                p.paid_alt_kind AS paidAltKind, p.paid_alt_amount AS paidAltAmount, p.paid_land AS paidLand,
+                (SELECT MIN(f.failed_at) FROM shop_refund_failures f WHERE f.purchase_id = p.id) AS failedAt
+           FROM shop_purchases p
+           JOIN shop_items i ON i.id = p.item_id
+          WHERE ${Shop.refundHandoffSql()}
+          ORDER BY failedAt ASC, p.id ASC
+          LIMIT ? OFFSET ?`,
+      )
+      .all(opts.limit ?? 25, Math.max(0, opts.offset ?? 0)) as Array<{
+      purchaseId: number;
+      userId: string;
+      itemName: string;
+      paidAltKind: string | null;
+      paidAltAmount: number | null;
+      paidLand: number | null;
+      failedAt: number;
+    }>;
+  }
+
+  countRefundHandoffs(): number {
+    return this.db
+      .prepare(`SELECT COUNT(*) FROM shop_purchases p WHERE ${Shop.refundHandoffSql()}`)
+      .pluck()
+      .get() as number;
   }
 
   /** 上と**同じ判定**を1件へ当てる。一覧・件数・確認・確定で条件を分けない。 */
@@ -3747,10 +3829,17 @@ export class Shop {
     try {
       return this.refund(input.purchaseId, "運営: 返金のやり直し", input.actor);
     } catch (error) {
-      // **「提供済みなので返さない」は失敗ではない。** 正しく拒んだだけなので、
-      // 追記専用の監査へ「返金を試して失敗した」という嘘の証拠を残さない。
-      // `refundOrRecordFailure()` と同じ扱いにそろえる。
-      if (error instanceof ShopError && error.code === "ERR_ALREADY_DELIVERED") throw error;
+      // **「返してはいけない／ここでは返せない」は、返金の失敗ではない。**
+      //
+      // `refundWith()` が投げる `ShopError` は**すべて事前条件の拒否**で、資産は1つも
+      // 動いていない（提供済み・代替支払・配送中・結末が不明・既に終わっている・
+      // 別経路が先に確定した）。それを `retry_failed` として積むと、追記専用の監査に
+      // 「返金を試して失敗した」という嘘の証拠が残る。
+      //
+      // 逆に、台帳側の失敗（`LedgerError` や予期しない例外）は**本当に返せなかった**
+      // ということなので、必ず記録する。`ShopError` かどうかが境界で、コードを
+      // 個別に whitelist しているわけではない——`Ledger` は `ShopError` を投げない。
+      if (error instanceof ShopError) throw error;
       this.recordRefundFailure({
         purchaseId: input.purchaseId,
         amount: purchase.paid_land ?? 0,

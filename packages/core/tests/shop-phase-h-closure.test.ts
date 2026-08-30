@@ -334,6 +334,230 @@ describe("Hardening 2: 生きている claim がある間は、返金の復旧�
   });
 });
 
+describe("Round 2: 商館で返せない購入を、返金キューへ出さない", () => {
+  /**
+   * 代替支払を含む**いまのコードが作った**購入。generic refund は必ず
+   * `ERR_ALT_REFUND_UNSUPPORTED` で拒む。provenance を持つので「結末が分からない旧購入」
+   * ではない——確認待ちではなく、純粋に「返せない」だけの案件になる。
+   */
+  function altPaid(ctx: Ctx, userId = "u-alt"): number {
+    const id = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,paid_alt_kind,paid_alt_amount,status,delivery_state,delivery_snapshot_json)
+         VALUES (?,?,1,0,'invite',5,'active','pending',?) RETURNING id`,
+      )
+      .pluck()
+      .get(
+        ctx.item.id,
+        userId,
+        JSON.stringify({ delivery: "auto", delivery_kind: "add_role", delivery_data: { role_id: ROLE } }),
+      ) as number;
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_purchase_fulfillment_provenance (purchase_id,delivery_mode,stock_consumed,captured_at,source)
+         VALUES (?, 'auto', 0, 1, 'storefront')`,
+      )
+      .run(id);
+    return id;
+  }
+
+  it("Scenario A — land 払いの本当の返金失敗は、これまでどおり商館の仕事", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+
+    expect(queues(ctx, p.id).refund).toBe(true);
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    expect(ctx.shop.countRefundHandoffs()).toBe(0);
+    const quote = ctx.shop.quoteRefundRetry(p.id);
+    expect(quote.open).toBe(true);
+    const before = ctx.ledger.balanceOf(`user:${USER}`);
+    expect(ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: quote.token, actor: STAFF }).refunded).toBe(true);
+    expect(ctx.ledger.balanceOf(`user:${USER}`)).toBe(before + 100);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    ctx.db.close();
+  });
+
+  it("Scenario B — 代替支払は証拠を残したまま、商館の返金キューへ出さない", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    // 自動返金は必ず拒まれ、escalation の証拠が durable に残る
+    const outcome = ctx.shop.refundOrRecordFailure(id, "delivery_failed", "system");
+    expect(outcome).toMatchObject({ failed: true, code: "ERR_ALT_REFUND_UNSUPPORTED" });
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(id)).toBe(1);
+
+    // 商館の仕事には出さない
+    expect(queues(ctx, id).refund).toBe(false);
+    expect(ctx.shop.countRefundFailures()).toBe(0);
+    expect(ctx.shop.quoteRefundRetry(id).open).toBe(false);
+    // 商館の仕事としては1件も出さない（二重計上どころか、押せる操作が無い）
+    expect(queueCount(queues(ctx, id))).toBe(0);
+
+    // **運営判断が必要な案件として発見できる**
+    expect(ctx.shop.countRefundHandoffs()).toBe(1);
+    const row = ctx.shop.listRefundHandoffs()[0]!;
+    expect(row).toMatchObject({ purchaseId: id, paidAltKind: "invite", paidAltAmount: 5 });
+    ctx.db.close();
+  });
+
+  it("Scenario C — 代替支払への古い返金やり直しは、1つも書かない", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+    const before = {
+      status: ctx.shop.getPurchase(id)!.status,
+      land: ctx.ledger.balanceOf("user:u-alt"),
+      failures: ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(id),
+    };
+
+    const quote = ctx.shop.quoteRefundRetry(id);
+    expect(quote.open).toBe(false);
+    expect(() => ctx.shop.retryRefund({ purchaseId: id, expectedToken: quote.token, actor: STAFF })).toThrow(
+      /ERR_RESOLUTION_NOT_APPLICABLE/,
+    );
+
+    expect(ctx.shop.getPurchase(id)!.status).toBe(before.status);
+    expect(ctx.ledger.balanceOf("user:u-alt")).toBe(before.land);
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(id)).toBe(
+      before.failures,
+    );
+    // 「返金できる」表示にも戻らない
+    expect(ctx.shop.quoteRefundRetry(id).open).toBe(false);
+    expect(queues(ctx, id).refund).toBe(false);
+    ctx.db.close();
+  });
+
+  it("Scenario C' — authority が拒んだだけなら retry_failed を積まない", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+
+    // 事前 guard を通り抜けて refund() まで届いた場合（競合）でも記録しない
+    const real = ctx.shop.refund.bind(ctx.shop);
+    (ctx.shop as unknown as { refund: unknown }).refund = () => {
+      throw new ShopError("ERR_ALT_REFUND_UNSUPPORTED", { purchaseId: id });
+    };
+    let code: string | undefined;
+    try {
+      ctx.shop.retryRefund({ purchaseId: id, expectedToken: "x", actor: STAFF });
+    } catch (error) {
+      code = (error as { code?: string }).code;
+    }
+    (ctx.shop as unknown as { refund: unknown }).refund = real;
+
+    // stale guard が先に効く。どちらにせよ記録は増えない
+    expect(code === "ERR_RESOLUTION_STALE" || code === "ERR_ALT_REFUND_UNSUPPORTED").toBe(true);
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(id)).toBe(1);
+    ctx.db.close();
+  });
+
+  it("Scenario D — live claim + 代替支払でも二重計上せず、失効も止まったまま", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    const claim = ctx.shop.claimExternalDelivery({ purchaseId: id, deliveryKind: "add_role", actor: "system" }) as {
+      token: string;
+    };
+    ctx.shop.markExternalDeliveryUncertain({ purchaseId: id, token: claim.token, reason: "x", actor: "system" });
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(id);
+
+    // authority が強い方（claim）だけが商館の仕事になる
+    expect(queues(ctx, id).confirm).toBe(true);
+    expect(queues(ctx, id).refund).toBe(false);
+    expect(queueCount(queues(ctx, id))).toBe(1);
+    // claim 中は運営 handoff にも二重で出さない
+    expect(ctx.shop.countRefundHandoffs()).toBe(0);
+    // 失効の guard に切れ目を作らない
+    expect(ctx.shop.expireIfDue(id, STAFF)).toEqual({ expired: false, reason: "delivery_in_flight" });
+
+    // claim が解ければ、商館では返せない案件として運営へ出る
+    ctx.shop.releaseExternalDelivery({ purchaseId: id, token: claim.token, reason: "operator", actor: STAFF });
+    expect(ctx.shop.countRefundHandoffs()).toBe(1);
+    expect(queues(ctx, id).refund).toBe(false);
+    ctx.db.close();
+  });
+
+  it("決着画面でも、商館で返せない購入に「返金する」を出さない", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    // 外部へ投げたが結果が分からない＝確認待ちの案件になる
+    const claim = ctx.shop.claimExternalDelivery({ purchaseId: id, deliveryKind: "add_role", actor: "system" }) as {
+      token: string;
+    };
+    ctx.shop.markExternalDeliveryUncertain({ purchaseId: id, token: claim.token, reason: "x", actor: "system" });
+
+    const quote = ctx.shop.quoteOperatorResolution(id);
+    expect(quote.kind).toBe("uncertain_delivery");
+    // **返金を伴う決着は出さない。** 出すと ERR_ALT_REFUND_UNSUPPORTED で必ず失敗する
+    expect(quote.refundSupported).toBe(false);
+    expect(() =>
+      ctx.shop.resolveOperatorCase({
+        purchaseId: id,
+        decision: "no_effect",
+        refund: true,
+        expectedToken: quote.token,
+        actor: STAFF,
+        note: "ロールが無いことを確認",
+      }),
+    ).toThrow(/ERR_ALT_REFUND_UNSUPPORTED/);
+    ctx.db.close();
+  });
+
+  it("台帳が落ちた本当の失敗は記録し、authority の拒否は記録しない", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    const rows = () =>
+      ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(p.id) as number;
+
+    // (1) authority の拒否（ShopError）＝ 資産は動いていない。記録しない
+    const real = ctx.shop.refund.bind(ctx.shop);
+    (ctx.shop as unknown as { refund: unknown }).refund = () => {
+      throw new ShopError("ERR_ALT_REFUND_UNSUPPORTED", { purchaseId: p.id });
+    };
+    expect(() =>
+      ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: ctx.shop.quoteRefundRetry(p.id).token, actor: STAFF }),
+    ).toThrow(/ERR_ALT_REFUND_UNSUPPORTED/);
+    expect(rows()).toBe(1);
+
+    // (2) 台帳側の失敗＝ 本当に返せなかった。必ず記録する
+    (ctx.shop as unknown as { refund: unknown }).refund = () => {
+      throw new Error("ledger unavailable");
+    };
+    expect(() =>
+      ctx.shop.retryRefund({ purchaseId: p.id, expectedToken: ctx.shop.quoteRefundRetry(p.id).token, actor: STAFF }),
+    ).toThrow(/ledger unavailable/);
+    expect(rows()).toBe(2);
+
+    (ctx.shop as unknown as { refund: unknown }).refund = real;
+    ctx.db.close();
+  });
+
+  it("land 払いなら handoff ではなく、商館の仕事のまま", () => {
+    const ctx = setup();
+    const p = buy(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: p.id, amount: 100, reason: "delivery_failed", actor: "system" });
+    expect(ctx.shop.countRefundHandoffs()).toBe(0);
+    expect(ctx.shop.countRefundFailures()).toBe(1);
+    ctx.db.close();
+  });
+
+  it("返金されれば handoff からも消える（履歴は残る）", () => {
+    const ctx = setup();
+    const id = altPaid(ctx);
+    ctx.shop.recordRefundFailure({ purchaseId: id, amount: 0, reason: "delivery_failed", actor: "system" });
+    expect(ctx.shop.countRefundHandoffs()).toBe(1);
+
+    // 運営が別経路で決着させた（ここでは status を終端へ動かす操作で代表させる）
+    ctx.db.prepare("UPDATE shop_purchases SET status='refunded' WHERE id=?").run(id);
+
+    expect(ctx.shop.countRefundHandoffs()).toBe(0);
+    // 追記専用の証拠は消えない
+    expect(ctx.db.prepare("SELECT COUNT(*) FROM shop_refund_failures WHERE purchase_id=?").pluck().get(id)).toBe(1);
+    ctx.db.close();
+  });
+});
+
 describe("Hardening 3: 「提供済みなので返さない」を失敗として記録しない", () => {
   it("提供済みの購入への古い返金やり直しは、1つも書かずに拒む", () => {
     const ctx = setup();
