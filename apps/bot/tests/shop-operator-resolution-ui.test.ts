@@ -239,7 +239,46 @@ describe("運営の決着UI", () => {
     expect(content(confirm)).toContain("何も変更していません");
     expect(landOf(ctx)).toBe(before);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
-    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
+    // 先に通った「提供済み」の決着だけが残る。古い画面からの返金は1つも書いていない
+    expect(ctx.shop.safetySnapshot(p.id)!.operatorCase.decided).toBe("delivered");
+    expect(ctx.shop.operatorResolutions(p.id)).toHaveLength(1);
+    ctx.db.close();
+  });
+
+  /**
+   * **本番に39件ある形。** ボタンは前から出ていたが、押すと必ず
+   * 「何も変更していません」で終わっていた——移行の推測値
+   * （`delivery_state='delivered'`）が exactly-once guard に引っかかり、
+   * Core が `ERR_RESOLUTION_STALE` を投げていたため。
+   */
+  it("旧購入でも「提供できていた」が最後まで通る", async () => {
+    const { handleShokanButton } = await shokanModule;
+    const { handleShokanModal } = await shokanModule;
+    const ctx = setup();
+    const id = ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases (item_id,user_id,purchased_at,paid_land,status,delivery_state)
+         VALUES (?,?,1,100,'active','delivered') RETURNING id`,
+      )
+      .pluck()
+      .get(ctx.item.id, USER) as number;
+    expect(ctx.shop.unresolvedCaseKind(id)).toBe("legacy_unknown");
+    const before = landOf(ctx);
+
+    const modalId = await openNoteModal(handleShokanButton, ctx.services, id, "shokan:case-pre:delivered:");
+    const confirm = vi.fn(async () => undefined);
+    await handleShokanModal(submitNote(modalId, "本人に確認。利用済み", confirm), ctx.services);
+
+    // **止まらない。** 「何も変更していません」で終わっていたのがこのバグ
+    expect(content(confirm)).not.toContain("何も変更していません");
+    expect(ctx.shop.operatorResolutions(id)).toHaveLength(1);
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.evidence).toBe(true);
+    // 金銭は動かない。配送も実行していない
+    expect(landOf(ctx)).toBe(before);
+    expect(ctx.shop.getPurchase(id)!.delivered_at).toBeNull();
+    expect(ctx.events.listByType("shop_delivered")).toHaveLength(0);
+    // 確認キューから消える
+    expect(ctx.shop.listUnresolvedCases({ limit: 100 }).some((c) => c.purchaseId === id)).toBe(false);
     ctx.db.close();
   });
 

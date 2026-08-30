@@ -82,6 +82,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
     const p = buy(ctx);
     uncertain(ctx, p.id);
     const before = landOf(ctx);
+    const stateBefore = ctx.shop.getPurchase(p.id)!.delivery_state;
     const quote = ctx.shop.quoteOperatorResolution(p.id);
     expect(quote.kind).toBe("uncertain_delivery");
 
@@ -95,8 +96,13 @@ describe("運営による決着 — 外部配送の未確定", () => {
 
     expect(result.decision).toBe("delivered");
     expect(result.refunded).toBe(false);
-    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
-    expect(ctx.events.listByType("shop_delivered")).toHaveLength(1);
+    // **決着は「外で提供された事実の確認」なので、配送そのものはやっていない。**
+    // 工程の状態も配送eventも作らない——作れば、実行していない配送を実行したことにする
+    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe(stateBefore);
+    expect(ctx.shop.getPurchase(p.id)!.delivered_at).toBeNull();
+    expect(ctx.events.listByType("shop_delivered")).toHaveLength(0);
+    // 確認そのものが提供済みの正本になる
+    expect(ctx.shop.safetySnapshot(p.id)!.fulfillment.evidence).toBe(true);
     expect(ctx.events.listByType("shop_refunded")).toHaveLength(0);
     expect(landOf(ctx)).toBe(before);
     expect(ctx.shop.externalDeliveryClaim(p.id)).toBeUndefined();
@@ -193,7 +199,8 @@ describe("運営による決着 — 外部配送の未確定", () => {
     expect(row.refunded).toBe(0);
     const after = JSON.parse(row.after_state) as Record<string, unknown>;
     expect(after).toMatchObject({ decision: "delivered", status: "active", claimState: "settled", refunded: false });
-    expect(after.deliveryState).toBe("delivered");
+    // 工程の状態は決着で動かないので、監査行にも動かない値が残る
+    expect(after.deliveryState).toBe(ctx.shop.getPurchase(p.id)!.delivery_state);
     ctx.db.close();
   });
 
@@ -282,7 +289,8 @@ describe("運営による決着 — 外部配送の未確定", () => {
     // 0 financial mutation / 0 status overwrite
     expect(landOf(ctx)).toBe(before);
     expect(ctx.shop.getPurchase(p.id)!.status).toBe("active");
-    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
+    // 先に通った決着だけが証拠として立っている（2つ目は1行も書いていない）
+    expect(ctx.shop.safetySnapshot(p.id)!.operatorCase.decided).toBe("delivered");
     expect(resolutionsOf(ctx, p.id)).toHaveLength(1);
     ctx.db.close();
   });
@@ -367,7 +375,7 @@ describe("運営による決着 — 外部配送の未確定", () => {
       ctx.shop.resolveOperatorCase({ purchaseId: p.id, decision: "no_effect", expectedToken: b.token, actor: OTHER, refund: true , note: "運営確認済み" }),
     ).toThrow(expect.objectContaining({ code: "ERR_RESOLUTION_STALE" }));
 
-    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
+    expect(ctx.shop.safetySnapshot(p.id)!.operatorCase.decided).toBe("delivered");
     expect(landOf(ctx)).toBe(before);
     expect(resolutionsOf(ctx, p.id)).toHaveLength(1);
     ctx.db.close();
@@ -542,7 +550,7 @@ describe("根拠が無ければ決着させない（Core側のauthority）", () 
 
     // 前後の空白は落として保存する
     expect(resolutionsOf(ctx, p.id)[0]!.note).toBe("ロールを確認");
-    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
+    expect(ctx.shop.safetySnapshot(p.id)!.fulfillment.evidence).toBe(true);
     ctx.db.close();
   });
 });
@@ -1228,7 +1236,9 @@ describe("運営による決着 — 旧購入の不明", () => {
       note: "当時の対応記録を確認",
     });
 
-    expect(ctx.shop.getPurchase(p.id)!.delivery_state).toBe("delivered");
+    // **偽の配送日時を作らずに**提供済みの正本が立つ
+    expect(ctx.shop.getPurchase(p.id)!.delivered_at).toBeNull();
+    expect(ctx.shop.safetySnapshot(p.id)!.fulfillment.evidence).toBe(true);
     expect(ctx.shop.unresolvedCaseKind(p.id)).toBeNull();
     ctx.db.close();
   });
