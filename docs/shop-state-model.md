@@ -244,7 +244,7 @@ claim 保持中
 → 前者は仕事なし／後者は「返金をやり直す」キュー
 ```
 
-**この間、守りが外れていて未返金の瞬間は存在しない。**
+**この間、守りが外れていて決着も未了、という瞬間は存在しない。**
 別接続から観測できるのは「claim保持」「返金済み」「義務あり」の3つだけ。
 
 ### 結果が分からない
@@ -352,7 +352,7 @@ legacy や事故で、理論上あり得ない組み合わせが実在しうる�
 | 種別 | 意味 |
 |---|---|
 | `terminal_purchase_with_live_claim:<status>` | 終わった購入に生きた claim が残っている |
-| `terminal_with_refund_failure_history_without_delivery_evidence:<status>` | 終わった購入（`expired` / `cancelled`）に、返金を試して失敗した記録だけが残っている。**金の決着を人が監査する必要がある**——「返った」とも「未返金が確定した」とも言わない（「返金を試して失敗した」とは限らない） |
+| `terminal_with_refund_failure_history_without_delivery_evidence:<status>` | 終わった購入（`expired` / `cancelled`）に、自動決着の対応記録だけが残っている。**金の決着を人が監査する必要がある**——「返った」とも「返っていないと確定した」とも言わない（実際に返金を試したかも行からは分からない） |
 | `delivered_evidence_vs_operator_no_effect` | 提供済みの証拠と「提供なし」の人の判断が同時に立っている |
 | `delivered_evidence_vs_open_refund_recovery` | 提供済みの証拠があるのに返金の導線が開いている。正本の定義上ありえない |
 | `refund_recovery_and_handoff_both_open` | 商館の仕事と運営への引き継ぎは排他。両方に出るなら述語がズレている |

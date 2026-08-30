@@ -1074,12 +1074,20 @@ CREATE INDEX IF NOT EXISTS idx_shop_operator_resolutions_purchase
 -- generic refund が authority 上扱えない場合（代替支払）も、運営への引き継ぎを
 -- durable にするためにここへ積む。行だけから実際の試行有無は判断できない。
 --
--- 「提供できたか確認できないので返金を試していない」(withheld) とは別物。
--- 前者は利用者の資産が戻っていないので運営が復旧する必要があり、後者は確認待ち。
+-- 「提供できたか確認できないので返金の判断自体をしていない」(withheld) は別経路で、
+-- この writer を使わない。あちらはまだ結末が分からないだけで、決着を試してすらいない。
 -- イベントだけだと仕事の一覧に出せないので、durable に残して商館の正本から引く。
 --
--- 解消は purchase の状態で決まる（refunded / expired / delivered になれば対象外）ので、
--- この表を後から書き換える必要は無い＝append-only のままでよい。
+-- **この表は append-only。** 行そのものは消えないし、書き換えもしない。
+-- 「いまどの導線に属するか」は行ではなく purchase の状態・delivered evidence・
+-- 支払い方法から**派生**して決まる:
+--   refunded / delivered … 正常に決着した。どの導線にも出ない
+--   active + 未提供       … 決着が未了。商館の返金復旧か運営への引き継ぎへ
+--   expired / cancelled   … 通常の導線からは外れる。**ただしそれだけでは決着済みと言わない**
+--                           （issue history + terminal + delivered evidence なしは
+--                            safetySnapshot の anomaly として surface する）
+--
+-- 「通常の導線から外れた」ことと「金銭の決着が済んだ」ことを同じ語で言わない。
 CREATE TABLE IF NOT EXISTS shop_refund_failures (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   purchase_id INTEGER NOT NULL REFERENCES shop_purchases(id),

@@ -3766,7 +3766,7 @@ export class Shop {
    *
    * したがって **false を「金銭的な義務が無い」と読んではいけない。**
    * この一覧から外れることと、金銭の決着が済んだことは別の事実で、
-   * 前者を後者の証明に使うと未返金が黙って消える。金が戻ったと言えるのは
+   * 前者を後者の証明に使うと、決着の未了が黙って消える。金が戻ったと言えるのは
    * `status = 'refunded'` だけ。terminal へ落ちたまま失敗履歴だけが残っている購入は、
    * `safetySnapshot().contradictions` が監査対象として surface する。
    */
@@ -3833,14 +3833,19 @@ export class Shop {
   }
 
   /**
-   * **返すべき金が残っているが、商館では返せない購入。**
+   * **自動決着が未了で、generic refund では処理できない購入。**
    *
-   * 代替支払を含むので generic refund が扱えない。商館スタッフに処理 authority が
-   * 無いので「対応が必要な仕事」には数えないが、**黙って消さない**——誰も知らないまま
-   * 利用者の資産が戻らない、が最悪の結末なので、運営判断が必要な案件として出す。
+   * 代替支払を含むため、generic refund には「何を・どこへ・どれだけ戻すべきか」を
+   * 判断する authority がない。商館スタッフに処理権限が無いので「対応が必要な仕事」には
+   * 数えないが、**黙って消さない**——決着が未了の案件を誰にも知らせないまま失効・消失
+   * させないために、運営判断が必要な案件として出す。
+   *
+   * **未返却の資産をこの述語から断定しない。** `paid_alt_*` は実際にその資源が減った
+   * 証拠ではない（Phase C 以来の contract）ので、何がどれだけ戻っていないかは
+   * ここでは決まらない。言えるのは「決着が未了で、商館では安全に完了できない」まで。
    *
    * 剥奪の `blocked` とは別物。あちらは「与えたか証明できないので取り消せない」、
-   * こちらは「返す先の資源を generic refund が知らない」。
+   * こちらは「戻す先と量を generic refund が判断できない」。
    */
   private static refundHandoffSql(): string {
     return `${Shop.refundSettlementPendingSql()}
@@ -5040,7 +5045,7 @@ export class Shop {
    * **見るのは「商館で返せるか」ではなく「決着が済んだか」。** 商館の
    * `refundFailureOpen()` を使うと、代替支払のように商館では返せない購入が
    * 「商館の仕事ではない」という理由だけで失効し、運営への引き継ぎ一覧
-   * （`status='active'` を要求する）からも消える——未返金のまま導線が全部消える。
+   * （`status='active'` を要求する）からも消える——決着が未了のまま導線が全部消える。
    */
   expiryBlockedBy(purchaseId: number): ExpiryBlockedReason | null {
     if (this.externalDeliveryInFlight(purchaseId)) return "delivery_in_flight";

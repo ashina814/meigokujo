@@ -276,7 +276,7 @@ describe("商館で処理できない仕事を押し付けない", () => {
     const f = fields(hub);
     // 剥奪の話と混ぜない
     expect(f).toContain("商館では返せない返金");
-    expect(f).toContain("利用者へ返せていない購入");
+    expect(f).toContain("決着がついていない購入");
     expect(f).toContain("運営へ");
     // 押せば必ず失敗するボタンを出さない
     const ids = (payload(hub)?.components ?? []).flatMap((r: any) => (r.components ?? []).map((c: any) => c.data?.custom_id ?? ""));

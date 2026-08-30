@@ -121,8 +121,8 @@ function queueCounts(services: Services): {
     // **どの巡回も触らない剥奪。** worker は pending しか拾わないので、
     // blocked として failed に落ちた行は人が見るまで永久に残る
     blockedRevocations: services.shop.countBlockedRoleRevocations(),
-    // **商館では返せない返金。** 代替支払を含むので generic refund が扱えない。
-    // 商館の仕事には数えないが、放置すると利用者の資産が戻らないので必ず見せる
+    // **商館では決着できない返金案件。** 代替支払を含むので generic refund が扱えない。
+    // 商館の仕事には数えないが、放置すると決着が未了のまま止まるので必ず見せる
     refundHandoffs: services.shop.countRefundHandoffs(),
   };
 }
@@ -260,13 +260,13 @@ function renderWorkHub(services: Services) {
         : open.map((e) => `${e.emoji} **${e.label}　${e.count}件**\n-# ${e.what}`).join("\n\n"),
     );
   if (c.refundHandoffs > 0) {
-    // **返せていない金がある。** 商館の返金は LD しか戻せないので操作を出さない。
+    // **決着が未了の案件がある。** 商館の返金は LD しか戻せないので操作を出さない。
     // 剥奪の blocked とは別の話なので、フィールドも分ける
     const rows = services.shop.listRefundHandoffs({ limit: 5 });
     embed.addFields({
       name: "🧭 運営判断が必要 — 商館では返せない返金（商館では処理できません）",
       value: [
-        `**利用者へ返せていない購入が ${c.refundHandoffs}件あります。**`,
+        `**決着がついていない購入が ${c.refundHandoffs}件あります。**`,
         "支払いに land 以外が含まれるため、商館の返金では戻せません（何をどれだけ戻すかを商館が判断できません）。",
         ...rows.map((r) => `・購入 #${r.purchaseId} — ${r.itemName} / <@${r.userId}>（${altPaymentLabel(r)}）`),
         ...(c.refundHandoffs > rows.length ? [`・ほか ${c.refundHandoffs - rows.length}件`] : []),
