@@ -1068,6 +1068,37 @@ CREATE TABLE IF NOT EXISTS shop_operator_resolutions (
 );
 CREATE INDEX IF NOT EXISTS idx_shop_operator_resolutions_purchase
   ON shop_operator_resolutions(purchase_id, resolved_at);
+-- Phase I: **Bot自身が外部効果の成立を独立に確認できた**という事実。
+--
+-- 運営の決着（shop_operator_resolutions）と同じく「提供済みの証拠」だが、
+-- 確認したのが人ではなく writer 自身、という点だけが違う。**工程を進める処理ではない**
+-- ので、この行を積んでも delivery_state も delivered_at も動かさない。
+--
+-- なぜ別表か:
+--   * shop_purchase_fulfillment_provenance は「購入時に何だったか」を凍結する表で、
+--     事後の観測を入れると意味が変わる
+--   * shop_operator_resolutions は**人の判断**の表。Botの行を混ぜると
+--     OPERATOR_DECIDED_SQL（人が決着させたか）まで汚れる
+--   * event だけだと一意性を DB に守らせられず、再試行のたびに証拠が増える
+--
+-- **effect_target は剥奪対象の authority ではない。** 「何を与えたか」の観測であって
+-- 「将来何を剥がしてよいか」は購入時の不変な証拠（roleGrantTarget()）だけが決める。
+-- ここを剥奪へ流用すると、観測の副産物で契約内容が書き換わる。
+--
+-- UNIQUE(purchase_id, source) が冪等性の正本。同じ確認を何度やり直しても
+-- 証拠は1行に収束する（ON CONFLICT DO NOTHING）。
+CREATE TABLE IF NOT EXISTS shop_verified_delivery_evidence (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  purchase_id   INTEGER NOT NULL REFERENCES shop_purchases(id),
+  source        TEXT NOT NULL CHECK (source IN ('timed_access_role_added_and_refetched')),
+  writer        TEXT NOT NULL,
+  effect_target TEXT,
+  detail        TEXT,
+  observed_at   INTEGER NOT NULL,
+  UNIQUE (purchase_id, source)
+);
+CREATE INDEX IF NOT EXISTS idx_shop_verified_delivery_evidence_purchase
+  ON shop_verified_delivery_evidence(purchase_id, observed_at);
 -- Phase H: **自動の返金・決着がその場で完了しなかった**という事実。
 --
 -- テーブル名は歴史的なもので、行は「実際に振替を試して失敗した」だけを表さない。
@@ -1120,6 +1151,16 @@ CREATE TRIGGER IF NOT EXISTS trg_shop_refund_failures_no_delete
 BEFORE DELETE ON shop_refund_failures
 BEGIN
   SELECT RAISE(ABORT, 'shop refund failures are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_verified_delivery_evidence_no_update
+BEFORE UPDATE ON shop_verified_delivery_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'shop verified delivery evidence is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_verified_delivery_evidence_no_delete
+BEFORE DELETE ON shop_verified_delivery_evidence
+BEGIN
+  SELECT RAISE(ABORT, 'shop verified delivery evidence is append-only');
 END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_operator_resolutions_no_update
 BEFORE UPDATE ON shop_operator_resolutions

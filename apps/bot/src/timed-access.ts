@@ -17,6 +17,20 @@ function errorCode(error: unknown): number | undefined {
   return Number.isFinite(code) ? code : undefined;
 }
 
+/**
+ * Discordへの操作は (利用者, ロール) 単位で1回でよいので、契約をそこへ畳む。
+ *
+ * **畳んだ結果の `purchase` は「代表」でしかない。** 同じロールを与える有効な契約が
+ * 複数あると、`Map.set` の後勝ちで **id が最大の購入**だけが残る。ロールの付与は1回
+ * なので、それが「どの購入の効果か」はここでは決まらない。
+ *
+ * したがって代表の `purchase.id` は、
+ *   - Discordへ何をするか決めるため（同じロールを二度付けない）
+ * には使ってよいが、
+ *   - **どの購入が提供済みかの証拠**
+ * には使ってはいけない。証拠を残すときは別途、帰属が一意であることを確かめる
+ * （`timedAccessAttributionUnique()`）。
+ */
 function uniqueGrants(grants: TimedAccessGrant[]): TimedAccessGrant[] {
   const unique = new Map<string, TimedAccessGrant>();
   for (const grant of grants) unique.set(`${grant.purchase.user_id}:${grant.roleId}`, grant);
@@ -89,6 +103,27 @@ async function reconcileTimedAccessRoles(
       }
       if (added) {
         result.restored += 1;
+        // **ここまで来たものだけが「外部効果の成立を確認できた」と言える。**
+        //   1. 最初のforce fetchでロールが**無かった**
+        //   2. 付ける直前にも契約がactiveだった
+        //   3. 自分で `roles.add()` を成功させた
+        //   4. force refetchで在席を**再確認**した
+        //   5. 失効競合のチェックを通過した
+        //
+        // `added=false`（元からロールがあった）はここへ来ない。**ロールの起源を
+        // 証明していない**ので、提供済みの証拠にも未提供の証拠にもしない。
+        //
+        // **帰属してよいかは Core が決める。** 購入時の不変な証拠でロールが確定して
+        // いること・観測したロールと一致すること・同じロールを与える有効な契約が
+        // これ1つであること——を1つの transaction で確かめ、1つでも欠ければ
+        // 何も書かない。曖昧なまま書くと、返金を拒む authority を推測で作ることになる。
+        services.shop.recordTimedAccessVerifiedDelivery({
+          purchaseId: grant.purchase.id,
+          userId: target,
+          roleId: grant.roleId,
+          writer: "system:shop-timed-access",
+          detail: { itemId: grant.item.id, verification: "force_refetch_role_present" },
+        });
         services.events.log("shop_timed_access_restored", {
           actor: "system:shop-timed-access",
           target,

@@ -56,14 +56,16 @@ DEFERRED で始めるため読み取りのために書き込みロックは取�
 | 購入時 provenance | `shop_purchase_fulfillment_provenance` | 「今のコードが作った購入」 |
 | ロール付与 provenance | `shop_purchase_role_grant_provenance` | 何のロールを与える契約だったか |
 | 運営の確認 | `shop_operator_resolutions.decision='delivered'` | 証拠（**外部事実の人による確認**） |
+| Botの確認 | `shop_verified_delivery_evidence` | 証拠（**外部効果の成立を writer 自身が確認**） |
 | **提供済みか** | `DELIVERED_EVIDENCE_SQL` / `hasDeliveredEvidence()` | **authoritative** |
 
-`DELIVERED_EVIDENCE_SQL` は次の4つの **or**。どれか1つあれば提供済みと言える。
+`DELIVERED_EVIDENCE_SQL` は次の5つの **or**。どれか1つあれば提供済みと言える。
 
 1. `delivered_at IS NOT NULL`
 2. `shop_delivered` event
 3. provenance あり かつ `delivery_state='delivered'`
 4. `shop_operator_resolutions` に `decision='delivered'`（`OPERATOR_DELIVERED_SQL`）
+5. `shop_verified_delivery_evidence` に行がある（`VERIFIED_EXTERNAL_DELIVERY_SQL`）
 
 1件判定はこの定義をそのまま評価する（`DELIVERED_EVIDENCE_ROW_SQL`）ので、
 一覧と個別判定が食い違わない。
@@ -76,6 +78,77 @@ DEFERRED で始めるため読み取りのために書き込みロックは取�
 
 `no_effect` は含めない。両方ともキューを閉じるが意味は正反対（提供済み／未提供）で、
 金銭の帰結も逆になる。「どちらもキューを閉じる」を理由に同じ扱いにしてはいけない。
+
+#### 5 は「今ロールがある」ではない
+
+**この2つを絶対に同義にしない。**
+
+| | |
+|---|---|
+| ロールが**今存在する** | 何も証明しない。誰が・どの契約で付けたか分からない |
+| この購入が提供されたと**独立に検証できた** | writer 自身が、無いことを確認 → 自分で付与 → force refetch で再確認、まで到達した |
+
+`shop_verified_delivery_evidence` に積んでよいのは後者だけ。
+
+**帰属（attribution）の要件**も同じくらい重い。ロールの付与は1回なのに、同じ
+(利用者, ロール) を与える有効な契約が複数あると、その1回が**どの購入の効果か**は
+決まらない。あとから買った契約が、既にあったロールへ相乗りしているだけかもしれない。
+
+> 期限つきアクセスの巡回は Discord への操作を (利用者, ロール) 単位へ畳む
+> （`uniqueGrants()`）。畳んだ結果の `purchase` は **`Map` の後勝ちで残った代表**で
+> しかなく、証拠の帰属先ではない。証拠を残す前に
+> `timedAccessAttributionUnique()` で「この購入ただ1つか」を確かめ、
+> **一意でなければ何も書かない**。
+>
+> 証拠が無いことは「提供されていない」ではない。ただ**言えることが無い**だけ。
+
+##### 互換で復元できること ≠ 提供済みへ昇格できること
+
+`listActiveTimedAccess()` は互換のため、購入時スナップショットが無い旧購入について
+**現在の商品設定**からロールを読む経路を持つ。これは「ロールを復元してよいか」には
+使えるが、**証拠の authority にはならない**。
+
+```
+listActiveTimedAccess の互換経路
+        ≠
+verified delivery evidence の authority
+```
+
+これを混ぜると「**現在の商品設定を根拠に、過去の購入が何を買ったかを後から決める**」
+ことになり、その推測で返金を拒むことになる。
+
+だから証拠を積む条件は3つ揃ったときだけ:
+
+1. **観測**（ロールが無い → 自分で付与 → force refetch で在席を再確認）
+2. **購入時の不変な証拠**でロールが確定していて（`roleGrantTarget()` が `proven`）、
+   それが観測したロールと**一致する**
+3. その (利用者, ロール) を与える有効な契約が**この購入ただ1つ**
+
+`roleGrantTarget` が `legacy_unknown` なら、互換経路でロールを復元すること自体は
+従来どおり起こりうるが、**verified evidence は 0 のまま**。
+
+2 の照合は**帰属を確かめるためだけ**に使う。剥奪してよい対象を決めるのは
+今までどおり `roleGrantTarget()` だけで、証拠の `effect_target` はその authority ではない。
+
+##### 生きている claim があるあいだは書かない
+
+別の配送が外部へ投げている最中（`in_flight` / `uncertain`）は、観測した効果が
+**誰の実行によるものか決まらない**。claim を握ったままの購入へ提供済みを立てると
+`delivered_evidence_vs_unresolved_case` が成立してしまうので、その間は書かない。
+
+#### 3つの「提供済み」の出所
+
+| 出所 | 誰が確認したか | 工程を進めるか |
+|---|---|---|
+| 通常の配送完了（1・2・3） | Bot が実行し、実行の結果として印を付けた | **進める**（`completeDeliveryWith`。二重実行を禁じる） |
+| 運営の確認（4） | **人**が外部の事実を確かめた | 進めない |
+| Botの確認（5） | **writer 自身**が外部効果の成立を確かめた | 進めない |
+
+下2つは「記録する」operation なので、`completeDeliveryWith()` の
+exactly-once guard を通らない。**通してはいけない**——旧購入の
+`delivery_state='delivered'` は移行の推測値でしかなく、そこへ本物の観測が来ると
+推測が観測を握り潰す（本番 #58 が実際にこれで `delivered_at` と
+`shop_delivered` を失っている）。
 
 #### 工程の状態と、観測された結末は直交する
 
@@ -205,6 +278,13 @@ DBが1件に縛る集合が将来ズレて、Coreは止めているつもりな�
 | 失効させてよいか | `expireIfDue()`。止める理由は `expiryBlockedBy()` |
 | 候補に入れてよいか | `expireOverdue()` の候補SQL（`expiryBlockedBy()` と**同じ述語から組む**） |
 | ロールを剥がしてよいか | `roleGrantTarget()`（何を与える契約だったか）＋ delivered evidence（実際に与えたか） |
+
+> **⚠ `shop_verified_delivery_evidence.effect_target` を剥奪対象にしない。**
+>
+> 証拠には「何を観測したか」としてロールIDが入るが、それは**観測の副産物**であって
+> 「将来何を剥がしてよいか」ではない。剥奪対象は購入時の不変な証拠
+> （role grant provenance / 購入時スナップショット / 明示的な移行記録）だけが決める。
+> ここを流用すると、観測から契約内容が書き換わる。
 
 剥奪キュー `shop_role_revocations` の `status`:
 
