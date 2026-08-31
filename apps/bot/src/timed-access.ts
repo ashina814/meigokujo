@@ -1,4 +1,5 @@
 import type { Client, Guild } from "discord.js";
+import { Shop } from "@meigokujo/core";
 import type { TimedAccessGrant } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
@@ -52,10 +53,44 @@ async function reconcileTimedAccessRoles(
   for (const grant of uniqueGrants(services.shop.listActiveTimedAccess(userId))) {
     const target = grant.purchase.user_id;
     result.checked += 1;
+
+    // **Discord を読む前に、外部効果の実行権を取る。**
+    //
+    // 「ロールが無いことを確認してから付ける」だけでは足りない。確認した後・付ける
+    // 前に通常配送が同じ (guild, user, role) へ投げられるので、`roles.add` が二重に
+    // 走りうる。読む前に durable な鍵を取り、取れた場合だけ**取ったあとに読み直す**。
+    //
+    // 鍵は購入ではなく効果の単位。同じロールを与える別契約が並んでいても、
+    // 実行してよいのは常に1人だけになる。
+    const effectKey = Shop.discordRoleAddEffectKey(guild.id, target, grant.roleId);
+    const lock = services.shop.acquireExternalEffectLock({
+      scope: "discord_role_add",
+      key: effectKey,
+      owner: "system:shop-timed-access",
+      purchaseId: grant.purchase.id,
+    });
+    if (!lock.ok) {
+      // 別の処理が同じ効果を握っている。**何も投げず、何も推測しない。**
+      // 失敗でも未提供でもない——今は言えることが無い、というだけ
+      continue;
+    }
+    let lockOpen = true;
+    /** 副作用が無いと確認できたときだけ解放する。分からなければ握ったまま残す */
+    const closeLock = (next: "settled" | "released" | "uncertain", reason: string): void => {
+      if (!lockOpen) return;
+      lockOpen = false;
+      const args = { key: effectKey, token: lock.token, reason, actor: "system:shop-timed-access" };
+      if (next === "settled") services.shop.settleExternalEffectLock(args);
+      else if (next === "released") services.shop.releaseExternalEffectLock(args);
+      else services.shop.markExternalEffectUncertain(args);
+    };
+
     let member;
     try {
+      // **鍵を取ったあとの観測が正本。** 取る前に見た状態は使わない
       member = await guild.members.fetch({ user: target, force: true });
     } catch (error) {
+      closeLock("released", "member_fetch_failed_no_effect");
       if (errorCode(error) === 10007) {
         result.absent += 1;
         continue;
@@ -71,13 +106,32 @@ async function reconcileTimedAccessRoles(
     }
 
     let added = false;
+    /** 一度でも Discord へ投げたか。投げたあとは「無かった」と断定しない */
+    let attempted = false;
     try {
       if (!member.roles.cache.has(grant.roleId)) {
-        // 一覧取得後に失効していたらDiscordへ触らない。
-        if (!services.shop.activeTimedAccessGrantsRole(target, grant.roleId)) continue;
-        await member.roles.add(grant.roleId, "有効な期限付きアクセス契約の復元");
-        added = true;
+        // **鍵を持ったまま、投げる直前にもう一度権利を確かめる。**
+        // 一覧を取ってから鍵を取るまでに失効していることがある
+        if (!services.shop.activeTimedAccessGrantsRole(target, grant.roleId)) {
+          closeLock("released", "entitlement_expired_before_effect");
+          continue;
+        }
+        attempted = true;
+        // **APIの返り値だけで決めない。** エラー応答でも実際には付いていることがある。
+        // 投げたあとに取り直した実物を正本にする（通常配送と同じ規則）
+        const addError = await member.roles
+          .add(grant.roleId, "有効な期限付きアクセス契約の復元")
+          .then(() => null)
+          .catch((e: unknown) => (e instanceof Error ? e.message : String(e)));
+        // ここで throw したら結果は分からないまま＝catch が uncertain で鍵を残す
         member = await guild.members.fetch({ user: target, force: true });
+        added = member.roles.cache.has(grant.roleId);
+        if (!added) {
+          // 取り直した実物にロールが無い＝**副作用が無いことを確認できた**。
+          // 鍵を解放して、次の巡回が普通にやり直せるようにする
+          closeLock("released", "verified_no_effect_after_add");
+          throw new Error(`role_add_failed:${addError ?? "role_missing"}`);
+        }
       }
 
       // addと失効が競合した場合、古い処理が付けたロールを残さない。
@@ -87,9 +141,16 @@ async function reconcileTimedAccessRoles(
           const settled = await guild.members.fetch({ user: target, force: true });
           if (settled.roles.cache.has(grant.roleId)) throw new Error("stale_role_remained");
         }
+        // 付けたものを自分で取り消した＝正味の副作用は残っていない
+        closeLock("released", "expired_during_effect_rolled_back");
         continue;
       }
-      if (!member.roles.cache.has(grant.roleId)) throw new Error("role_missing_after_add");
+      if (!member.roles.cache.has(grant.roleId)) {
+        // 付けたはずのロールが、その後の確認で消えている（外部が剥がした等）。
+        // 実物で不在を確認できているので副作用は残っていない
+        closeLock("released", "role_missing_after_add");
+        throw new Error("role_missing_after_add");
+      }
 
       services.shop.markDeliverySucceeded(grant.purchase.id, "system:shop-timed-access");
       // 成功印の直前に失効が割り込んだ場合も、古い巡回が権利を残さない。
@@ -99,6 +160,7 @@ async function reconcileTimedAccessRoles(
           const settled = await guild.members.fetch({ user: target, force: true });
           if (settled.roles.cache.has(grant.roleId)) throw new Error("stale_role_remained_after_settle");
         }
+        closeLock("released", "expired_after_settle_rolled_back");
         continue;
       }
       if (added) {
@@ -130,8 +192,13 @@ async function reconcileTimedAccessRoles(
           payload: { purchaseId: grant.purchase.id, itemId: grant.item.id, roleId: grant.roleId },
         });
       }
+      // 目的状態の成立を force refetch で確認できている
+      closeLock("settled", added ? "role_added_and_verified" : "role_already_present");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
+      // **投げたあとに分からなくなったなら、鍵は握ったまま残す。**
+      // 解放すると「効果は無かった」と断定したことになり、次の worker が重ねて投げる
+      closeLock(attempted ? "uncertain" : "released", `reconcile_failed:${message}`);
       services.shop.markDeliveryFailed(grant.purchase.id, `timed_access_reconcile:${message}`, "system:shop-timed-access");
       result.failed.push({ userId: target, roleId: grant.roleId, error: message });
       services.events.log("shop_timed_access_reconcile_failed", {

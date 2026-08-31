@@ -34,6 +34,7 @@ import {
   convergePendingSubAccounts,
   expireOverduePurchases,
   convergeExternalDeliveries,
+  convergeExternalEffectLocks,
   processShopRoleRevocations,
   recoverAutoDropNoEvalGhosts,
 } from "./scheduler-recovery.js";
@@ -434,6 +435,12 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // 先に決着をつけないと剥奪側が判断できない。
     await convergeExternalDeliveries(client, services).catch((e) =>
       console.error("[ショップ] 外部配送の収束失敗:", e),
+    );
+
+    // 落ちたプロセスが残した**外部効果の実行権**も収束させる。放置すると、その
+    // (guild, user, role) へ誰も投げられなくなる。時間では消さず、Discordの実状態で決める
+    await convergeExternalEffectLocks(client, services).catch((e) =>
+      console.error("[ショップ] 外部効果の実行権の収束失敗:", e),
     );
 
     // 失効購入のロール剥奪は失効処理と分離し、購入ID単位で毎分自己修復する。

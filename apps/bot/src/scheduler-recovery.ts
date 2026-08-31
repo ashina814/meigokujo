@@ -463,6 +463,60 @@ let externalDeliveryRecoveryInFlight = false;
  * 取り上げる処理ではない。別契約で同じロールを持っている場合もあるので、
  * この購入が付けたと証明できないロールに触れてはいけない。
  */
+/**
+ * 決着していない**外部効果の実行権**を収束させる。
+ *
+ * プロセスが落ちると `held` / `uncertain` の鍵が残る。放っておくと、その
+ * `(guild, user, role)` へは誰も投げられなくなる——通常配送も巡回も止まる。
+ * かといって時間で勝手に失効させると、投げている最中の相手を追い出して
+ * 二重実行を作ってしまうので、**時間では消さない**。
+ *
+ * 収束の根拠は Discord の実状態だけ。ロールが在れば目的は達しているので閉じ、
+ * 無ければ副作用が残っていないので解放する。**確かめられないものは残す。**
+ *
+ * ここでロールを剥がすことはしない。与えたかもしれないものを確認する処理であって、
+ * 取り上げる処理ではない。
+ */
+export async function convergeExternalEffectLocks(client: Client, services: Services): Promise<void> {
+  const open = services.shop.listUnresolvedExternalEffectLocks();
+  if (open.length === 0) return;
+  const guildId = services.settings.getString("guild:main");
+  if (!guildId) return;
+  const guild = await client.guilds.fetch(guildId).catch(() => null);
+  if (!guild) return;
+
+  for (const lock of open) {
+    if (lock.effect_scope !== "discord_role_add") continue;
+    // 鍵は `discord_role_add:<guild>:<user>:<role>`。**自分の guild のものだけ**触る
+    const parts = lock.effect_key.split(":");
+    if (parts.length !== 4) continue;
+    const [, lockGuildId, userId, roleId] = parts as [string, string, string, string];
+    if (lockGuildId !== guildId) continue;
+
+    const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
+    if (!member) continue; // 確かめられない。鍵は残したまま人へ
+
+    if (member.roles.cache.has(roleId)) {
+      // 目的状態は成立している。**ただしこれは「提供された」の証拠ではない**——
+      // 誰の効果かは別問題なので、鍵を閉じるだけで delivered evidence は作らない
+      services.shop.settleExternalEffectLock({
+        key: lock.effect_key,
+        token: lock.owner_token,
+        reason: "recovered_role_present",
+        actor: "system:shop-external-effect",
+      });
+      continue;
+    }
+    // ロールが無いことを実物で確認できた＝副作用は残っていない。解放して通常へ戻す
+    services.shop.releaseExternalEffectLock({
+      key: lock.effect_key,
+      token: lock.owner_token,
+      reason: "recovered_verified_no_effect",
+      actor: "system:shop-external-effect",
+    });
+  }
+}
+
 export async function convergeExternalDeliveries(client: Client, services: Services): Promise<void> {
   if (externalDeliveryRecoveryInFlight) return;
   externalDeliveryRecoveryInFlight = true;

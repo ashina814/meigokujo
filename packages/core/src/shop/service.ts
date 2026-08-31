@@ -356,6 +356,30 @@ export interface OperatorResolutionRow {
  */
 export type VerifiedDeliveryEvidenceSource = "timed_access_role_added_and_refetched";
 
+/** 外部効果の種類。所有権はこの単位で調停する。 */
+export type ExternalEffectScope = "discord_role_add";
+
+/** 生きている所有権の状態。**`uncertain` は解放しない**（結果不明を失敗と断定しない）。 */
+export const EXTERNAL_EFFECT_LIVE_STATES = ["held", "uncertain"] as const;
+export const EXTERNAL_EFFECT_LIVE_STATES_SQL = `('${EXTERNAL_EFFECT_LIVE_STATES.join("','")}')`;
+
+export interface ExternalEffectLockRow {
+  id: number;
+  effect_scope: ExternalEffectScope;
+  effect_key: string;
+  owner_token: string;
+  owner: string;
+  purchase_id: number | null;
+  state: "held" | "uncertain" | "settled" | "released";
+  detail: string | null;
+  acquired_at: number;
+  updated_at: number;
+}
+
+export type ExternalEffectLock =
+  | { readonly ok: true; readonly token: string; readonly key: string }
+  | { readonly ok: false; readonly reason: "busy"; readonly holder: ExternalEffectLockRow };
+
 export interface VerifiedDeliveryEvidenceRow {
   id: number;
   purchase_id: number;
@@ -3411,6 +3435,147 @@ export class Shop {
       });
     };
     return this.db.inTransaction ? run() : this.db.transaction(run).immediate();
+  }
+
+  // ── 外部効果の所有権（Phase I / Race F）──────────────────────────────────
+
+  /**
+   * **Discord のロール付与という外部効果の鍵。**
+   *
+   * 衝突するのは purchase ではなく `(guild, user, role)`。同じロールを与える契約が
+   * 2つあれば、purchase 単位の claim は**両方に live を許してしまう**ので、
+   * どちらの worker も `roles.add` を投げられる。鍵はこの単位で持つ。
+   *
+   * 通常配送と期限つきアクセスの巡回が**同じ関数**でキーを作ることが要点。
+   * 片方だけ別の作り方をすると、同じ効果に別々の鍵ができて調停にならない。
+   */
+  static discordRoleAddEffectKey(guildId: string, userId: string, roleId: string): string {
+    return `discord_role_add:${guildId}:${userId}:${roleId}`;
+  }
+
+  /**
+   * 外部効果の実行権を durable に取る。**Discord を叩く前に必ず取る。**
+   *
+   * 「先に読んで、空いていたら投げる」では TOCTOU が閉じない（読んだ後・投げる前に
+   * 別 worker が取れてしまう）。だから取得そのものを1つの transaction にして、
+   * **DBの部分ユニーク索引に1人だけを選ばせる**。
+   *
+   * **これは配送済みの authority ではない**（Task #213 の証拠モデルが別に持つ）。
+   * 鍵を取れたことは「投げてよい」であって「提供された」ではない。
+   */
+  acquireExternalEffectLock(input: {
+    scope: ExternalEffectScope;
+    key: string;
+    owner: string;
+    purchaseId?: number | null;
+  }): ExternalEffectLock {
+    const body = (): ExternalEffectLock => {
+      const holder = this.externalEffectLockHolder(input.key);
+      if (holder) return { ok: false, reason: "busy", holder };
+      const token = randomBytes(12).toString("base64url");
+      const ts = now();
+      this.db
+        .prepare(
+          `INSERT INTO shop_external_effect_locks
+             (effect_scope, effect_key, owner_token, owner, purchase_id, state, detail, acquired_at, updated_at)
+           VALUES (?,?,?,?,?, 'held', NULL, ?, ?)`,
+        )
+        .run(input.scope, input.key, token, input.owner, input.purchaseId ?? null, ts, ts);
+      this.events.log("shop_external_effect_acquired", {
+        actor: input.owner,
+        payload: { effectKey: input.key, scope: input.scope, purchaseId: input.purchaseId ?? null },
+      });
+      return { ok: true, token, key: input.key };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /** いま実行権を持っている行（`held` / `uncertain`）。無ければ undefined。 */
+  externalEffectLockHolder(key: string): ExternalEffectLockRow | undefined {
+    return this.db
+      .prepare(
+        `SELECT * FROM shop_external_effect_locks
+          WHERE effect_key = ? AND state IN ${EXTERNAL_EFFECT_LIVE_STATES_SQL}`,
+      )
+      .get(key) as ExternalEffectLockRow | undefined;
+  }
+
+  /**
+   * 実行権の状態を進める。**自分のトークンでしか動かせない。**
+   *
+   * 他の worker の鍵を横から settle / release できると、投げている最中の相手を
+   * 追い出して二重実行を作れてしまう。`owner_token` の一致を条件付き UPDATE の
+   * 中で確かめ、動いた1行だけを結果とする。
+   */
+  private transitionExternalEffectLock(
+    key: string,
+    token: string,
+    next: "settled" | "released" | "uncertain",
+    reason: string,
+    actor: string,
+    eventType: string,
+  ): boolean {
+    const body = (): boolean => {
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_external_effect_locks
+              SET state = ?, detail = ?, updated_at = ?
+            WHERE effect_key = ? AND owner_token = ? AND state IN ${EXTERNAL_EFFECT_LIVE_STATES_SQL}`,
+        )
+        .run(next, reason.slice(0, 500), now(), key, token).changes;
+      if (changed !== 1) return false;
+      this.events.log(eventType, { actor, payload: { effectKey: key, reason: reason.slice(0, 200) } });
+      return true;
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /** 目的状態の成立を確認して終了する。 */
+  settleExternalEffectLock(input: { key: string; token: string; reason: string; actor: string }): boolean {
+    return this.transitionExternalEffectLock(
+      input.key, input.token, "settled", input.reason, input.actor, "shop_external_effect_settled",
+    );
+  }
+
+  /**
+   * **副作用が無いと確認できた**ので解放する。次の worker が取れるようになる。
+   *
+   * 「たぶん失敗した」では呼んではいけない。分からないときは `uncertain`。
+   */
+  releaseExternalEffectLock(input: { key: string; token: string; reason: string; actor: string }): boolean {
+    return this.transitionExternalEffectLock(
+      input.key, input.token, "released", input.reason, input.actor, "shop_external_effect_released",
+    );
+  }
+
+  /**
+   * 投げたが結果が分からない。**鍵を握ったまま残す。**
+   *
+   * ここで解放すると「効果は無かった」と断定したことになり、次の worker が
+   * 同じ効果をもう一度投げる。分からないものは分からないまま人と収束処理へ渡す。
+   */
+  markExternalEffectUncertain(input: { key: string; token: string; reason: string; actor: string }): boolean {
+    return this.transitionExternalEffectLock(
+      input.key, input.token, "uncertain", input.reason, input.actor, "shop_external_effect_uncertain",
+    );
+  }
+
+  /** 決着していない実行権。再起動後の収束と運営画面の両方から使う。 */
+  listUnresolvedExternalEffectLocks(limit = 50): ExternalEffectLockRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM shop_external_effect_locks
+          WHERE state IN ${EXTERNAL_EFFECT_LIVE_STATES_SQL}
+          ORDER BY acquired_at ASC LIMIT ?`,
+      )
+      .all(limit) as ExternalEffectLockRow[];
+  }
+
+  /** この購入に対する実行権の履歴（新しい順）。監査用。 */
+  externalEffectLocksForPurchase(purchaseId: number): ExternalEffectLockRow[] {
+    return this.db
+      .prepare("SELECT * FROM shop_external_effect_locks WHERE purchase_id = ? ORDER BY id DESC")
+      .all(purchaseId) as ExternalEffectLockRow[];
   }
 
   /** この購入に積まれている、Bot が確認した外部配送の証拠（新しい順）。 */

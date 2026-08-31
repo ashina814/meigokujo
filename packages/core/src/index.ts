@@ -283,6 +283,8 @@ export {
   type RoleGrantTarget,
   EXTERNAL_CLAIM_LIVE_STATES,
   EXTERNAL_CLAIM_LIVE_STATES_SQL,
+  EXTERNAL_EFFECT_LIVE_STATES,
+  EXTERNAL_EFFECT_LIVE_STATES_SQL,
   type ExternalClaimLiveState,
   type ShopSafetySnapshot,
   type ExpiryBlockedReason,

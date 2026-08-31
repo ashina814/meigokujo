@@ -1,5 +1,10 @@
 import Database from "better-sqlite3";
-import { EXTERNAL_CLAIM_LIVE_STATES_SQL, WITHDRAWN_DELIVERY_KINDS, parseDeliverySnapshot } from "../shop/service.js";
+import {
+  EXTERNAL_CLAIM_LIVE_STATES_SQL,
+  EXTERNAL_EFFECT_LIVE_STATES_SQL,
+  WITHDRAWN_DELIVERY_KINDS,
+  parseDeliverySnapshot,
+} from "../shop/service.js";
 
 /**
  * スキーマは追記専用の台帳を中心に設計されている（経済設計.md §3）。
@@ -1042,6 +1047,49 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_external_delivery_open
   WHERE state IN ${EXTERNAL_CLAIM_LIVE_STATES_SQL};
 CREATE INDEX IF NOT EXISTS idx_shop_external_delivery_state
   ON shop_external_delivery_attempts(state, started_at);
+-- Phase I: **外部効果そのものの所有権。**
+--
+-- 上の claim は「この購入の配送試行」を守る。守っている単位は purchase_id なので、
+-- 同じロールを与える別契約が2つあると、**両方が同時に live claim を持てる**。
+-- するとどちらの worker も Discord へ roles.add(user, role) を投げられる——
+-- 実際に起きる衝突は purchase ではなく (guild, user, role) の側にある。
+--
+-- そこで「外部効果を今だれが実行してよいか」を別の正本として持つ。
+-- **これは配送済みの authority ではない。** 鍵を取ったことも、返したことも、
+-- 「提供された」の証拠にはならない（証拠は delivered evidence 側が持つ）。
+--
+-- 通常配送も期限つきアクセスの巡回も、**同じこの表**で調停する。
+-- 片方だけ別の仕組みを持たせない。
+--
+-- state
+--   held      … 実行権を保持している（live）
+--   uncertain … 投げたが結果が分からない。**解放しない**（live のまま）
+--   settled   … 目的状態の成立を確認して終了
+--   released  … 副作用が無いと確認して終了
+CREATE TABLE IF NOT EXISTS shop_external_effect_locks (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  effect_scope TEXT NOT NULL CHECK (effect_scope IN ('discord_role_add')),
+  effect_key   TEXT NOT NULL,
+  owner_token  TEXT NOT NULL,
+  owner        TEXT NOT NULL,
+  -- 参考情報。**どの購入のためだったか**を監査で辿るためだけに持つ。
+  -- 所有権の単位ではないし、配送済みの authority でもない。
+  purchase_id  INTEGER REFERENCES shop_purchases(id),
+  state        TEXT NOT NULL CHECK (state IN ('held','uncertain','settled','released')),
+  detail       TEXT,
+  acquired_at  INTEGER NOT NULL,
+  updated_at   INTEGER NOT NULL
+);
+-- **1つの外部効果につき、同時に実行してよい所有者は1人。** DBに守らせる。
+-- uncertain を live 側へ入れるのが要点——結果が分からない鍵を解放すると、
+-- 「たぶん失敗だろう」で二重に投げることになる。
+CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_external_effect_live
+  ON shop_external_effect_locks(effect_key)
+  WHERE state IN ${EXTERNAL_EFFECT_LIVE_STATES_SQL};
+CREATE INDEX IF NOT EXISTS idx_shop_external_effect_state
+  ON shop_external_effect_locks(state, acquired_at);
+CREATE INDEX IF NOT EXISTS idx_shop_external_effect_purchase
+  ON shop_external_effect_locks(purchase_id);
 -- Phase H: 運営が事実を確認して下した決着。**判断そのものを durable な事実として残す。**
 --
 -- ボタンの副作用として status だけ動かすと、あとから「何を根拠にそう決めたのか」が
@@ -1151,6 +1199,11 @@ CREATE TRIGGER IF NOT EXISTS trg_shop_refund_failures_no_delete
 BEFORE DELETE ON shop_refund_failures
 BEGIN
   SELECT RAISE(ABORT, 'shop refund failures are append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS trg_shop_external_effect_locks_no_delete
+BEFORE DELETE ON shop_external_effect_locks
+BEGIN
+  SELECT RAISE(ABORT, 'shop external effect locks are append-only');
 END;
 CREATE TRIGGER IF NOT EXISTS trg_shop_verified_delivery_evidence_no_update
 BEFORE UPDATE ON shop_verified_delivery_evidence
