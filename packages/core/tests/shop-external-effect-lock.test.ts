@@ -128,6 +128,83 @@ describe("鍵の単位は購入ではなく外部効果", () => {
   });
 });
 
+// ── 証拠は所有権を持つ者しか残せない ────────────────────────────────────────
+
+describe("所有権を持たない呼び出しは証拠を書けない", () => {
+  /** 期限つきロール契約（購入時スナップショットで対象が証明できる形） */
+  function timedPurchase(ctx: Ctx): number {
+    return ctx.db
+      .prepare(
+        `INSERT INTO shop_purchases
+           (item_id,user_id,purchased_at,expires_at,paid_land,status,delivery_state,delivery_snapshot_json)
+         VALUES (?,?,1,?,100,'active','delivered',?) RETURNING id`,
+      )
+      .pluck()
+      .get(
+        ctx.mk("庭園").id,
+        USER,
+        Math.floor(Date.now() / 1000) + 30 * 24 * 3600,
+        JSON.stringify({ delivery: "auto", delivery_kind: "add_role", delivery_data: { role_id: ROLE } }),
+      ) as number;
+  }
+
+  const complete = (ctx: Ctx, id: number, token: string) =>
+    ctx.shop.completeTimedAccessRoleAdd({
+      effectKey: KEY,
+      effectToken: token,
+      purchaseId: id,
+      userId: USER,
+      roleId: ROLE,
+      writer: "system:shop-timed-access",
+    });
+
+  it("鍵を1つも持っていなければ、証拠も決着も作らない", () => {
+    const ctx = setup();
+    const id = timedPurchase(ctx);
+    // 鍵は誰も取っていない
+    expect(ctx.shop.externalEffectLockHolder(KEY)).toBeUndefined();
+
+    const result = complete(ctx, id, "fabricated-token");
+
+    expect(result).toEqual({ settled: false, evidenceRecorded: false });
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.verifiedExternal).toBe(false);
+    ctx.db.close();
+  });
+
+  it("他人が持っている鍵のトークンを騙っても書けない", () => {
+    const ctx = setup();
+    const id = timedPurchase(ctx);
+    const mine = acquire(ctx, "other-worker");
+    expect(mine.ok).toBe(true);
+
+    // **返金拒否 authority を、所有権なしで発行させない**
+    const result = complete(ctx, id, "not-the-owners-token");
+
+    expect(result).toEqual({ settled: false, evidenceRecorded: false });
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    // 他人の鍵も動いていない
+    expect(ctx.shop.externalEffectLockHolder(KEY)?.owner).toBe("other-worker");
+    expect(ctx.shop.externalEffectLockHolder(KEY)?.state).toBe("held");
+    ctx.db.close();
+  });
+
+  it("正しい所有者なら、証拠を残して鍵を閉じる", () => {
+    const ctx = setup();
+    const id = timedPurchase(ctx);
+    const mine = acquire(ctx, "system:shop-timed-access");
+    expect(mine.ok).toBe(true);
+    if (!mine.ok) return;
+
+    const result = complete(ctx, id, mine.token);
+
+    expect(result).toEqual({ settled: true, evidenceRecorded: true });
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(1);
+    expect(ctx.shop.externalEffectLockHolder(KEY)).toBeUndefined();
+    ctx.db.close();
+  });
+});
+
 // ── F3 同時取得 ──────────────────────────────────────────────────────────────
 
 describe("F3: 同時に取りにいっても勝者は1人", () => {

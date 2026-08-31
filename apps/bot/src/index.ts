@@ -93,8 +93,7 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
-import { beginExternalEffectStartup } from "./external-effect-barrier.js";
-import { convergeExternalEffectLocks } from "./scheduler-recovery.js";
+import { armExternalEffectStartupRecovery } from "./scheduler-recovery.js";
 import { reconcileTimedAccessForClient, reconcileTimedAccessForGuild } from "./timed-access.js";
 import { enforceConversationCourtRestrictionForGuild, handleConversationCourtVoiceUpdate } from "./conversation-court.js";
 import { resumePendingFreeSpins } from "./casino/slots.js";
@@ -164,7 +163,7 @@ client.once(Events.ClientReady, async (ready) => {
   // 関門を先に張っておけば、それらは収束の完了を待ってから取得しにいく。
   //
   // 関門はプロセス内の順序づけだけで、所有権の正本ではない（正本はDB）。
-  beginExternalEffectStartup(() => convergeExternalEffectLocks(ready, services, { includeHeld: true }));
+  armExternalEffectStartupRecovery(ready, services);
 
   initializeVcPublicSocialPresence(ready, services);
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。

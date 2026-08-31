@@ -1,7 +1,7 @@
 import type { Client, GuildMember } from "discord.js";
 import { Shop } from "@meigokujo/core";
 import type { Services } from "./services.js";
-import { awaitExternalEffectReady } from "./external-effect-barrier.js";
+import { awaitExternalEffectReady, beginExternalEffectStartup } from "./external-effect-barrier.js";
 
 const AUTODROP_PENDING_KEY = "autodrop:pending_role_sync";
 let shopRoleRevocationInFlight = false;
@@ -479,6 +479,21 @@ let externalDeliveryRecoveryInFlight = false;
  * ここでロールを剥がすことはしない。与えたかもしれないものを確認する処理であって、
  * 取り上げる処理ではない。
  */
+/**
+ * **起動時の収束を関門として張る。**
+ *
+ * ここを投げっぱなし（`void`）にすると、収束が終わる前に新しい worker が同じ資源を
+ * 取りにいけてしまい、「前のプロセスは死んでいて、新しい worker はまだ動いていない」
+ * という収束の前提が崩れる。関門に結びつけることで、外部効果を取りにいく入口が
+ * 完了を待つようになる。
+ *
+ * index.ts から呼ぶ配線をここへ切り出してあるのは、**その配線自体をテストできる**
+ * ようにするため（entrypoint のままだと誰も検証できない）。
+ */
+export function armExternalEffectStartupRecovery(client: Client, services: Services): void {
+  beginExternalEffectStartup(() => convergeExternalEffectLocks(client, services, { includeHeld: true }));
+}
+
 export async function convergeExternalEffectLocks(
   client: Client,
   services: Services,

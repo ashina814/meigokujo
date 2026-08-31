@@ -70,10 +70,21 @@ function expiredWithRevocation(ctx: Ctx): number {
   return id;
 }
 
-function discord(opts: { roles?: string[]; removeFails?: boolean; finalFetchFails?: boolean; onRemove?: () => void } = {}) {
+function discord(
+  opts: {
+    roles?: string[];
+    removeFails?: boolean;
+    finalFetchFails?: boolean;
+    onRemove?: () => void;
+    onAdd?: () => void;
+  } = {},
+) {
   const held = new Set(opts.roles ?? [ROLE]);
   let fetches = 0;
-  const add = vi.fn(async (id: string) => void held.add(id));
+  const add = vi.fn(async (id: string) => {
+    opts.onAdd?.();
+    held.add(id);
+  });
   const remove = vi.fn(async (id: string) => {
     opts.onRemove?.();
     if (opts.removeFails) throw new Error("remove failed");
@@ -134,6 +145,8 @@ describe("RF-E: 剥がした直後に契約が生えても、補償は同じ鍵�
     const id = expiredWithRevocation(ctx);
     let ownerDuringCompensation: string | undefined;
     let rivalCouldAcquire: boolean | undefined;
+    let ownerDuringAdd: string | undefined;
+    let rivalCouldAcquireDuringAdd: boolean | undefined;
 
     // roles.remove の最中に、同じロールを与える有効な契約が生える
     const d = discord({
@@ -158,6 +171,13 @@ describe("RF-E: 剥がした直後に契約が生えても、補償は同じ鍵�
           scope: "discord_role", key: KEY, operation: "add", owner: "rival",
         }).ok;
       },
+      // **補償の add の最中**に横取りを試す。ここが M19 の境界
+      onAdd: () => {
+        ownerDuringAdd = holder(ctx)?.owner;
+        rivalCouldAcquireDuringAdd = ctx.shop.acquireExternalEffectLock({
+          scope: "discord_role", key: KEY, operation: "add", owner: "rival-during-add",
+        }).ok;
+      },
     });
 
     await processShopRoleRevocations(d.client as never, ctx.services);
@@ -165,6 +185,10 @@ describe("RF-E: 剥がした直後に契約が生えても、補償は同じ鍵�
     // 剥奪 worker が資源を握ったまま補償している
     expect(ownerDuringCompensation).toBe("system:shop-role-revocation");
     expect(rivalCouldAcquire).toBe(false);
+    // **補償の add を投げている最中も握っている。** 剥がしたあとに閉じてから
+    // 戻すと、その隙に別 worker が資源を取れてしまう
+    expect(ownerDuringAdd).toBe("system:shop-role-revocation");
+    expect(rivalCouldAcquireDuringAdd).toBe(false);
     // 剥がして、戻した（どちらも同じ所有権の中）
     expect(d.remove).toHaveBeenCalledTimes(1);
     expect(d.add).toHaveBeenCalledTimes(1);

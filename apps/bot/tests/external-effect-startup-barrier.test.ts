@@ -242,6 +242,93 @@ describe("RF-I: 収束できなくても、塞がるのはその資源だけ", (
   });
 });
 
+// ── M22: 起動時の配線が本当に関門になっているか ─────────────────────────────
+
+describe("起動時の配線は、収束が終わるまで関門を閉じたままにする", () => {
+  /**
+   * **投げっぱなしにすると、この関門は無いのと同じ。**
+   *
+   * `armExternalEffectStartupRecovery()` は収束の Promise を関門へ結びつける。
+   * ここを `void` にしてしまうと `awaitExternalEffectReady()` が即座に通り、
+   * 収束の途中で新しい worker が走り出せる。
+   *
+   * 収束を「まだ返さない guild fetch」で止め、その間 `awaitExternalEffectReady()` が
+   * 解決しないことを見る。時間待ちは使わない。
+   */
+  it("収束が終わるまで awaitExternalEffectReady は解決しない", async () => {
+    const { armExternalEffectStartupRecovery } = await import("../src/scheduler-recovery.js");
+    const { awaitExternalEffectReady } = await import("../src/external-effect-barrier.js");
+    const ctx = setup();
+    ctx.shop.acquireExternalEffectLock({
+      scope: "discord_role", key: KEY, operation: "add", owner: "previous-process",
+    });
+
+    // guild の取得を保留させて、収束を途中で止める
+    const gate = deferred();
+    const d = discord();
+    const client = {
+      guilds: {
+        fetch: vi.fn(async () => {
+          await gate.promise;
+          return d.guild;
+        }),
+      },
+    };
+
+    armExternalEffectStartupRecovery(client as never, ctx.services);
+
+    let opened = false;
+    void awaitExternalEffectReady().then(() => void (opened = true));
+
+    // 収束が止まっている間は関門も閉じたまま
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(opened).toBe(false);
+    // 引き継いだ held もまだ残っている
+    expect(ctx.shop.externalEffectLockHolder(KEY)?.owner).toBe("previous-process");
+
+    gate.resolve();
+    await awaitExternalEffectReady();
+    expect(opened).toBe(true);
+    // 収束が済んで、実状態（ロール不在）から解放されている
+    expect(ctx.shop.externalEffectLockHolder(KEY)).toBeUndefined();
+    ctx.db.close();
+  });
+
+  it("収束が終わるまで、巡回は外部効果へ触れない", async () => {
+    const { armExternalEffectStartupRecovery } = await import("../src/scheduler-recovery.js");
+    const ctx = setup();
+    timedAccess(ctx, ctx.mkItem("庭園", ROLE).id, ROLE);
+
+    const gate = deferred();
+    const d = discord();
+    const client = {
+      guilds: {
+        fetch: vi.fn(async () => {
+          await gate.promise;
+          return d.guild;
+        }),
+      },
+    };
+    armExternalEffectStartupRecovery(client as never, ctx.services);
+
+    let done = false;
+    const run = reconcileTimedAccessForGuild(d.guild, ctx.services).then(() => void (done = true));
+
+    await Promise.resolve();
+    await Promise.resolve();
+    // **起動時収束を追い越していない**
+    expect(done).toBe(false);
+    expect(d.add).not.toHaveBeenCalled();
+
+    gate.resolve();
+    await run;
+    expect(done).toBe(true);
+    expect(d.add).toHaveBeenCalledTimes(1);
+    ctx.db.close();
+  });
+});
+
 // ── §7 定期経路は held へ到達できない ───────────────────────────────────────
 
 describe("定期収束は held へ到達できない", () => {
