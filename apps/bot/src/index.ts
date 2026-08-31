@@ -93,6 +93,8 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
+import { beginExternalEffectStartup } from "./external-effect-barrier.js";
+import { convergeExternalEffectLocks } from "./scheduler-recovery.js";
 import { reconcileTimedAccessForClient, reconcileTimedAccessForGuild } from "./timed-access.js";
 import { enforceConversationCourtRestrictionForGuild, handleConversationCourtVoiceUpdate } from "./conversation-court.js";
 import { resumePendingFreeSpins } from "./casino/slots.js";
@@ -153,6 +155,17 @@ inviteTracker.wire();
 
 client.once(Events.ClientReady, async (ready) => {
   console.log(`⚔️ 冥獄城ボット 起動: ${ready.user.tag}`);
+
+  // **他の何より先に、外部効果の関門を張る。**
+  //
+  // 前のプロセスが残した `held` の実行権を収束できるのは再起動直後だけ。
+  // ところがこの ready ハンドラの中でも、下の期限つきアクセス収束や、
+  // 既に登録済みの interaction / GuildMemberAdd から配送が走りうる。
+  // 関門を先に張っておけば、それらは収束の完了を待ってから取得しにいく。
+  //
+  // 関門はプロセス内の順序づけだけで、所有権の正本ではない（正本はDB）。
+  beginExternalEffectStartup(() => convergeExternalEffectLocks(ready, services, { includeHeld: true }));
+
   initializeVcPublicSocialPresence(ready, services);
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。
   // 再起動直後にstatus=openのまま外部I/O待ちになるfail-open窓を作らない。

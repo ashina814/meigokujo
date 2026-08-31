@@ -485,18 +485,6 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     }
   }
 
-  // **再起動直後だけ、落ちた worker が残した held の実行権を収束させる。**
-  //
-  // ここは「前のプロセスは確実に死んでいて、新しい worker はまだ1つも動いていない」
-  // と言える唯一の境界。稼働中の tick で held を触ると、いま Discord を叩いている
-  // 最中の worker を追い出して二重実行を作る（だから tick 側は uncertain だけ）。
-  //
-  // 単一インスタンス構成（systemd の1ユニット）であることが前提。複数を同時に
-  // 走らせる構成にするなら、instance/session identity で死を証明する必要がある。
-  void convergeExternalEffectLocks(client, services, { includeHeld: true }).catch((e) =>
-    console.error("[ショップ] 起動時の外部効果収束に失敗:", e),
-  );
-
   return setInterval(() => void runTick().catch((e) => console.error("[刻時盤] tick失敗:", e)), intervalMs);
 }
 

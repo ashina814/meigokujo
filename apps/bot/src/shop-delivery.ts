@@ -10,6 +10,7 @@ import {
 } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import { withUserLock } from "./user-lock.js";
+import { awaitExternalEffectReady } from "./external-effect-barrier.js";
 import {
   currentLadderRoles,
   missingLadderRoleKeys,
@@ -424,6 +425,9 @@ export async function deliverPurchaseUnlocked(
       const roleId = data.role_id;
       if (!roleId) return fail("role_id_missing", "配送設定が不完全です（ロールID未設定）。運営にお問い合わせください。");
       if (!guild) return fail("guild_unavailable", "サーバー情報が取れず配送できませんでした。運営にお問い合わせください。");
+
+      // 起動時収束を追い越さない（このプロセス自身の後始末より先に取りにいかない）
+      await awaitExternalEffectReady();
 
       // **Discord を1回でも読む前に鍵を取る。** 「読んで空いていたら投げる」だと、
       // 読んだあと投げる前に別 worker が取れてしまい TOCTOU が閉じない。

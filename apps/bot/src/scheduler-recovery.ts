@@ -1,6 +1,7 @@
 import type { Client, GuildMember } from "discord.js";
 import { Shop } from "@meigokujo/core";
 import type { Services } from "./services.js";
+import { awaitExternalEffectReady } from "./external-effect-barrier.js";
 
 const AUTODROP_PENDING_KEY = "autodrop:pending_role_sync";
 let shopRoleRevocationInFlight = false;
@@ -603,6 +604,8 @@ export async function processShopRoleRevocations(client: Client, services: Servi
   if (shopRoleRevocationInFlight) return;
   shopRoleRevocationInFlight = true;
   try {
+    // 起動時収束を追い越さない（剥奪も同じ資源へ触る）
+    await awaitExternalEffectReady();
     backfillShopRoleRevocations(services);
     const pending = services.shop.pendingRoleRevocations();
     if (pending.length === 0) return;

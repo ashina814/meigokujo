@@ -1,5 +1,6 @@
 import type { Client, Guild } from "discord.js";
 import { Shop } from "@meigokujo/core";
+import { awaitExternalEffectReady } from "./external-effect-barrier.js";
 import type { TimedAccessGrant } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
@@ -49,6 +50,10 @@ async function reconcileTimedAccessRoles(
   services: Pick<Services, "shop" | "events">,
   userId?: string,
 ): Promise<TimedAccessReconcileResult> {
+  // **起動時収束を追い越さない。** 前のプロセスの held を調べ終わる前に
+  // 同じ資源を取りにいくと、収束の前提（新しい worker はまだ動いていない）が崩れる
+  await awaitExternalEffectReady();
+
   const result: TimedAccessReconcileResult = { checked: 0, restored: 0, absent: 0, failed: [] };
   for (const grant of uniqueGrants(services.shop.listActiveTimedAccess(userId))) {
     const target = grant.purchase.user_id;
