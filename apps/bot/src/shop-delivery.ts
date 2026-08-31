@@ -6,9 +6,11 @@ import {
   parseDeliverySnapshot,
   type OriginalRoleRow,
   type PurchaseRow,
+  Shop,
 } from "@meigokujo/core";
 import { refreshEvalStatsForUser } from "./eval-daily.js";
 import { withUserLock } from "./user-lock.js";
+import { awaitExternalEffectReady } from "./external-effect-barrier.js";
 import {
   currentLadderRoles,
   missingLadderRoleKeys,
@@ -74,6 +76,9 @@ export interface DeliveryOutcome {
  * 商品定義を後から変えただけで過去の購入の配送内容が変わってしまう。
  */
 /** 購入時に本人が入力した内容 */
+/** 決着を1つの transaction で all-or-nothing にするための内部シグナル */
+class SettlementRollback extends Error {}
+
 export function parseRequest(json: string | null): Record<string, unknown> | null {
   if (!json) return null;
   try {
@@ -238,6 +243,25 @@ export async function deliverPurchaseUnlocked(
   let effectMayHaveOccurred = false;
   const deferReleaseForRefund = opts.deferReleaseForRefund === true;
 
+  /**
+   * **外部効果そのものの実行権。** purchase の claim とは別。
+   *
+   * claim が守るのは「この購入の配送試行」で、単位は purchase_id。同じロールを
+   * 与える別契約があると両方が live claim を持ててしまうので、Discord へ投げる
+   * 権利は `(guild, user, role)` の鍵で調停する。巡回側と**同じ表**を使う。
+   */
+  let effectKey: string | null = null;
+  let effectToken: string | null = null;
+  const resolveEffectLock = (next: "settled" | "released" | "uncertain", reason: string): void => {
+    if (effectKey === null || effectToken === null) return;
+    const args = { key: effectKey, token: effectToken, reason, actor };
+    if (next === "settled") services.shop.settleExternalEffectLock(args);
+    else if (next === "released") services.shop.releaseExternalEffectLock(args);
+    else services.shop.markExternalEffectUncertain(args);
+    effectKey = null;
+    effectToken = null;
+  };
+
   /** 外部APIを叩く直前に必ず呼ぶ。投げた事実を先に残す。 */
   const markExternalAttempt = (): void => {
     effectMayHaveOccurred = true;
@@ -253,6 +277,9 @@ export async function deliverPurchaseUnlocked(
     //   - 投げたあとに、目的状態が成立していないことを実物で確認できた
     // それ以外は uncertain。**付け忘れたら解放される fail-open にはしない。**
     const canRelease = !effectMayHaveOccurred || opts.verifiedNoEffect === true;
+    // **鍵も claim と同じ規則で始末する。** 投げたかどうか分からないまま解放すると、
+    // 次の worker が同じ効果をもう一度投げる
+    resolveEffectLock(canRelease ? "released" : "uncertain", reason);
     let uncertain = false;
     let carried: string | null = null;
     if (claimToken !== null) {
@@ -288,14 +315,44 @@ export async function deliverPurchaseUnlocked(
    * 確定できなかった＝そのあいだに purchase が動いた、ということなので
    * 「Discordでは提供済みだがDBでは未確定」として人へ渡す。自動返金はしない。
    */
+  /**
+   * 外部の目的状態を確認したあとの確定。
+   *
+   * **鍵の決着と購入の決着を同じ transaction で閉じる。** 割ると、間で落ちたときに
+   * 「鍵は閉じたが購入は未決着」になり、別 worker が同じ効果を投げ直せてしまう。
+   * Discord の呼び出しは transaction にできないが、そのあとのDB収束はできる。
+   */
   const settle = (): boolean => {
-    if (claimToken === null) return services.shop.markDeliverySucceeded(purchase.id, actor);
-    const ok = services.shop.settleExternalDelivery({ purchaseId: purchase.id, token: claimToken, actor });
-    if (ok) claimToken = null;
-    return ok;
+    const savedKey = effectKey;
+    const savedToken = effectToken;
+    try {
+      return services.db
+        .transaction(() => {
+          resolveEffectLock("settled", "effect_confirmed");
+          const ok =
+            claimToken === null
+              ? services.shop.markDeliverySucceeded(purchase.id, actor)
+              : services.shop.settleExternalDelivery({ purchaseId: purchase.id, token: claimToken, actor });
+          // **購入側が確定できないなら、鍵の決着も巻き戻す。**
+          // 片方だけ閉じると「鍵は閉じたが購入は未決着」になり、別 worker が投げ直せる
+          if (!ok) throw new SettlementRollback();
+          claimToken = null;
+          return true;
+        })
+        .immediate();
+    } catch (error) {
+      if (error instanceof SettlementRollback) {
+        // 巻き戻したので鍵はまだ自分のもの。呼び出し側が uncertain へ倒す
+        effectKey = savedKey;
+        effectToken = savedToken;
+        return false;
+      }
+      throw error;
+    }
   };
 
   const unsettled = (userMessage: string): DeliveryOutcome => {
+    resolveEffectLock("uncertain", "settlement_conflict");
     if (claimToken !== null) {
       services.shop.markExternalDeliveryUncertain({
         purchaseId: purchase.id,
@@ -368,6 +425,31 @@ export async function deliverPurchaseUnlocked(
       const roleId = data.role_id;
       if (!roleId) return fail("role_id_missing", "配送設定が不完全です（ロールID未設定）。運営にお問い合わせください。");
       if (!guild) return fail("guild_unavailable", "サーバー情報が取れず配送できませんでした。運営にお問い合わせください。");
+
+      // 起動時収束を追い越さない（このプロセス自身の後始末より先に取りにいかない）
+      await awaitExternalEffectReady();
+
+      // **Discord を1回でも読む前に鍵を取る。** 「読んで空いていたら投げる」だと、
+      // 読んだあと投げる前に別 worker が取れてしまい TOCTOU が閉じない。
+      // 取得は1つの transaction で、DBの部分ユニーク索引が1人だけを選ぶ。
+      const key = Shop.discordRoleEffectKey(guild.id, userId, roleId);
+      const lock = services.shop.acquireExternalEffectLock({
+        scope: "discord_role",
+        key,
+        operation: "add",
+        owner: actor,
+        purchaseId: purchase.id,
+      });
+      if (!lock.ok) {
+        // 同じ (guild, user, role) を別の処理が握っている。**重ねて投げない。**
+        return fail("external_effect_busy", "この操作は現在ほかの処理が進行中です。少し待ってからご確認ください。", {
+          refundable: false,
+        });
+      }
+      effectKey = lock.key;
+      effectToken = lock.token;
+
+      // **鍵を取ったあとに読み直す。** 取る前の観測は、取った時点の事実ではない
       let member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
       if (!member) return fail("member_fetch_failed", "メンバー情報の取得に失敗し配送できませんでした。運営にお問い合わせください。");
       if (!member.roles.cache.has(roleId)) {

@@ -322,7 +322,9 @@ describe("競合", () => {
     const result = await reconcileTimedAccessForGuild(discord.guild, ctx.services);
 
     expect(result.failed).toHaveLength(1);
-    expect(result.failed[0]!.error).toBe("role_missing_after_add");
+    // 投げたあとに取り直した実物へロールが無い＝副作用が無いことを確認できた失敗。
+    // 通常配送と同じラベル体系にそろえた（意味は同じ: 確認できた失敗なので再試行してよい）
+    expect(result.failed[0]!.error).toBe("role_add_failed:role_missing");
     expect(allEvidence(ctx)).toBe(0);
     expect(ctx.shop.safetySnapshot(ctx.purchase.id)!.fulfillment.evidence).toBe(false);
     ctx.db.close();
