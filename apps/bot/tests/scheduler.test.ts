@@ -335,9 +335,10 @@ describe("ショップ 失効とロール剥奪", () => {
     const { db, events, shop, item, purchase } = setupShop();
     const keeper = shop.purchase({ expectedTermsToken: shop.quoteGenericPurchase(item.id).termsToken, itemId: item.id, userId: "user1", actor: "user1", memberRoleIds: [] }).purchase;
     deliver(shop, keeper.id);
-    const remove = vi.fn(async () => undefined);
-    const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
-    const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
+    const held = new Set<string>(["role_old"]);
+    const remove = vi.fn(async (id: string) => void held.delete(id));
+    const member = { roles: { cache: { has: (id: string) => held.has(id) }, remove } };
+    const client = { guilds: { fetch: vi.fn(async () => ({ id: "guild", members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
     const { processShopRoleRevocations } = await schedulerModule;
     const services = { db, events, shop, settings };
@@ -355,11 +356,17 @@ describe("ショップ 失効とロール剥奪", () => {
 
   it("active購入がなければロールを剥奪し、Discord API一時失敗後は剥奪だけ再試行する", async () => {
     const { db, events, shop, purchase } = setupShop();
-    const remove = vi.fn()
-      .mockRejectedValueOnce(new Error("temporary"))
-      .mockResolvedValueOnce(undefined);
-    const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
-    const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
+    // **実状態を持つ stub。** 剥奪は「投げたら成功」ではなく、取り直して不在を
+    // 確認できたときだけ done になる（Task #214）。1回目は失敗してロールが残る
+    const held = new Set<string>(["role_old"]);
+    let calls = 0;
+    const remove = vi.fn(async (id: string) => {
+      calls += 1;
+      if (calls === 1) throw new Error("temporary");
+      held.delete(id);
+    });
+    const member = { roles: { cache: { has: (id: string) => held.has(id) }, remove } };
+    const client = { guilds: { fetch: vi.fn(async () => ({ id: "guild", members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
     const { processShopRoleRevocations } = await schedulerModule;
     const services = { db, events, shop, settings };
@@ -383,9 +390,10 @@ describe("ショップ 失効とロール剥奪", () => {
   it("既存の失効購入に剥奪キューが無くても起動時バックフィルで回収する", async () => {
     const { db, events, shop, purchase } = setupShop();
     db.prepare("DELETE FROM shop_role_revocations WHERE purchase_id=?").run(purchase.id);
-    const remove = vi.fn(async () => undefined);
-    const member = { roles: { cache: { has: vi.fn(() => true) }, remove } };
-    const client = { guilds: { fetch: vi.fn(async () => ({ members: { fetch: vi.fn(async () => member) } })) } };
+    const held = new Set<string>(["role_old"]);
+    const remove = vi.fn(async (id: string) => void held.delete(id));
+    const member = { roles: { cache: { has: (id: string) => held.has(id) }, remove } };
+    const client = { guilds: { fetch: vi.fn(async () => ({ id: "guild", members: { fetch: vi.fn(async () => member) } })) } };
     const settings = { getString: vi.fn((key: string) => key === "guild:main" ? "guild" : undefined) };
     const { processShopRoleRevocations } = await schedulerModule;
 

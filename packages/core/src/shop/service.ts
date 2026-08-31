@@ -3642,11 +3642,20 @@ export class Shop {
     key: string;
     observed: "present" | "absent";
     actor: string;
+    /** `held` も対象にしてよいか。**再起動直後だけ true。** 既定は false */
+    includeHeld?: boolean;
   }): boolean {
     const body = (): boolean => {
       const holder = this.externalEffectLockHolder(input.key);
       if (!holder) return false;
-      const next = input.observed === "present" ? "settled" : "released";
+      // **稼働中に `held` を横取りしない。** `held` は「死んだ」ではなく
+      // 「いま実行しているかもしれない」。時間や存在では死を証明できないので、
+      // 所有者が生きていないと分かる境界（再起動直後）でしか触らない
+      if (holder.state === "held" && input.includeHeld !== true) return false;
+      // **達成された状態は操作によって逆。** 行に記録された operation で決める
+      // （呼び出し側の都合で決めない）。add は「在れば達成」、remove は「無ければ達成」
+      const reached = holder.operation === "remove" ? input.observed === "absent" : input.observed === "present";
+      const next = reached ? "settled" : "released";
       const changed = this.db
         .prepare(
           `UPDATE shop_external_effect_locks
@@ -3657,22 +3666,40 @@ export class Shop {
       if (changed !== 1) return false;
       this.events.log("shop_external_effect_recovered", {
         actor: input.actor,
-        payload: { effectKey: input.key, observed: input.observed, previousOwner: holder.owner },
+        payload: {
+          effectKey: input.key,
+          observed: input.observed,
+          operation: holder.operation,
+          outcome: next,
+          previousState: holder.state,
+          previousOwner: holder.owner,
+        },
       });
       return true;
     };
     return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
   }
 
-  /** 決着していない実行権。再起動後の収束と運営画面の両方から使う。 */
-  listUnresolvedExternalEffectLocks(limit = 50): ExternalEffectLockRow[] {
+  /**
+   * 決着していない実行権。再起動後の収束と運営画面の両方から使う。
+   *
+   * `states` で絞れる。**稼働中の巡回は `uncertain` だけを見る**——`held` は
+   * まだ実行中かもしれず、外から死を証明できないため。
+   */
+  listUnresolvedExternalEffectLocks(
+    limit = 50,
+    states: ReadonlyArray<"held" | "uncertain"> = EXTERNAL_EFFECT_LIVE_STATES,
+  ): ExternalEffectLockRow[] {
+    const allowed = states.filter((v) => (EXTERNAL_EFFECT_LIVE_STATES as readonly string[]).includes(v));
+    if (allowed.length === 0) return [];
+    const placeholders = allowed.map(() => "?").join(",");
     return this.db
       .prepare(
         `SELECT * FROM shop_external_effect_locks
-          WHERE state IN ${EXTERNAL_EFFECT_LIVE_STATES_SQL}
+          WHERE state IN (${placeholders})
           ORDER BY acquired_at ASC LIMIT ?`,
       )
-      .all(limit) as ExternalEffectLockRow[];
+      .all(...allowed, limit) as ExternalEffectLockRow[];
   }
 
   /** この購入に対する実行権の履歴（新しい順）。監査用。 */

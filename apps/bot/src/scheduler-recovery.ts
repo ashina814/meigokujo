@@ -1,4 +1,4 @@
-import type { Client } from "discord.js";
+import type { Client, GuildMember } from "discord.js";
 import { Shop } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
@@ -478,8 +478,24 @@ let externalDeliveryRecoveryInFlight = false;
  * ここでロールを剥がすことはしない。与えたかもしれないものを確認する処理であって、
  * 取り上げる処理ではない。
  */
-export async function convergeExternalEffectLocks(client: Client, services: Services): Promise<void> {
-  const open = services.shop.listUnresolvedExternalEffectLocks();
+export async function convergeExternalEffectLocks(
+  client: Client,
+  services: Services,
+  opts: { includeHeld?: boolean } = {},
+): Promise<void> {
+  // **稼働中は `held` を触らない。** `held` は「落ちた」ではなく
+  // 「いま Discord を叩いているかもしれない」。定期巡回が横から解放すると、
+  // 実行中の worker と次の worker が同じ効果を二重に投げる——Task #214 が
+  // 防ごうとしているものそのものになる。
+  //
+  // 所有者が生きていないと言えるのは**再起動直後だけ**（このBotは単一インスタンス
+  // 構成で、systemd の1ユニットとして動く）。複数インスタンスを同時に走らせる
+  // 構成へ変えるなら、ここは instance/session identity で死を証明する必要がある。
+  const includeHeld = opts.includeHeld === true;
+  const open = services.shop.listUnresolvedExternalEffectLocks(
+    50,
+    includeHeld ? (["held", "uncertain"] as const) : (["uncertain"] as const),
+  );
   if (open.length === 0) return;
   const guildId = services.settings.getString("guild:main");
   if (!guildId) return;
@@ -507,6 +523,7 @@ export async function convergeExternalEffectLocks(client: Client, services: Serv
       key: lock.effect_key,
       observed: member.roles.cache.has(roleId) ? "present" : "absent",
       actor: "system:shop-external-effect",
+      includeHeld,
     });
   }
 }
@@ -632,7 +649,7 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         }
       }
 
-      let member;
+      let member: GuildMember;
       try {
         member = await guild.members.fetch(candidate.user_id);
       } catch (error) {
@@ -646,41 +663,110 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         continue;
       }
 
+      // 資源の critical section はここから。
+      //
+      // **剥奪も、その巻き戻しも、同じ資源への外部効果。** 付ける側と同じ鍵で調停する。
+      // 鍵は (guild, user, role) という資源の単位で、操作は metadata。操作ごとに
+      // 分けると ADD(U,R) と REMOVE(U,R) を別 worker が同時に所有できてしまう。
+      //
+      // **取得はここ。** 巻き戻し（持ち越しの復元・剥奪後の補償）も保護対象なので、
+      // それより前に取り、資源の遷移が終わるまで手放さない。途中で settle して
+      // 取り直すと、その隙に別 worker が入れてしまう。
+      const effectKey = Shop.discordRoleEffectKey(guild.id, candidate.user_id, roleId);
+      const lock = services.shop.acquireExternalEffectLock({
+        scope: "discord_role",
+        key: effectKey,
+        operation: "remove",
+        owner: "system:shop-role-revocation",
+        purchaseId: candidate.purchase_id,
+      });
+      if (!lock.ok) {
+        // 誰かが同じロールを触っている最中。**横から剥がしも戻しもしない。**
+        // 失敗ではないので retry 回数は消費させず、次の巡回へ回す
+        markRoleRevocationDeferred(services, candidate.purchase_id, "external_effect_busy");
+        continue;
+      }
+      let lockOpen = true;
+      const closeLock = (next: "settled" | "released" | "uncertain", reason: string): void => {
+        if (!lockOpen) return;
+        lockOpen = false;
+        const args = { key: effectKey, token: lock.token, reason, actor: "system:shop-role-revocation" };
+        if (next === "settled") services.shop.settleExternalEffectLock(args);
+        else if (next === "released") services.shop.releaseExternalEffectLock(args);
+        else services.shop.markExternalEffectUncertain(args);
+      };
+
       /**
-       * 有効な契約があるのに role が無い状態を残さない。**戻し切れたかどうかだけを返す。**
-       * done にするか持ち越すかは、戻す理由（`delivered` / `unsettled`）で呼び側が決める。
+       * Discord を1回叩いて、**実物を取り直して結末を決める**。
+       *
+       * 解決した promise だけでは足りない（エラー応答でも効いていることがあるし、
+       * 成功応答でも後から消えていることがある）。取り直せなければ unknown——
+       * 「分からない」を「起きなかった」に落とさない。
        */
-      const restoreRole = async (): Promise<boolean> => {
-        if (member.roles.cache.has(roleId)) return true;
+      const applyAndVerify = async (
+        act: () => Promise<unknown>,
+        want: "present" | "absent",
+      ): Promise<{ outcome: "reached" | "not_reached" | "unknown"; error: string | null }> => {
+        let error: string | null = null;
         try {
-          await member.roles.add(roleId);
-          const confirmed = await guild.members.fetch({ user: candidate.user_id, force: true });
-          if (!confirmed.roles.cache.has(roleId)) throw new Error("rollback_not_confirmed");
+          await act();
+        } catch (e) {
+          error = e instanceof Error ? e.message : String(e);
+        }
+        const confirmed = await guild.members
+          .fetch({ user: candidate.user_id, force: true })
+          .catch(() => null);
+        if (confirmed === null) return { outcome: "unknown", error };
+        member = confirmed;
+        const has = confirmed.roles.cache.has(roleId);
+        const reached = want === "present" ? has : !has;
+        return { outcome: reached ? "reached" : "not_reached", error };
+      };
+
+      /**
+       * 有効な契約があるのに role が無い状態を残さない。
+       *
+       * **鍵を持ったまま実行する。** 補償の add も保護対象の資源変更なので、
+       * ここで所有権を手放してはいけない。
+       */
+      const restoreRole = async (): Promise<"restored" | "failed" | "unknown"> => {
+        if (member.roles.cache.has(roleId)) return "restored";
+        const { outcome, error } = await applyAndVerify(() => member.roles.add(roleId), "present");
+        if (outcome === "reached") {
           services.events.log("shop_role_revocation_rolled_back", {
             actor: "system:shop-role-revocation",
             target: candidate.user_id,
-            payload: { purchaseId: candidate.purchase_id },
+            payload: { purchaseId: candidate.purchase_id, underEffectOwnership: true },
           });
-          return true;
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          markRoleRevocationRetryOnce(services, candidate.purchase_id, `rollback_failed:${message}`);
-          failures.push(`rollback:${candidate.purchase_id}:${message}`);
-          return false;
+          return "restored";
         }
+        const message = error ?? "rollback_not_confirmed";
+        markRoleRevocationRetryOnce(services, candidate.purchase_id, `rollback_failed:${message}`);
+        failures.push(`rollback:${candidate.purchase_id}:${message}`);
+        return outcome === "unknown" ? "unknown" : "failed";
       };
 
       /**
        * ロールを戻してから、守っている契約の強さで決着をつける。
        *
        * - `delivered` … 提供済みの契約が守っている。この失効はもう役目を終えた → done
-       * - `unsettled` … 提供されたか未確定。**戻すが done にはしない**。Bが提供されれば
-       *   次の巡回で done、Bが返金されれば次の巡回で改めて剥がす
+       * - `unsettled` … 提供されたか未確定。**戻すが done にはしない**
        *
        * **戻し切れなければどちらでも done にしない。** 次の巡回でやり直す。
        */
       const restoreThenSettle = async (state: "delivered" | "unsettled"): Promise<void> => {
-        if (!(await restoreRole())) return;
+        const restored = await restoreRole();
+        if (restored === "unknown") {
+          // 戻したかどうか分からない。**鍵は握ったまま残す**（次の add を走らせない）
+          closeLock("uncertain", "restore_unverified");
+          return;
+        }
+        if (restored === "failed") {
+          // 戻せていないことは確認できた。資源は動いていないので解放してよい
+          closeLock("released", "restore_failed_no_effect");
+          return;
+        }
+        closeLock("settled", "restored_under_ownership");
         if (state === "delivered") {
           markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
           return;
@@ -689,7 +775,7 @@ export async function processShopRoleRevocations(client: Client, services: Servi
       };
 
       // 再起動やrollback失敗で持ち越した行。有効な契約があるなら、まず実体を収束させる。
-      // **ここも3状態で見る。** `unsettled` を素通りさせると、下の `already_absent` が
+      // **ここも3状態で見る。** `unsettled` を素通りさせると、下の already_absent が
       // 「自分が外したロール」を戻さないまま done にしてしまう（remove直後に落ちた場合）。
       if (mayHaveRemoved) {
         const carried = entitlement();
@@ -700,6 +786,7 @@ export async function processShopRoleRevocations(client: Client, services: Servi
       }
 
       if (!member.roles.cache.has(roleId)) {
+        closeLock("settled", "already_absent");
         markRoleRevocationDoneOnce(services, candidate.purchase_id, "already_absent");
         continue;
       }
@@ -708,91 +795,50 @@ export async function processShopRoleRevocations(client: Client, services: Servi
       // 新しい契約が成立していると、新しい権利のロールを古い失効が剥がしてしまう。
       const beforeRemove = entitlement();
       if (beforeRemove === "delivered") {
+        closeLock("released", "entitlement_appeared_before_remove");
         markRoleRevocationDoneOnce(services, candidate.purchase_id, "active_purchase_still_grants_role");
         continue;
       }
       if (beforeRemove === "unsettled") {
+        closeLock("released", "entitlement_unsettled_before_remove");
         markRoleRevocationDeferred(services, candidate.purchase_id, "active_purchase_unsettled");
-        continue;
-      }
-
-      // **剥がすのも同じ資源への外部効果。** 付ける側と同じ鍵で調停する。
-      //
-      // 鍵を「操作ごと」に分けると、ADD(U,R) と REMOVE(U,R) を別々の worker が
-      // 同時に所有できてしまい、付けた直後に剥がす競合が残る。だから鍵は
-      // (guild, user, role) という**資源**の単位で、操作は metadata にしてある。
-      const effectKey = Shop.discordRoleEffectKey(guild.id, candidate.user_id, roleId);
-      const lock = services.shop.acquireExternalEffectLock({
-        scope: "discord_role",
-        key: effectKey,
-        operation: "remove",
-        owner: "system:shop-role-revocation",
-        purchaseId: candidate.purchase_id,
-      });
-      if (!lock.ok) {
-        // 誰かが同じロールへ付与を投げている最中。**横から剥がさない。**
-        // 失敗ではないので retry 回数も消費させず、次の巡回へ回す
-        markRoleRevocationDeferred(services, candidate.purchase_id, "external_effect_busy");
         continue;
       }
 
       // **呼ぶ前にDBへ残す。** 呼んだ直後に落ちても、次回「自分が外したかもしれない」
       // と分かるようにする（メモリ上のフラグでは落ちた瞬間に消える）。
       services.shop.markRoleRevocationRemoveAttempt(candidate.purchase_id);
-      try {
-        await member.roles.remove(roleId);
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        // **実物を取り直して、効果の有無を確かめてから鍵を始末する。**
-        // 「投げて失敗した」だけでは剥がせたかどうか分からない。
-        // 分かるなら分かった通りに閉じ、分からないときだけ握ったまま残す。
-        const after = await guild.members.fetch({ user: candidate.user_id, force: true }).catch(() => null);
-        if (after === null) {
-          services.shop.markExternalEffectUncertain({
-            key: effectKey,
-            token: lock.token,
-            reason: `role_remove_failed_unverified:${message}`,
-            actor: "system:shop-role-revocation",
-          });
-        } else if (after.roles.cache.has(roleId)) {
-          // まだ付いている＝剥がせていない。副作用が無いので解放してよい（再試行できる）
-          services.shop.releaseExternalEffectLock({
-            key: effectKey,
-            token: lock.token,
-            reason: `role_remove_failed_no_effect:${message}`,
-            actor: "system:shop-role-revocation",
-          });
-        } else {
-          // 例外は返ったが実際には剥がれている
-          services.shop.settleExternalEffectLock({
-            key: effectKey,
-            token: lock.token,
-            reason: "role_removed_despite_error",
-            actor: "system:shop-role-revocation",
-          });
-        }
-        markRoleRevocationRetryOnce(services, candidate.purchase_id, message);
-        failures.push(`role_remove:${candidate.purchase_id}:${message}`);
+      const removed = await applyAndVerify(() => member.roles.remove(roleId), "absent");
+      if (removed.outcome === "unknown") {
+        // 投げたが最終確認が取れない。**剥がせたかどうか分からない**ので鍵は残す。
+        // ここで解放すると、次の add がこの不確定と競合する
+        const why = removed.error ?? "final_fetch_failed";
+        closeLock("uncertain", `role_remove_unverified:${why}`);
+        markRoleRevocationRetryOnce(services, candidate.purchase_id, why);
+        failures.push(`role_remove:${candidate.purchase_id}:${why}`);
         continue;
       }
-      services.shop.settleExternalEffectLock({
-        key: effectKey,
-        token: lock.token,
-        reason: "role_removed",
-        actor: "system:shop-role-revocation",
-      });
+      if (removed.outcome === "not_reached") {
+        // まだ付いている＝剥がせていない。資源は動いていないので解放してよい
+        const why = removed.error ?? "still_present";
+        closeLock("released", `role_remove_no_effect:${why}`);
+        markRoleRevocationRetryOnce(services, candidate.purchase_id, why);
+        failures.push(`role_remove:${candidate.purchase_id}:${why}`);
+        continue;
+      }
 
       // **剥がした直後にも確かめる。** 剥がしている最中に新しい契約が生えていたら、
       // 自分が消したロールを戻す。戻し切れるまでこの失効を done にしない。
-      // **`delivered` だけを見てはいけない。** `roles.remove()` のawait中に生えた
-      // 未配送の契約（`unsettled`）を無視すると、race のときだけ
-      // 「剥がさない / done にしない」という契約を破る。
+      //
+      // **補償の add も同じ鍵の中で行う。** ここで settle して取り直すと、その隙に
+      // 別 worker が資源を触れてしまう。
       const afterRemove = entitlement();
       if (afterRemove !== "none") {
         await restoreThenSettle(afterRemove);
         continue;
       }
 
+      closeLock("settled", "role_removed");
       markRoleRevocationDoneOnce(services, candidate.purchase_id, "removed");
     }
 

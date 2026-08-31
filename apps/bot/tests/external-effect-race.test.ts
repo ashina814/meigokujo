@@ -316,13 +316,44 @@ describe("F5 / F7: 落ちた worker の鍵が残っているとき", () => {
     // ロールは付いていない＝副作用は残っていないと実物で確認できる
     const d = discord();
     const client = { guilds: { fetch: vi.fn(async () => d.guild) } };
-    await convergeExternalEffectLocks(client as never, ctx.services);
 
+    // **稼働中の定期収束は held を触らない。** 所有者がまだ実行中かもしれない
+    await convergeExternalEffectLocks(client as never, ctx.services);
+    expect(ctx.shop.listUnresolvedExternalEffectLocks()).toHaveLength(1);
+
+    // 再起動直後の境界でだけ収束できる
+    await convergeExternalEffectLocks(client as never, ctx.services, { includeHeld: true });
     expect(ctx.shop.listUnresolvedExternalEffectLocks()).toHaveLength(0);
     const { deliverPurchaseUnlocked } = await deliveryModule;
     const outcome = await deliverPurchaseUnlocked(ctx.services, d.guild, p, ACTOR);
     expect(outcome.state).toBe("delivered");
     expect(d.add).toHaveBeenCalledTimes(1);
+    ctx.db.close();
+  });
+
+  it("RF-A: 稼働中の定期収束は、生きている held を奪わない", async () => {
+    const { convergeExternalEffectLocks } = await import("../src/scheduler-recovery.js");
+    const ctx = setup();
+    const lock = ctx.shop.acquireExternalEffectLock({
+      scope: "discord_role", key: KEY, operation: "add", owner: "live-worker",
+    });
+    expect(lock.ok).toBe(true);
+    if (!lock.ok) return;
+
+    const d = discord();
+    const client = { guilds: { fetch: vi.fn(async () => d.guild) } };
+    await convergeExternalEffectLocks(client as never, ctx.services);
+
+    // 所有者もトークンもそのまま。別 worker はまだ取れない
+    const after = holder(ctx)!;
+    expect(after.state).toBe("held");
+    expect(after.owner).toBe("live-worker");
+    expect(after.owner_token).toBe(lock.token);
+    expect(
+      ctx.shop.acquireExternalEffectLock({
+        scope: "discord_role", key: KEY, operation: "add", owner: "rival",
+      }).ok,
+    ).toBe(false);
     ctx.db.close();
   });
 
