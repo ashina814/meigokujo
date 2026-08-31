@@ -62,10 +62,11 @@ async function reconcileTimedAccessRoles(
     //
     // 鍵は購入ではなく効果の単位。同じロールを与える別契約が並んでいても、
     // 実行してよいのは常に1人だけになる。
-    const effectKey = Shop.discordRoleAddEffectKey(guild.id, target, grant.roleId);
+    const effectKey = Shop.discordRoleEffectKey(guild.id, target, grant.roleId);
     const lock = services.shop.acquireExternalEffectLock({
-      scope: "discord_role_add",
+      scope: "discord_role",
       key: effectKey,
+      operation: "add",
       owner: "system:shop-timed-access",
       purchaseId: grant.purchase.id,
     });
@@ -175,25 +176,33 @@ async function reconcileTimedAccessRoles(
         // `added=false`（元からロールがあった）はここへ来ない。**ロールの起源を
         // 証明していない**ので、提供済みの証拠にも未提供の証拠にもしない。
         //
-        // **帰属してよいかは Core が決める。** 購入時の不変な証拠でロールが確定して
-        // いること・観測したロールと一致すること・同じロールを与える有効な契約が
-        // これ1つであること——を1つの transaction で確かめ、1つでも欠ければ
-        // 何も書かない。曖昧なまま書くと、返金を拒む authority を推測で作ることになる。
-        services.shop.recordTimedAccessVerifiedDelivery({
+        // **所有権つきで、証拠と鍵の決着を1つの transaction にまとめる。**
+        //
+        // 「証拠を書く」と「鍵を閉じる」を割ると、間で落ちたときに
+        // 「鍵は閉じたが購入側は未決着」になり、別 worker が再実行できてしまう。
+        // また鍵を持たない呼び出し側が証拠だけ作れる形も残してはいけない。
+        //
+        // 帰属が証明できなければ証拠は書かず、鍵だけ正常に閉じる
+        // （曖昧さは失敗ではない。言えることが無いだけ）。
+        services.shop.completeTimedAccessRoleAdd({
+          effectKey,
+          effectToken: lock.token,
           purchaseId: grant.purchase.id,
           userId: target,
           roleId: grant.roleId,
           writer: "system:shop-timed-access",
           detail: { itemId: grant.item.id, verification: "force_refetch_role_present" },
         });
+        lockOpen = false; // 上の operation が settled まで済ませている
         services.events.log("shop_timed_access_restored", {
           actor: "system:shop-timed-access",
           target,
           payload: { purchaseId: grant.purchase.id, itemId: grant.item.id, roleId: grant.roleId },
         });
       }
-      // 目的状態の成立を force refetch で確認できている
-      closeLock("settled", added ? "role_added_and_verified" : "role_already_present");
+      // added=false（元から在った）の場合はここで閉じる。
+      // added=true は上の完了 operation が所有権つきで閉じている
+      closeLock("settled", "role_already_present");
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       // **投げたあとに分からなくなったなら、鍵は握ったまま残す。**

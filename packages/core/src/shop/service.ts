@@ -356,8 +356,15 @@ export interface OperatorResolutionRow {
  */
 export type VerifiedDeliveryEvidenceSource = "timed_access_role_added_and_refetched";
 
-/** 外部効果の種類。所有権はこの単位で調停する。 */
-export type ExternalEffectScope = "discord_role_add";
+/**
+ * 排他する**資源**の種類。操作（add/remove）ではない。
+ *
+ * 操作を排他の次元にすると「付ける人」と「剥がす人」が同時に成立してしまう。
+ */
+export type ExternalEffectScope = "discord_role";
+
+/** その所有者が何をしようとしているか。**排他の次元ではない**（metadata）。 */
+export type ExternalEffectOperation = "add" | "remove";
 
 /** 生きている所有権の状態。**`uncertain` は解放しない**（結果不明を失敗と断定しない）。 */
 export const EXTERNAL_EFFECT_LIVE_STATES = ["held", "uncertain"] as const;
@@ -367,6 +374,7 @@ export interface ExternalEffectLockRow {
   id: number;
   effect_scope: ExternalEffectScope;
   effect_key: string;
+  operation: ExternalEffectOperation;
   owner_token: string;
   owner: string;
   purchase_id: number | null;
@@ -3446,11 +3454,14 @@ export class Shop {
    * 2つあれば、purchase 単位の claim は**両方に live を許してしまう**ので、
    * どちらの worker も `roles.add` を投げられる。鍵はこの単位で持つ。
    *
-   * 通常配送と期限つきアクセスの巡回が**同じ関数**でキーを作ることが要点。
-   * 片方だけ別の作り方をすると、同じ効果に別々の鍵ができて調停にならない。
+   * 通常配送・期限つきアクセスの巡回・**失効時の剥奪**が同じ関数でキーを作る。
+   * 片方だけ別の作り方をすると、同じ資源に別々の鍵ができて調停にならない。
+   *
+   * **キーに操作（add/remove）を含めない。** 含めると
+   * 「付ける人」と「剥がす人」が同時に鍵を持ててしまう。
    */
-  static discordRoleAddEffectKey(guildId: string, userId: string, roleId: string): string {
-    return `discord_role_add:${guildId}:${userId}:${roleId}`;
+  static discordRoleEffectKey(guildId: string, userId: string, roleId: string): string {
+    return `discord_role:${guildId}:${userId}:${roleId}`;
   }
 
   /**
@@ -3466,6 +3477,7 @@ export class Shop {
   acquireExternalEffectLock(input: {
     scope: ExternalEffectScope;
     key: string;
+    operation: ExternalEffectOperation;
     owner: string;
     purchaseId?: number | null;
   }): ExternalEffectLock {
@@ -3477,13 +3489,18 @@ export class Shop {
       this.db
         .prepare(
           `INSERT INTO shop_external_effect_locks
-             (effect_scope, effect_key, owner_token, owner, purchase_id, state, detail, acquired_at, updated_at)
-           VALUES (?,?,?,?,?, 'held', NULL, ?, ?)`,
+             (effect_scope, effect_key, operation, owner_token, owner, purchase_id, state, detail, acquired_at, updated_at)
+           VALUES (?,?,?,?,?,?, 'held', NULL, ?, ?)`,
         )
-        .run(input.scope, input.key, token, input.owner, input.purchaseId ?? null, ts, ts);
+        .run(input.scope, input.key, input.operation, token, input.owner, input.purchaseId ?? null, ts, ts);
       this.events.log("shop_external_effect_acquired", {
         actor: input.owner,
-        payload: { effectKey: input.key, scope: input.scope, purchaseId: input.purchaseId ?? null },
+        payload: {
+          effectKey: input.key,
+          scope: input.scope,
+          operation: input.operation,
+          purchaseId: input.purchaseId ?? null,
+        },
       });
       return { ok: true, token, key: input.key };
     };
@@ -3558,6 +3575,93 @@ export class Shop {
     return this.transitionExternalEffectLock(
       input.key, input.token, "uncertain", input.reason, input.actor, "shop_external_effect_uncertain",
     );
+  }
+
+  /**
+   * **所有権を持っている worker だけが、証拠を残して鍵を閉じられる。**
+   *
+   * 「ロールを付けた」→「証拠を書く」を別々の operation にすると、
+   * *鍵を持っていない呼び出し側でも証拠を作れてしまう*（返金拒否 authority を
+   * 所有権なしで発行できる）。また2つの transaction に割れると、
+   * 「鍵は閉じたが購入側は未決着」で落ちたときに別 worker が再実行できる。
+   *
+   * だから1つの transaction で:
+   *   1. **この鍵の現在の所有者が自分である**ことを確かめる（トークン照合）
+   *   2. Task #213 の帰属・購入時対象の規則を通す
+   *   3. 通ったときだけ証拠を残す（通らなければ**証拠なしで**鍵だけ閉じる）
+   *   4. 鍵を settled にする
+   *
+   * 帰属が証明できないことは失敗ではない。**言えることが無いだけ**なので、
+   * 鍵は正常に閉じて次の処理へ道を空ける（無限に握らない）。
+   */
+  completeTimedAccessRoleAdd(input: {
+    effectKey: string;
+    effectToken: string;
+    purchaseId: number;
+    userId: string;
+    roleId: string;
+    writer: string;
+    detail?: Record<string, unknown>;
+  }): { settled: boolean; evidenceRecorded: boolean } {
+    const body = (): { settled: boolean; evidenceRecorded: boolean } => {
+      // **所有権が先。** 持っていない者に証拠を書かせない
+      const holder = this.externalEffectLockHolder(input.effectKey);
+      if (!holder || holder.owner_token !== input.effectToken) {
+        return { settled: false, evidenceRecorded: false };
+      }
+      const evidenceRecorded = this.recordTimedAccessVerifiedDelivery({
+        purchaseId: input.purchaseId,
+        userId: input.userId,
+        roleId: input.roleId,
+        writer: input.writer,
+        detail: input.detail,
+      });
+      const settled = this.settleExternalEffectLock({
+        key: input.effectKey,
+        token: input.effectToken,
+        reason: evidenceRecorded ? "role_added_and_verified" : "role_added_attribution_unproven",
+        actor: input.writer,
+      });
+      return { settled, evidenceRecorded };
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
+  }
+
+  /**
+   * **収束専用の上書き経路。** 通常の worker の決着とは別物として分ける。
+   *
+   * 落ちた worker の鍵は、そのトークンを持つ者がもういないので普通には閉じられない。
+   * かといって時間で消すと、投げている最中の相手を追い出して二重実行を作る。
+   * だから「**外部の実状態を観測できた**」ことだけを根拠に、収束処理が上書きする。
+   *
+   * **これは配送済みの authority ではない。** ロールが在ることは資源の状態であって、
+   * 「この購入の効果だった」の証明ではない（別の誰かが付けたのかもしれない）。
+   * だから証拠は1つも書かない。分からないものは分からないまま残す。
+   */
+  recoverExternalEffectLock(input: {
+    key: string;
+    observed: "present" | "absent";
+    actor: string;
+  }): boolean {
+    const body = (): boolean => {
+      const holder = this.externalEffectLockHolder(input.key);
+      if (!holder) return false;
+      const next = input.observed === "present" ? "settled" : "released";
+      const changed = this.db
+        .prepare(
+          `UPDATE shop_external_effect_locks
+              SET state = ?, detail = ?, updated_at = ?
+            WHERE id = ? AND state IN ${EXTERNAL_EFFECT_LIVE_STATES_SQL}`,
+        )
+        .run(next, `recovered_role_${input.observed}`, now(), holder.id).changes;
+      if (changed !== 1) return false;
+      this.events.log("shop_external_effect_recovered", {
+        actor: input.actor,
+        payload: { effectKey: input.key, observed: input.observed, previousOwner: holder.owner },
+      });
+      return true;
+    };
+    return this.db.inTransaction ? body() : this.db.transaction(body).immediate();
   }
 
   /** 決着していない実行権。再起動後の収束と運営画面の両方から使う。 */

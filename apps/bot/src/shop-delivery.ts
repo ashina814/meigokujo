@@ -75,6 +75,9 @@ export interface DeliveryOutcome {
  * 商品定義を後から変えただけで過去の購入の配送内容が変わってしまう。
  */
 /** 購入時に本人が入力した内容 */
+/** 決着を1つの transaction で all-or-nothing にするための内部シグナル */
+class SettlementRollback extends Error {}
+
 export function parseRequest(json: string | null): Record<string, unknown> | null {
   if (!json) return null;
   try {
@@ -311,13 +314,40 @@ export async function deliverPurchaseUnlocked(
    * 確定できなかった＝そのあいだに purchase が動いた、ということなので
    * 「Discordでは提供済みだがDBでは未確定」として人へ渡す。自動返金はしない。
    */
+  /**
+   * 外部の目的状態を確認したあとの確定。
+   *
+   * **鍵の決着と購入の決着を同じ transaction で閉じる。** 割ると、間で落ちたときに
+   * 「鍵は閉じたが購入は未決着」になり、別 worker が同じ効果を投げ直せてしまう。
+   * Discord の呼び出しは transaction にできないが、そのあとのDB収束はできる。
+   */
   const settle = (): boolean => {
-    // 目的状態の成立を確認できているので、鍵は settled で閉じる
-    resolveEffectLock("settled", "effect_confirmed");
-    if (claimToken === null) return services.shop.markDeliverySucceeded(purchase.id, actor);
-    const ok = services.shop.settleExternalDelivery({ purchaseId: purchase.id, token: claimToken, actor });
-    if (ok) claimToken = null;
-    return ok;
+    const savedKey = effectKey;
+    const savedToken = effectToken;
+    try {
+      return services.db
+        .transaction(() => {
+          resolveEffectLock("settled", "effect_confirmed");
+          const ok =
+            claimToken === null
+              ? services.shop.markDeliverySucceeded(purchase.id, actor)
+              : services.shop.settleExternalDelivery({ purchaseId: purchase.id, token: claimToken, actor });
+          // **購入側が確定できないなら、鍵の決着も巻き戻す。**
+          // 片方だけ閉じると「鍵は閉じたが購入は未決着」になり、別 worker が投げ直せる
+          if (!ok) throw new SettlementRollback();
+          claimToken = null;
+          return true;
+        })
+        .immediate();
+    } catch (error) {
+      if (error instanceof SettlementRollback) {
+        // 巻き戻したので鍵はまだ自分のもの。呼び出し側が uncertain へ倒す
+        effectKey = savedKey;
+        effectToken = savedToken;
+        return false;
+      }
+      throw error;
+    }
   };
 
   const unsettled = (userMessage: string): DeliveryOutcome => {
@@ -398,10 +428,11 @@ export async function deliverPurchaseUnlocked(
       // **Discord を1回でも読む前に鍵を取る。** 「読んで空いていたら投げる」だと、
       // 読んだあと投げる前に別 worker が取れてしまい TOCTOU が閉じない。
       // 取得は1つの transaction で、DBの部分ユニーク索引が1人だけを選ぶ。
-      const key = Shop.discordRoleAddEffectKey(guild.id, userId, roleId);
+      const key = Shop.discordRoleEffectKey(guild.id, userId, roleId);
       const lock = services.shop.acquireExternalEffectLock({
-        scope: "discord_role_add",
+        scope: "discord_role",
         key,
+        operation: "add",
         owner: actor,
         purchaseId: purchase.id,
       });

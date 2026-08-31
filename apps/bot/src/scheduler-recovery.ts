@@ -1,4 +1,5 @@
 import type { Client } from "discord.js";
+import { Shop } from "@meigokujo/core";
 import type { Services } from "./services.js";
 
 const AUTODROP_PENDING_KEY = "autodrop:pending_role_sync";
@@ -486,8 +487,8 @@ export async function convergeExternalEffectLocks(client: Client, services: Serv
   if (!guild) return;
 
   for (const lock of open) {
-    if (lock.effect_scope !== "discord_role_add") continue;
-    // 鍵は `discord_role_add:<guild>:<user>:<role>`。**自分の guild のものだけ**触る
+    if (lock.effect_scope !== "discord_role") continue;
+    // 鍵は `discord_role:<guild>:<user>:<role>`。**自分の guild のものだけ**触る
     const parts = lock.effect_key.split(":");
     if (parts.length !== 4) continue;
     const [, lockGuildId, userId, roleId] = parts as [string, string, string, string];
@@ -496,22 +497,15 @@ export async function convergeExternalEffectLocks(client: Client, services: Serv
     const member = await guild.members.fetch({ user: userId, force: true }).catch(() => null);
     if (!member) continue; // 確かめられない。鍵は残したまま人へ
 
-    if (member.roles.cache.has(roleId)) {
-      // 目的状態は成立している。**ただしこれは「提供された」の証拠ではない**——
-      // 誰の効果かは別問題なので、鍵を閉じるだけで delivered evidence は作らない
-      services.shop.settleExternalEffectLock({
-        key: lock.effect_key,
-        token: lock.owner_token,
-        reason: "recovered_role_present",
-        actor: "system:shop-external-effect",
-      });
-      continue;
-    }
-    // ロールが無いことを実物で確認できた＝副作用は残っていない。解放して通常へ戻す
-    services.shop.releaseExternalEffectLock({
+    // **収束専用の経路を使う。** 通常の worker の決着（トークン必須）とは分ける。
+    // 落ちた worker のトークンを持つ者はもういないので、通常経路では閉じられない。
+    //
+    // 根拠は観測した資源の状態だけ。**「提供された」の証拠は1つも作らない**——
+    // ロールが在ることは資源の状態であって、この購入の効果だった証明ではない
+    // （不確定の窓の間に別の誰かが付けたのかもしれない）。
+    services.shop.recoverExternalEffectLock({
       key: lock.effect_key,
-      token: lock.owner_token,
-      reason: "recovered_verified_no_effect",
+      observed: member.roles.cache.has(roleId) ? "present" : "absent",
       actor: "system:shop-external-effect",
     });
   }
@@ -722,6 +716,26 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         continue;
       }
 
+      // **剥がすのも同じ資源への外部効果。** 付ける側と同じ鍵で調停する。
+      //
+      // 鍵を「操作ごと」に分けると、ADD(U,R) と REMOVE(U,R) を別々の worker が
+      // 同時に所有できてしまい、付けた直後に剥がす競合が残る。だから鍵は
+      // (guild, user, role) という**資源**の単位で、操作は metadata にしてある。
+      const effectKey = Shop.discordRoleEffectKey(guild.id, candidate.user_id, roleId);
+      const lock = services.shop.acquireExternalEffectLock({
+        scope: "discord_role",
+        key: effectKey,
+        operation: "remove",
+        owner: "system:shop-role-revocation",
+        purchaseId: candidate.purchase_id,
+      });
+      if (!lock.ok) {
+        // 誰かが同じロールへ付与を投げている最中。**横から剥がさない。**
+        // 失敗ではないので retry 回数も消費させず、次の巡回へ回す
+        markRoleRevocationDeferred(services, candidate.purchase_id, "external_effect_busy");
+        continue;
+      }
+
       // **呼ぶ前にDBへ残す。** 呼んだ直後に落ちても、次回「自分が外したかもしれない」
       // と分かるようにする（メモリ上のフラグでは落ちた瞬間に消える）。
       services.shop.markRoleRevocationRemoveAttempt(candidate.purchase_id);
@@ -729,10 +743,44 @@ export async function processShopRoleRevocations(client: Client, services: Servi
         await member.roles.remove(roleId);
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
+        // **実物を取り直して、効果の有無を確かめてから鍵を始末する。**
+        // 「投げて失敗した」だけでは剥がせたかどうか分からない。
+        // 分かるなら分かった通りに閉じ、分からないときだけ握ったまま残す。
+        const after = await guild.members.fetch({ user: candidate.user_id, force: true }).catch(() => null);
+        if (after === null) {
+          services.shop.markExternalEffectUncertain({
+            key: effectKey,
+            token: lock.token,
+            reason: `role_remove_failed_unverified:${message}`,
+            actor: "system:shop-role-revocation",
+          });
+        } else if (after.roles.cache.has(roleId)) {
+          // まだ付いている＝剥がせていない。副作用が無いので解放してよい（再試行できる）
+          services.shop.releaseExternalEffectLock({
+            key: effectKey,
+            token: lock.token,
+            reason: `role_remove_failed_no_effect:${message}`,
+            actor: "system:shop-role-revocation",
+          });
+        } else {
+          // 例外は返ったが実際には剥がれている
+          services.shop.settleExternalEffectLock({
+            key: effectKey,
+            token: lock.token,
+            reason: "role_removed_despite_error",
+            actor: "system:shop-role-revocation",
+          });
+        }
         markRoleRevocationRetryOnce(services, candidate.purchase_id, message);
         failures.push(`role_remove:${candidate.purchase_id}:${message}`);
         continue;
       }
+      services.shop.settleExternalEffectLock({
+        key: effectKey,
+        token: lock.token,
+        reason: "role_removed",
+        actor: "system:shop-role-revocation",
+      });
 
       // **剥がした直後にも確かめる。** 剥がしている最中に新しい契約が生えていたら、
       // 自分が消したロールを戻す。戻し切れるまでこの失効を done にしない。

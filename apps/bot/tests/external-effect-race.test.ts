@@ -24,7 +24,7 @@ const USER = "1463201396567441441";
 const ROLE = "r-vip";
 const GUILD = "main-guild";
 const ACTOR = "system:test";
-const KEY = Shop.discordRoleAddEffectKey(GUILD, USER, ROLE);
+const KEY = Shop.discordRoleEffectKey(GUILD, USER, ROLE);
 
 function setup() {
   const db = openDb(":memory:");
@@ -122,7 +122,7 @@ describe("F1: 通常配送が先に鍵を取る", () => {
     const tid = timedAccessPurchase(ctx, ctx.mkItem("庭園").id);
     // 通常配送が鍵を握っている最中
     const lock = ctx.shop.acquireExternalEffectLock({
-      scope: "discord_role_add", key: KEY, owner: "system:shop-delivery",
+      scope: "discord_role", key: KEY, operation: "add", owner: "system:shop-delivery",
     });
     expect(lock.ok).toBe(true);
 
@@ -147,7 +147,7 @@ describe("F2: 巡回が先に鍵を取る", () => {
     const before = ctx.ledger.balanceOf(`user:${USER}`);
     // 巡回が鍵を握っている
     const lock = ctx.shop.acquireExternalEffectLock({
-      scope: "discord_role_add", key: KEY, owner: "system:shop-timed-access",
+      scope: "discord_role", key: KEY, operation: "add", owner: "system:shop-timed-access",
     });
     expect(lock.ok).toBe(true);
 
@@ -172,7 +172,7 @@ describe("F2: 巡回が先に鍵を取る", () => {
     const ctx = setup();
     const p = buy(ctx, ctx.mkItem("裏口").id);
     const lock = ctx.shop.acquireExternalEffectLock({
-      scope: "discord_role_add", key: KEY, owner: "other",
+      scope: "discord_role", key: KEY, operation: "add", owner: "other",
     });
     if (!lock.ok) return;
     const d = discord();
@@ -295,7 +295,7 @@ describe("F5 / F7: 落ちた worker の鍵が残っているとき", () => {
     const p = buy(ctx, ctx.mkItem("裏口").id);
     timedAccessPurchase(ctx, ctx.mkItem("庭園").id);
     // 落ちたプロセスが held のまま残した
-    ctx.shop.acquireExternalEffectLock({ scope: "discord_role_add", key: KEY, owner: "crashed-worker" });
+    ctx.shop.acquireExternalEffectLock({ scope: "discord_role", key: KEY, operation: "add", owner: "crashed-worker" });
 
     const d = discord();
     await reconcileTimedAccessForGuild(d.guild, ctx.services);
@@ -311,7 +311,7 @@ describe("F5 / F7: 落ちた worker の鍵が残っているとき", () => {
     const { convergeExternalEffectLocks } = await import("../src/scheduler-recovery.js");
     const ctx = setup();
     const p = buy(ctx, ctx.mkItem("裏口").id);
-    ctx.shop.acquireExternalEffectLock({ scope: "discord_role_add", key: KEY, owner: "crashed-worker" });
+    ctx.shop.acquireExternalEffectLock({ scope: "discord_role", key: KEY, operation: "add", owner: "crashed-worker" });
 
     // ロールは付いていない＝副作用は残っていないと実物で確認できる
     const d = discord();
@@ -329,7 +329,7 @@ describe("F5 / F7: 落ちた worker の鍵が残っているとき", () => {
   it("収束は時間では消さない — 確かめられなければ残す", async () => {
     const { convergeExternalEffectLocks } = await import("../src/scheduler-recovery.js");
     const ctx = setup();
-    ctx.shop.acquireExternalEffectLock({ scope: "discord_role_add", key: KEY, owner: "crashed-worker" });
+    ctx.shop.acquireExternalEffectLock({ scope: "discord_role", key: KEY, operation: "add", owner: "crashed-worker" });
 
     // member が取れない＝実状態を確認できない
     const guild = {

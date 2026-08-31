@@ -19,7 +19,7 @@ registerDefaultTxTypes();
 const USER = "u-lock";
 const ROLE = "r-vip";
 const GUILD = "g-main";
-const KEY = Shop.discordRoleAddEffectKey(GUILD, USER, ROLE);
+const KEY = Shop.discordRoleEffectKey(GUILD, USER, ROLE);
 
 function setup() {
   const db = openDb(":memory:");
@@ -51,7 +51,7 @@ const buy = (ctx: Ctx, itemId: number) =>
   }).purchase;
 
 const acquire = (ctx: Ctx, owner: string, purchaseId?: number) =>
-  ctx.shop.acquireExternalEffectLock({ scope: "discord_role_add", key: KEY, owner, purchaseId });
+  ctx.shop.acquireExternalEffectLock({ scope: "discord_role", key: KEY, operation: "add", owner, purchaseId });
 
 // ── 鍵の単位 ─────────────────────────────────────────────────────────────────
 
@@ -89,14 +89,16 @@ describe("鍵の単位は購入ではなく外部効果", () => {
     const ctx = setup();
     expect(acquire(ctx, "w1").ok).toBe(true);
     const other = ctx.shop.acquireExternalEffectLock({
-      scope: "discord_role_add",
-      key: Shop.discordRoleAddEffectKey(GUILD, USER, "r-other"),
+      scope: "discord_role",
+      key: Shop.discordRoleEffectKey(GUILD, USER, "r-other"),
+      operation: "add",
       owner: "w2",
     });
     expect(other.ok).toBe(true);
     const otherUser = ctx.shop.acquireExternalEffectLock({
-      scope: "discord_role_add",
-      key: Shop.discordRoleAddEffectKey(GUILD, "u-other", ROLE),
+      scope: "discord_role",
+      key: Shop.discordRoleEffectKey(GUILD, "u-other", ROLE),
+      operation: "add",
       owner: "w3",
     });
     expect(otherUser.ok).toBe(true);
@@ -104,9 +106,9 @@ describe("鍵の単位は購入ではなく外部効果", () => {
   });
 
   it("キーは guild / user / role をすべて含む", () => {
-    expect(Shop.discordRoleAddEffectKey("g1", "u1", "r1")).not.toBe(Shop.discordRoleAddEffectKey("g2", "u1", "r1"));
-    expect(Shop.discordRoleAddEffectKey("g1", "u1", "r1")).not.toBe(Shop.discordRoleAddEffectKey("g1", "u2", "r1"));
-    expect(Shop.discordRoleAddEffectKey("g1", "u1", "r1")).not.toBe(Shop.discordRoleAddEffectKey("g1", "u1", "r2"));
+    expect(Shop.discordRoleEffectKey("g1", "u1", "r1")).not.toBe(Shop.discordRoleEffectKey("g2", "u1", "r1"));
+    expect(Shop.discordRoleEffectKey("g1", "u1", "r1")).not.toBe(Shop.discordRoleEffectKey("g1", "u2", "r1"));
+    expect(Shop.discordRoleEffectKey("g1", "u1", "r1")).not.toBe(Shop.discordRoleEffectKey("g1", "u1", "r2"));
   });
 
   it("DBの索引が最後の砦になっている", () => {
@@ -117,8 +119,8 @@ describe("鍵の単位は購入ではなく外部効果", () => {
       ctx.db
         .prepare(
           `INSERT INTO shop_external_effect_locks
-             (effect_scope, effect_key, owner_token, owner, purchase_id, state, detail, acquired_at, updated_at)
-           VALUES ('discord_role_add', ?, 'forged', 'attacker', NULL, 'held', NULL, 1, 1)`,
+             (effect_scope, effect_key, operation, owner_token, owner, purchase_id, state, detail, acquired_at, updated_at)
+           VALUES ('discord_role', ?, 'add', 'forged', 'attacker', NULL, 'held', NULL, 1, 1)`,
         )
         .run(KEY),
     ).toThrow(/UNIQUE/i);
@@ -246,7 +248,7 @@ describe("鍵は「提供された」の証拠ではない", () => {
     const before = ctx.shop.safetySnapshot(p.id)!.fulfillment.evidence;
 
     const a = ctx.shop.acquireExternalEffectLock({
-      scope: "discord_role_add", key: KEY, owner: "w1", purchaseId: p.id,
+      scope: "discord_role", key: KEY, operation: "add", owner: "w1", purchaseId: p.id,
     });
     if (!a.ok) return;
     expect(ctx.shop.safetySnapshot(p.id)!.fulfillment.evidence).toBe(before);
@@ -264,7 +266,7 @@ describe("鍵は「提供された」の証拠ではない", () => {
   it("鍵の履歴は購入から辿れる（監査用）", () => {
     const ctx = setup();
     const p = buy(ctx, ctx.mk("庭園").id);
-    ctx.shop.acquireExternalEffectLock({ scope: "discord_role_add", key: KEY, owner: "w1", purchaseId: p.id });
+    ctx.shop.acquireExternalEffectLock({ scope: "discord_role", key: KEY, operation: "add", owner: "w1", purchaseId: p.id });
     const rows = ctx.shop.externalEffectLocksForPurchase(p.id);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ effect_key: KEY, owner: "w1", state: "held", purchase_id: p.id });
@@ -281,7 +283,7 @@ describe("F9 / F10: 失効・返金は鍵に勝手を許さない", () => {
     // 通常配送が purchase claim を取り、外部効果の鍵も取った
     const claim = ctx.shop.claimExternalDelivery({ purchaseId: p.id, deliveryKind: "add_role", actor: "w1" });
     expect(claim.ok).toBe(true);
-    ctx.shop.acquireExternalEffectLock({ scope: "discord_role_add", key: KEY, owner: "w1", purchaseId: p.id });
+    ctx.shop.acquireExternalEffectLock({ scope: "discord_role", key: KEY, operation: "add", owner: "w1", purchaseId: p.id });
 
     // 投げている最中の返金は従来どおり止まる（authority は claim 側）
     expect(() => ctx.shop.refund(p.id, "いま返金", "staff")).toThrow(
@@ -294,7 +296,7 @@ describe("F9 / F10: 失効・返金は鍵に勝手を許さない", () => {
     const ctx = setup();
     const item = ctx.mk("庭園");
     const p = buy(ctx, item.id);
-    ctx.shop.acquireExternalEffectLock({ scope: "discord_role_add", key: KEY, owner: "w1", purchaseId: p.id });
+    ctx.shop.acquireExternalEffectLock({ scope: "discord_role", key: KEY, operation: "add", owner: "w1", purchaseId: p.id });
     ctx.db.prepare("UPDATE shop_items SET kind='one_shot' WHERE id=?").run(item.id);
     ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(p.id);
 

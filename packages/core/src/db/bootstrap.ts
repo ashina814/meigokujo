@@ -1068,8 +1068,12 @@ CREATE INDEX IF NOT EXISTS idx_shop_external_delivery_state
 --   released  … 副作用が無いと確認して終了
 CREATE TABLE IF NOT EXISTS shop_external_effect_locks (
   id           INTEGER PRIMARY KEY AUTOINCREMENT,
-  effect_scope TEXT NOT NULL CHECK (effect_scope IN ('discord_role_add')),
+  -- **資源の種類。** 操作ではない。add と remove を別の scope にすると、
+  -- 同じロールに対して「付ける人」と「剥がす人」が同時に成立してしまう
+  effect_scope TEXT NOT NULL CHECK (effect_scope IN ('discord_role')),
   effect_key   TEXT NOT NULL,
+  -- **やろうとしている操作は metadata。** 排他の次元にはしない
+  operation    TEXT NOT NULL CHECK (operation IN ('add','remove')),
   owner_token  TEXT NOT NULL,
   owner        TEXT NOT NULL,
   -- 参考情報。**どの購入のためだったか**を監査で辿るためだけに持つ。
@@ -1080,7 +1084,13 @@ CREATE TABLE IF NOT EXISTS shop_external_effect_locks (
   acquired_at  INTEGER NOT NULL,
   updated_at   INTEGER NOT NULL
 );
--- **1つの外部効果につき、同時に実行してよい所有者は1人。** DBに守らせる。
+-- **1つの資源につき、同時に実行してよい所有者は1人。** DBに守らせる。
+--
+-- 排他の単位は (guild, user, role) という**資源**であって、操作ではない。
+-- add と remove で鍵を分けると
+--     worker A が ADD(U,R) を所有 / worker B が REMOVE(U,R) を所有
+-- が同時に成立し、付けた直後に剥がす競合が残る。
+--
 -- uncertain を live 側へ入れるのが要点——結果が分からない鍵を解放すると、
 -- 「たぶん失敗だろう」で二重に投げることになる。
 CREATE UNIQUE INDEX IF NOT EXISTS uq_shop_external_effect_live
