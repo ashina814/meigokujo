@@ -138,6 +138,37 @@ describe("#58 と同じ形で、証拠が推測値に握り潰されない", () 
     ctx.db.close();
   });
 
+  /**
+   * **`delivered -> delivered` の不正 write は観測できない。**
+   *
+   * 上のテストの fixture は最初から `delivery_state='delivered'`（移行の推測値）なので、
+   * 記録処理がそこへもう一度 `delivered` を書いても値が変わらず、素通りしてしまう。
+   * 工程状態を**動かしていない**ことを見るには、動いたら分かる値から始める必要がある。
+   */
+  it("`pending` の購入へ記録しても、工程状態は `pending` のまま", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx, { deliveryState: "pending" });
+    const before = ctx.shop.getPurchase(id)!;
+    expect(before.delivery_state).toBe("pending");
+
+    expect(record(ctx, id)).toBe(true);
+
+    const after = ctx.shop.getPurchase(id)!;
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(1);
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.evidence).toBe(true);
+    // **工程は進めない。** 記録は結末の観測であって、配送の完了処理ではない
+    expect(after.delivery_state).toBe("pending");
+    expect(after.delivered_at).toBeNull();
+    expect(after.status).toBe(before.status);
+    expect(ctx.events.listByType("shop_delivered")).toHaveLength(0);
+    // snapshot 側でも同じ事実が見える
+    const snap = ctx.shop.safetySnapshot(id)!;
+    expect(snap.fulfillment.state).toBe("pending");
+    expect(snap.fulfillment.deliveredAt).toBeNull();
+    expect(snap.fulfillment.verifiedExternal).toBe(true);
+    ctx.db.close();
+  });
+
   it("実行側の exactly-once は緩んでいない", () => {
     const ctx = setup();
     const purchase = ctx.shop.purchase({
@@ -379,6 +410,30 @@ describe("互換で復元できることと、提供済みへ昇格できるこ�
     const id = legacyTimedAccess(ctx);
     expect(record(ctx, id, ROLE, "u-someone-else")).toBe(false);
     expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    ctx.db.close();
+  });
+
+  /**
+   * **他人の契約の効果を、この購入の証拠にしない。**
+   *
+   * USER_B 側にも同じロールの有効契約があると「観測はあった」状態になるが、
+   * その効果は USER_B の契約のものであって、USER_A の購入 X が提供された証明にはならない。
+   */
+  it("他人の有効契約があっても、その効果を別購入へ帰属しない", () => {
+    const ctx = setup();
+    const mine = legacyTimedAccess(ctx, { userId: USER });
+    const theirs = legacyTimedAccess(ctx, { userId: "u-other" });
+
+    // 私の購入を、相手の userId で記録しようとする
+    expect(record(ctx, mine, ROLE, "u-other")).toBe(false);
+    expect(ctx.shop.verifiedDeliveryEvidence(mine)).toHaveLength(0);
+    // 相手の購入を、私の userId で記録しようとする
+    expect(record(ctx, theirs, ROLE, USER)).toBe(false);
+    expect(ctx.shop.verifiedDeliveryEvidence(theirs)).toHaveLength(0);
+
+    // 正しい組み合わせなら通る
+    expect(record(ctx, mine, ROLE, USER)).toBe(true);
+    expect(record(ctx, theirs, ROLE, "u-other")).toBe(true);
     ctx.db.close();
   });
 
@@ -632,6 +687,72 @@ describe("剥奪の対象は、証拠からは決めない", () => {
       .prepare("SELECT role_id FROM shop_role_revocations WHERE purchase_id=?")
       .get(id) as { role_id: string } | undefined;
     expect(rev?.role_id).toBe(ROLE);
+    ctx.db.close();
+  });
+
+  /**
+   * **consumer 側の境界を固定する。**
+   *
+   * 「今の writer では `legacy_unknown` の購入へ証拠を作れないから安全」では足りない。
+   * `roleGrantTarget()` は**証拠行がどんな経路で存在していても**、購入時の不変な
+   * authority（スナップショット / role grant provenance / 明示的な移行記録）以外から
+   * 剥奪対象を決めてはいけない。将来 writer が増えても、過去の schema-valid な行が
+   * あっても、この境界は writer の到達可能性とは独立に成り立つ必要がある。
+   *
+   * そのため、ここでは証拠行を**テストの仕込みとして直接 INSERT する**。
+   * production の使い方を真似ているのではなく、consumer の authority 分離を試している。
+   */
+  it("証拠行が存在しても、購入時の証拠が無ければ剥奪対象は決まらない", () => {
+    const ctx = setup();
+    const id = legacyWithoutAnyTarget(ctx);
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toEqual({ kind: "legacy_unknown" });
+
+    // schema-valid な証拠行を直接置く（writer の gate は緩めない）
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_verified_delivery_evidence
+           (purchase_id, source, writer, effect_target, detail, observed_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(id, SOURCE, WRITER, "r-observed-x", null, 1);
+
+    // 提供済みの正本としては効いてよい
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.evidence).toBe(true);
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.verifiedExternal).toBe(true);
+
+    // **しかし剥奪対象にはならない。** `effect_target` は authority ではない
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toEqual({ kind: "legacy_unknown" });
+
+    // 失効させても r-observed-x を剥奪キューへ入れない
+    ctx.db.prepare("UPDATE shop_items SET kind='one_shot' WHERE id=?").run(ctx.item.id);
+    ctx.db.prepare("UPDATE shop_purchases SET expires_at=1 WHERE id=?").run(id);
+    expect(ctx.shop.expireIfDue(id, "system:cron").expired).toBe(true);
+    expect(
+      ctx.db.prepare("SELECT COUNT(*) FROM shop_role_revocations WHERE purchase_id=?").pluck().get(id),
+    ).toBe(0);
+    // 黙って消さず、人が確認する対象として残す
+    expect(
+      ctx.events.listByType("shop_role_revocation_unresolved").some((e) => {
+        const payload = JSON.parse(e.payload_json ?? "{}") as { purchaseId?: number; reason?: string };
+        return payload.purchaseId === id && payload.reason === "role_target_unknown";
+      }),
+    ).toBe(true);
+    ctx.db.close();
+  });
+
+  it("証拠行があっても、Discordへ剥奪を投げる直前の再検証は通さない", () => {
+    const ctx = setup();
+    const id = legacyWithoutAnyTarget(ctx);
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_verified_delivery_evidence
+           (purchase_id, source, writer, effect_target, detail, observed_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(id, SOURCE, WRITER, "r-observed-x", null, 1);
+
+    // 保存済みの剥奪対象が観測値と一致していても、購入時の証拠が無いので実行しない
+    expect(ctx.shop.roleRevocationTargetProven(id, "r-observed-x")).toBe(false);
     ctx.db.close();
   });
 
