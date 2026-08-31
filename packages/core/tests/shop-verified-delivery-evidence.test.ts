@@ -470,6 +470,76 @@ describe("互換で復元できることと、提供済みへ昇格できるこ�
     ctx.db.close();
   });
 
+  /**
+   * **Blocker 1 の本丸。** 帰属が一意に決まってもなお、購入時の対象が証明できなければ書かない。
+   *
+   * スナップショットが無い旧購入でも、運営の決着で提供済みの証拠が付くと
+   * `listActiveTimedAccess()` の互換経路に載る。その経路のロールは
+   * **現在の商品設定**から読まれるので、帰属だけ見ると一意に決まってしまう。
+   * ここで止めなければ「現在の商品設定を根拠に、過去の購入の返金を拒む」ことになる。
+   *
+   * この購入はこのロールの唯一の有効契約なので、**帰属の gate は通過する**。
+   * 止めているのは購入時対象の gate だけ——だからこのテストがその gate の
+   * 唯一の見張りになる。
+   */
+  it("帰属が一意でも、購入時の対象が証明できなければ書かない", () => {
+    const ctx = setup();
+    const id = legacyWithoutAnyTarget(ctx);
+    // 運営の決着で提供済みの証拠が付き、互換経路で有効契約として見えるようになる
+    ctx.shop.resolveOperatorCase({
+      purchaseId: id,
+      decision: "delivered",
+      expectedToken: ctx.shop.quoteOperatorResolution(id).token,
+      actor: "operator:1",
+      note: "運営が確認済み",
+    });
+
+    // 前提: 帰属は一意に決まる（＝帰属 gate では止まらない）
+    expect(ctx.shop.timedAccessAttributionUnique(id, USER, ROLE)).toBe(true);
+    // 前提: それでも購入時の対象は証明できない
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toEqual({ kind: "legacy_unknown" });
+
+    // **現在の商品設定と一致していても書かない**
+    expect(record(ctx, id, ROLE)).toBe(false);
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    expect(ctx.shop.safetySnapshot(id)!.fulfillment.verifiedExternal).toBe(false);
+    ctx.db.close();
+  });
+
+  /**
+   * **購入時対象の照合そのものを見張る。**
+   *
+   * `roleGrantTarget()` は role grant provenance をスナップショットより優先する。
+   * 両者が食い違う購入では、帰属（スナップショット由来）は観測ロールで一意に
+   * 決まるのに、**契約上与えるべきロールは別**という形が作れる。
+   * 照合を外すと、契約と違うロールの付与をこの購入の提供済み証拠にしてしまう。
+   */
+  it("契約上のロールと観測したロールが違えば、帰属が一意でも書かない", () => {
+    const ctx = setup();
+    const id = legacyTimedAccess(ctx); // スナップショットのロールは ROLE
+    // 購入時 provenance は別のロールを指している（provenance のほうが強い authority）
+    ctx.db
+      .prepare(
+        `INSERT INTO shop_purchase_role_grant_provenance
+           (purchase_id, grant_kind, role_id, delivery_mode, source, captured_at)
+         VALUES (?,?,?,?,?,?)`,
+      )
+      .run(id, "role", "r-contract-a", "auto", "storefront", 1);
+
+    // 前提: 帰属は観測ロール ROLE で一意（スナップショット由来）
+    expect(ctx.shop.timedAccessAttributionUnique(id, USER, ROLE)).toBe(true);
+    // 前提: 契約上与えるべきロールは r-contract-a
+    expect(ctx.shop.roleGrantTarget(ctx.shop.getPurchase(id)!)).toMatchObject({
+      kind: "proven",
+      roleId: "r-contract-a",
+    });
+
+    // **観測したのは ROLE。契約と違うので書かない**
+    expect(record(ctx, id, ROLE)).toBe(false);
+    expect(ctx.shop.verifiedDeliveryEvidence(id)).toHaveLength(0);
+    ctx.db.close();
+  });
+
   it("互換経路で見えていても、帰属の根拠は移行記録（現在の商品設定ではない）", () => {
     const ctx = setup();
     const id = legacyWithoutAnyTarget(ctx);
