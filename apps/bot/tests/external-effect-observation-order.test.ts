@@ -139,7 +139,11 @@ describe("観測の順序: 鍵を取ったあとに見た状態が正本", () =>
     // 前提が本当に成立していたか（副次的な確認）
     expect(acquireSpy).toHaveBeenCalledTimes(1);
     expect(d.authoritative.has(ROLE)).toBe(true); // 外部は確かに変化した
-    expect(d.trace.indexOf("acquire")).toBeLessThan(d.trace.indexOf("fetch")); // 取得 → 観測
+    // 候補の絞り込みの観測は取得より前に来るが、**権威ある観測は取得より後**。
+    // 見るべきは最後の fetch（＝実際に判断へ使ったもの）が acquire より後にあること
+    expect(d.trace.lastIndexOf("fetch")).toBeGreaterThan(d.trace.indexOf("acquire"));
+    // 絞り込み → 取得 → 権威ある観測、の3段になっている
+    expect(d.trace.indexOf("fetch")).toBeLessThan(d.trace.indexOf("acquire"));
     acquireSpy.mockRestore();
     ctx.db.close();
   });
