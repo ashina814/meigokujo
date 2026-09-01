@@ -100,7 +100,9 @@ function discord(opts: { roles?: string[]; finalFetchFails?: boolean; onAdd?: ()
     members: {
       fetch: vi.fn(async () => {
         fetches += 1;
-        if (opts.finalFetchFails && fetches > 1) throw new Error("fetch failed");
+        // 呼ばれる順は 候補の絞り込み → 取得後の権威ある観測 → 付与後の確認。
+        // ここで再現したいのは**最後の確認が取れない**ことなので3回目以降を落とす
+        if (opts.finalFetchFails && fetches > 2) throw new Error("fetch failed");
         return member;
       }),
       me: null,

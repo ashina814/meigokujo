@@ -59,11 +59,47 @@ async function reconcileTimedAccessRoles(
     const target = grant.purchase.user_id;
     result.checked += 1;
 
-    // **Discord を読む前に、外部効果の実行権を取る。**
+    // ── 候補の絞り込み（authority ではない）────────────────────────────
+    //
+    // **この観測が決めてよいのは「いま試す価値が無い」だけ。**
+    // 「投げてよい」は決めない。だから誤って present に見えたとしても、
+    // 修復が次の巡回まで遅れるだけで、誤った外部書き込みは起きない。
+    //
+    // ここで鍵を取らないのが要点。ほとんどの契約はロールが既に付いていて
+    // 何もする必要がないのに、取ると append-only の履歴だけが毎回積み上がる
+    // （本番実測で 12.7時間に lock 2,387行・event 4,774件、うち外部効果は0）。
+    let probe;
+    try {
+      probe = await guild.members.fetch({ user: target, force: true });
+    } catch (error) {
+      // **鍵を取らない。** 取れば「失敗した」という履歴だけが残る。
+      // ロールの有無も推測しない。次の巡回でやり直す
+      if (errorCode(error) === 10007) {
+        result.absent += 1;
+        continue;
+      }
+      const message = `member_fetch_failed:${error instanceof Error ? error.message : String(error)}`;
+      result.failed.push({ userId: target, roleId: grant.roleId, error: message });
+      services.events.log("shop_timed_access_reconcile_failed", {
+        actor: "system:shop-timed-access",
+        target,
+        payload: { purchaseId: grant.purchase.id, roleId: grant.roleId, error: message },
+      });
+      continue;
+    }
+    if (probe.roles.cache.has(grant.roleId)) {
+      // 外部効果は要らない。**鍵も履歴も作らない。**
+      // （元から在るロールを提供済みの証拠にしないのは Task #213 のとおり）
+      continue;
+    }
+
+    // ── ここから先は roles.add を投げうる。所有権が要る ──────────────
     //
     // 「ロールが無いことを確認してから付ける」だけでは足りない。確認した後・付ける
     // 前に通常配送が同じ (guild, user, role) へ投げられるので、`roles.add` が二重に
-    // 走りうる。読む前に durable な鍵を取り、取れた場合だけ**取ったあとに読み直す**。
+    // 走りうる。durable な鍵を取り、**取ったあとに読み直す**。
+    //
+    // **上の `probe` は二度と使わない。** 取得前の観測は取得時点の事実ではない。
     //
     // 鍵は購入ではなく効果の単位。同じロールを与える別契約が並んでいても、
     // 実行してよいのは常に1人だけになる。
