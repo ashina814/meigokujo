@@ -33,17 +33,25 @@ const seed = (wish: "yes" | "either" | "no" | null = "yes"): ConfessionRow => {
 const eventsOf = (type: string): number =>
   (db.prepare("SELECT COUNT(*) n FROM events WHERE type=?").get(type) as { n: number }).n;
 
-describe("受領確認は回答でも終了でもない", () => {
+/** 受領確認を1往復ぶん動かす。outcome は Discord から返ってきた結末。 */
+const ack = (id: number, staffId: string, outcome: "delivered" | "failed" | "unknown" = "delivered") => {
+  const begun = confessions.beginAcknowledgement(id, staffId);
+  if (!begun.ok) return begun;
+  confessions.settleAcknowledgement(begun.attemptId, outcome, staffId);
+  return begun;
+};
+
+describe("受領確認は回答でも終了でもなく、届いたときだけ届いたと言う", () => {
   // U1 / U2 / U3: 回答希望に関係なく受領確認できる。U2 が元バグの回帰テスト。
   for (const wish of ["yes", "either", "no", null] as const) {
     it(`回答希望=${wish ?? "未選択"} でも受領確認を送れて、案件は開いたまま`, () => {
       const row = seed(wish);
-      const result = confessions.acknowledgeAtomic(row.id, "staff-1");
-      expect(result.ok).toBe(true);
+      expect(ack(row.id, "staff-1").ok).toBe(true);
 
       const after = confessions.get(row.id)!;
       expect(after.acknowledged_at).not.toBeNull();
       expect(after.acknowledged_by).toBe("staff-1");
+      expect(confessions.ackState(row.id)).toBe("delivered");
       // 状態はひとつも動かない
       expect(after.status).toBe("claimed");
       expect(after.stage).toBe("active");
@@ -57,21 +65,69 @@ describe("受領確認は回答でも終了でもない", () => {
     });
   }
 
-  // R5: 二度押しで二重に通知しない
-  it("受領確認は一度きり。二人目・二度目は負けてイベントも増えない", () => {
+  // U16: 届かなかったものを「届いた」ことにしない
+  it("DM が明確に失敗したら acknowledged_at は入らない（送信済みにしない）", () => {
+    const row = seed("yes");
+    expect(ack(row.id, "staff-1", "failed").ok).toBe(true);
+    const after = confessions.get(row.id)!;
+    expect(after.acknowledged_at).toBeNull();
+    expect(after.acknowledged_by).toBeNull();
+    expect(confessions.ackState(row.id)).toBe("failed");
+    // 「届いた」イベントも残さない
+    expect(eventsOf("confession_acknowledge")).toBe(0);
+    expect(eventsOf("confession_acknowledge_failed")).toBe(1);
+  });
+
+  // U16: 結果不明も delivered ではない
+  it("送信結果が不明なときも acknowledged_at は入らず、不明として区別される", () => {
+    const row = seed("yes");
+    expect(ack(row.id, "staff-1", "unknown").ok).toBe(true);
+    expect(confessions.get(row.id)!.acknowledged_at).toBeNull();
+    expect(confessions.ackState(row.id)).toBe("unknown");
+    expect(eventsOf("confession_acknowledge")).toBe(0);
+  });
+
+  // U17: 明確な失敗のあとは、担当者の操作でやり直せる
+  it("失敗のあとは再試行でき、成功したときだけ acknowledged_at が入る", () => {
     const row = seed("either");
-    expect(confessions.acknowledgeAtomic(row.id, "staff-1").ok).toBe(true);
-    const second = confessions.acknowledgeAtomic(row.id, "staff-2");
-    expect(second).toMatchObject({ ok: false, code: "already_acknowledged" });
+    ack(row.id, "staff-1", "failed");
+    expect(confessions.get(row.id)!.acknowledged_at).toBeNull();
+
+    expect(ack(row.id, "staff-1", "delivered").ok).toBe(true);
+    expect(confessions.get(row.id)!.acknowledged_at).not.toBeNull();
+    expect(confessions.ackState(row.id)).toBe("delivered");
+    // 「届いた」記録は最後の1回だけ
     expect(eventsOf("confession_acknowledge")).toBe(1);
-    // 最初に押した人の記録が上書きされない
+  });
+
+  // R5: 送信中の二度押しは行レベルで負ける（時刻の書き込み順に頼らない）
+  it("送信中の試行は案件につき1つ。二人目は attempt_in_flight で負ける", () => {
+    const row = seed("either");
+    const first = confessions.beginAcknowledgement(row.id, "staff-1");
+    expect(first.ok).toBe(true);
+    expect(confessions.beginAcknowledgement(row.id, "staff-2")).toMatchObject({
+      ok: false,
+      code: "attempt_in_flight",
+    });
+    expect(confessions.ackState(row.id)).toBe("in_flight");
+    // 送信中は「送信済み」に見えない
+    expect(confessions.get(row.id)!.acknowledged_at).toBeNull();
+  });
+
+  it("届いたあとは、もう一度送ろうとしても始まらない", () => {
+    const row = seed("either");
+    ack(row.id, "staff-1");
+    expect(confessions.beginAcknowledgement(row.id, "staff-2")).toMatchObject({
+      ok: false,
+      code: "already_delivered",
+    });
     expect(confessions.get(row.id)!.acknowledged_by).toBe("staff-1");
   });
 
-  it("終了済みの案件へは受領確認を送れない", () => {
+  it("終了済みの案件へは受領確認を始められない", () => {
     const row = seed("no");
     confessions.close(row.id, "staff-1", "resolved");
-    expect(confessions.acknowledgeAtomic(row.id, "staff-1")).toMatchObject({ ok: false, code: "already_closed" });
+    expect(confessions.beginAcknowledgement(row.id, "staff-1")).toMatchObject({ ok: false, code: "already_closed" });
   });
 });
 
@@ -96,6 +152,39 @@ describe("自由返信は、待つのか終えるのかを明示してはじめ�
       ok: false,
       code: "already_consumed",
     });
+  });
+
+  // P1: 届いた本文を DB に残さない
+  it("届いたと確定した返信本文は DB から消え、監査メタだけが残る", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "確認しました。", 90);
+    expect(confessions.getReplyDraft(draft.id)!.body).toBe("確認しました。");
+    expect(confessions.getReplyDraft(draft.id)!.body_purge_at).not.toBeNull();
+
+    confessions.claimReplyDraft(draft.id, "staff-1", "close");
+    confessions.finishReplyDraft(draft.id, "delivered");
+
+    const after = confessions.getReplyDraft(draft.id)!;
+    expect(after.body).toBeNull();
+    expect(after.outcome).toBe("delivered");
+    expect(after.confession_id).toBe(row.id);
+    expect(after.staff_id).toBe("staff-1");
+    expect(after.intent).toBe("close");
+  });
+
+  // P2: 届かなかった本文も、案件と同じ保持期限の内側にある
+  it("届かなかった返信本文は再試行のため残るが、保持期限を過ぎたら消える", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "秘密の連絡", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    confessions.finishReplyDraft(draft.id, "unknown");
+    expect(confessions.getReplyDraft(draft.id)!.body).toBe("秘密の連絡");
+
+    const purgeAt = confessions.getReplyDraft(draft.id)!.body_purge_at!;
+    expect(confessions.purgeExpiredConversationBodies(purgeAt - 1).drafts).toBe(0);
+    expect(confessions.purgeExpiredConversationBodies(purgeAt).drafts).toBe(1);
+    expect(confessions.getReplyDraft(draft.id)!.body).toBeNull();
+    expect(confessions.getReplyDraft(draft.id)!.outcome).toBe("unknown");
   });
 
   it("下書きを書いた本人以外は送信できない", () => {
@@ -155,27 +244,97 @@ describe("投稿者自身が終われる", () => {
 
 describe("投稿者の追記は運営の番へ戻し、期限を消す", () => {
   // U8 / R6
-  it("投稿者待ちからの追記で、担当者の番へ戻り期限が消える", () => {
+  it("投稿者待ちからの追記で、本文が確定し、担当者の番へ戻り期限が消える", () => {
     const row = seed("yes");
     confessions.applyStaffReplyWaiting(row.id, "staff-1");
     expect(confessionBall(confessions.get(row.id)!)).toBe("waiting_sender");
 
-    expect(confessions.senderFollowUp(row.id, "sender-1").ok).toBe(true);
+    const result = confessions.recordSenderFollowUp(row.id, "sender-1", "こういう状況です。", 90);
+    expect(result.ok).toBe(true);
     const after = confessions.get(row.id)!;
     expect(after.stage).toBe("awaiting_staff");
     expect(after.reply_deadline_at).toBeNull();
     expect(confessionBall(after)).toBe("staff_attention");
+    // **本文は Discord へ渡す前に DB 上で確定している**
+    const stored = confessions.getFollowUp((result as { followUpId: number }).followUpId)!;
+    expect(stored.body).toBe("こういう状況です。");
+    expect(stored.relayed_at).toBeNull();
+    expect(stored.outcome).toBeNull();
   });
 
-  it("投稿者以外は追記できない", () => {
+  // U18: 中継に失敗しても本文は残り、案件は運営の番のまま
+  it("中継に失敗しても追記本文は残り、期限も戻らない", () => {
     const row = seed("yes");
-    expect(confessions.senderFollowUp(row.id, "not-the-sender")).toMatchObject({ ok: false, code: "not_sender" });
+    confessions.applyStaffReplyWaiting(row.id, "staff-1");
+    const result = confessions.recordSenderFollowUp(row.id, "sender-1", "助けてほしい", 90) as { ok: true; followUpId: number };
+    confessions.settleFollowUpRelay(result.followUpId, "failed");
+
+    const stored = confessions.getFollowUp(result.followUpId)!;
+    expect(stored.body).toBe("助けてほしい"); // 失われない
+    expect(stored.relayed_at).toBeNull();
+    expect(stored.attempts).toBe(1);
+    expect(confessions.get(row.id)!.reply_deadline_at).toBeNull();
+    expect(confessions.listUnrelayedFollowUps(row.id)).toHaveLength(1);
   });
 
-  it("終了済みには追記できない", () => {
+  // U19: 明確な失敗だけを自動で拾い直し、届いたら本文を残さない
+  it("明確な失敗は再試行の対象になり、届いた時点で本文が消える", () => {
+    const row = seed("yes");
+    const result = confessions.recordSenderFollowUp(row.id, "sender-1", "追記", 90) as { ok: true; followUpId: number };
+    confessions.settleFollowUpRelay(result.followUpId, "failed");
+
+    expect(confessions.listRetryableFollowUps().map((r) => r.id)).toEqual([result.followUpId]);
+    const claimed = confessions.claimFollowUpRetry(result.followUpId);
+    expect(claimed).toBeDefined();
+    // 所有権は1つだけ（同時に2回中継しない）
+    expect(confessions.claimFollowUpRetry(result.followUpId)).toBeUndefined();
+
+    confessions.settleFollowUpRelay(result.followUpId, "delivered");
+    const after = confessions.getFollowUp(result.followUpId)!;
+    expect(after.relayed_at).not.toBeNull();
+    expect(after.body).toBeNull(); // P1: 届いた本文は残さない
+    expect(confessions.listUnrelayedFollowUps(row.id)).toEqual([]);
+  });
+
+  // unknown ≠ failed。届いている可能性のある本文を勝手にもう一度送らない
+  it("送信結果が不明な追記は、自動再試行の対象に入らない", () => {
+    const row = seed("yes");
+    const result = confessions.recordSenderFollowUp(row.id, "sender-1", "追記", 90) as { ok: true; followUpId: number };
+    confessions.settleFollowUpRelay(result.followUpId, "unknown");
+    expect(confessions.listRetryableFollowUps()).toEqual([]);
+    expect(confessions.claimFollowUpRetry(result.followUpId)).toBeUndefined();
+    // ただし担当者からは見える
+    expect(confessions.listUnrelayedFollowUps(row.id)).toHaveLength(1);
+  });
+
+  // P2: 未引き渡しの本文も保持期限の内側
+  it("未引き渡しの追記本文も、保持期限を過ぎたら消える", () => {
+    const row = seed("yes");
+    const result = confessions.recordSenderFollowUp(row.id, "sender-1", "秘密", 90) as { ok: true; followUpId: number };
+    confessions.settleFollowUpRelay(result.followUpId, "unknown");
+    const purgeAt = confessions.getFollowUp(result.followUpId)!.body_purge_at!;
+    expect(confessions.purgeExpiredConversationBodies(purgeAt - 1).followUps).toBe(0);
+    expect(confessions.purgeExpiredConversationBodies(purgeAt).followUps).toBe(1);
+    expect(confessions.getFollowUp(result.followUpId)!.body).toBeNull();
+  });
+
+  it("投稿者以外は追記できない（本文も残らない）", () => {
+    const row = seed("yes");
+    expect(confessions.recordSenderFollowUp(row.id, "not-the-sender", "本文")).toMatchObject({
+      ok: false,
+      code: "not_sender",
+    });
+    expect(confessions.listUnrelayedFollowUps(row.id)).toEqual([]);
+  });
+
+  it("終了済みには追記できない（本文も残らない）", () => {
     const row = seed("yes");
     confessions.senderCloseAtomic(row.id, "sender-1");
-    expect(confessions.senderFollowUp(row.id, "sender-1")).toMatchObject({ ok: false, code: "already_closed" });
+    expect(confessions.recordSenderFollowUp(row.id, "sender-1", "本文")).toMatchObject({
+      ok: false,
+      code: "already_closed",
+    });
+    expect(confessions.listUnrelayedFollowUps(row.id)).toEqual([]);
   });
 });
 
@@ -237,7 +396,7 @@ describe("自動終了の対象は「運営が返答を待つと決めた案件�
     const staleDeadline = confessions.get(row.id)!.reply_deadline_at!;
 
     // worker が期限を読んだ「あと」に投稿者が追記した
-    expect(confessions.senderFollowUp(row.id, "sender-1").ok).toBe(true);
+    expect(confessions.recordSenderFollowUp(row.id, "sender-1", "まだ困っています").ok).toBe(true);
 
     expect(confessions.autoCloseExpiredAtomic(row.id, staleDeadline)).toMatchObject({ ok: false });
     const after = confessions.get(row.id)!;
@@ -252,7 +411,7 @@ describe("自動終了の対象は「運営が返答を待つと決めた案件�
     const oldDeadline = confessions.get(row.id)!.reply_deadline_at!;
 
     // 投稿者が追記し、担当者がもう一度返信して期限が引き直された
-    confessions.senderFollowUp(row.id, "sender-1");
+    confessions.recordSenderFollowUp(row.id, "sender-1", "追記");
     confessions.applyStaffReplyWaiting(row.id, "staff-1", 1_900_000_000);
     const newDeadline = confessions.get(row.id)!.reply_deadline_at!;
     expect(newDeadline).not.toBe(oldDeadline);
@@ -285,15 +444,67 @@ describe("次に誰の番か", () => {
 
   it("終了済みは closed", () => {
     const row = seed("yes");
-    confessions.close(row.id, "staff-1", "resolved");
+    expect(confessions.close(row.id, "staff-1", "resolved").ok).toBe(true);
     expect(confessionBall(confessions.get(row.id)!)).toBe("closed");
     expect(confessions.get(row.id)!.closed_side).toBe("staff");
+  });
+
+  // R8 の核: 既に終わっている会話を、あとから来た確定が塗り替えない
+  it("投稿者が終えた会話を、担当者側の終了が上書きしない", () => {
+    const row = seed("yes");
+    expect(confessions.senderCloseAtomic(row.id, "sender-1").ok).toBe(true);
+    const sealed = confessions.get(row.id)!;
+
+    const late = confessions.close(row.id, "staff-1", "resolved", 90, "staff");
+    expect(late).toMatchObject({ ok: false, code: "already_closed" });
+
+    const after = confessions.get(row.id)!;
+    expect(after.closed_side).toBe("sender");
+    expect(after.close_reason).toBe("poster_ended");
+    expect(after.closed_by).toBe("sender-1");
+    expect(after.closed_at).toBe(sealed.closed_at);
+    // 偽の終了ログも残らない
+    expect(eventsOf("confession_close")).toBe(1);
+  });
+
+  // R9 の核: 終わった会話に「待っている」を生やさない
+  it("終了済みの会話へ返答待ちを付けようとしても、期限もイベントも作らない", () => {
+    const row = seed("yes");
+    confessions.senderCloseAtomic(row.id, "sender-1");
+    expect(confessions.applyStaffReplyWaiting(row.id, "staff-1")).toMatchObject({
+      ok: false,
+      code: "already_closed",
+    });
+    expect(confessions.get(row.id)!.reply_deadline_at).toBeNull();
+    expect(confessions.get(row.id)!.stage).not.toBe("awaiting_poster");
+    expect(eventsOf("confession_reply_wait")).toBe(0);
+  });
+
+  it("終了済みの会話へ運営側の待機を付けようとしても負ける", () => {
+    const row = seed("yes");
+    confessions.senderCloseAtomic(row.id, "sender-1");
+    expect(confessions.setInternalHold(row.id, "staff-1")).toMatchObject({ ok: false, code: "already_closed" });
+    expect(eventsOf("confession_internal_hold")).toBe(0);
+  });
+
+  // R10 の核: 自動終了が先に成立していたら、担当者側の確定は勝てない
+  it("自動終了が先に成立した会話を、あとから来た担当者の確定が壊さない", () => {
+    const row = seed("yes");
+    confessions.applyStaffReplyWaiting(row.id, "staff-1");
+    const deadline = confessions.get(row.id)!.reply_deadline_at!;
+    expect(confessions.autoCloseExpiredAtomic(row.id, deadline).ok).toBe(true);
+
+    expect(confessions.close(row.id, "staff-1", "resolved", 90, "staff")).toMatchObject({ ok: false });
+    expect(confessions.applyStaffReplyWaiting(row.id, "staff-1")).toMatchObject({ ok: false });
+    const after = confessions.get(row.id)!;
+    expect(after.closed_side).toBe("timeout");
+    expect(after.reply_deadline_at).toBeNull();
   });
 
   it("終了すると、残っていた返答期限は必ず消える", () => {
     const row = seed("yes");
     confessions.applyStaffReplyWaiting(row.id, "staff-1");
-    confessions.close(row.id, "staff-1", "resolved");
+    expect(confessions.close(row.id, "staff-1", "resolved").ok).toBe(true);
     expect(confessions.get(row.id)!.reply_deadline_at).toBeNull();
   });
 });

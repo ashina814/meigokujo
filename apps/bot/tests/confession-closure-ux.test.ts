@@ -1,3 +1,4 @@
+import { ChannelType } from "discord.js";
 import { describe, expect, it, vi } from "vitest";
 import { Confessions, EventLog, openDb } from "@meigokujo/core";
 import type { Services } from "../src/services.js";
@@ -16,6 +17,8 @@ const {
   handleConfessionButton,
   handleConfessionModal,
   closeExpiredSenderWaits,
+  retryPendingFollowUps,
+  relayStaffMessage,
 } = await import("../src/commands/confession.js");
 
 /**
@@ -29,6 +32,7 @@ const STAFF = "staff-1";
 const SENDER = "sender-1";
 const THREAD = "thread-1";
 const PANEL = "panel-1";
+const NOTICE_CH = "confession-ch";
 
 type Sent = { embeds?: any[]; components?: any[]; content?: string; allowedMentions?: any };
 
@@ -43,7 +47,19 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
 
   const dms: Sent[] = [];
   const threadPosts: Sent[] = [];
-  let dmFails = false;
+  const noticePosts: Sent[] = [];
+  /**
+   * Discord の応答を差し替える。
+   * `api` = DiscordAPIError（サーバの確定応答＝届いていない）、
+   * `net` = 応答が得られなかった（届いたか分からない）。
+   */
+  let dmMode: "ok" | "api" | "net" = "ok";
+  let threadMode: "ok" | "api" | "net" = "ok";
+  /** 送信の境界で止めるための deferred。時間待ちは使わない。 */
+  let dmGate: Promise<void> | null = null;
+  let dmGateEntered: (() => void) | null = null;
+  const apiError = () => Object.assign(new Error("Cannot send messages to this user"), { code: 50007 });
+  const netError = () => Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
 
   // パネルは編集された内容を保持する（overlay が読み直すため）
   const panelMessage: { embeds: any[]; components: any[]; edit: (o: Sent) => Promise<void> } = {
@@ -58,19 +74,39 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
     isThread: () => true,
     archived: false,
     send: async (o: Sent) => {
+      if (threadMode === "api") throw apiError();
+      if (threadMode === "net") throw netError();
       threadPosts.push(o);
     },
     setArchived: vi.fn(async () => undefined),
     messages: { fetch: async (mid: string) => (mid === PANEL ? panelMessage : null) },
     members: { add: vi.fn(), remove: vi.fn() },
   };
+  const noticeChannel = {
+    type: ChannelType.GuildText,
+    isTextBased: () => true,
+    send: async (o: Sent) => {
+      noticePosts.push(o);
+    },
+  };
   const client = {
-    channels: { fetch: async (cid: string) => (cid === THREAD ? thread : null) },
+    channels: {
+      fetch: async (cid: string) => (cid === THREAD ? thread : cid === NOTICE_CH ? noticeChannel : null),
+    },
     users: {
       fetch: async (uid: string) => ({
         id: uid,
         send: async (o: Sent) => {
-          if (dmFails) throw new Error("cannot DM");
+          // ゲートは**いま飛ぼうとしている1通だけ**を止める。後続（投稿者側の操作で
+          // 出る DM など）まで止めると、競合そのものを作れない。
+          const gate = dmGate;
+          dmGate = null;
+          if (gate) {
+            dmGateEntered?.(); // 「本当に送信の途中まで来た」ことを呼び出し側へ知らせる
+            await gate;
+          }
+          if (dmMode === "api") throw apiError();
+          if (dmMode === "net") throw netError();
           dms.push(o);
         },
       }),
@@ -80,7 +116,10 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
     db,
     events,
     confessions,
-    settings: { getNumber: () => 90, getString: () => undefined },
+    settings: {
+      getNumber: () => 90,
+      getString: (k: string) => (k === "channel:confession" ? NOTICE_CH : undefined),
+    },
   } as unknown as Services;
 
   const shown: string[] = [];
@@ -122,10 +161,45 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
 
   return {
     db, services, confessions, id, dms, threadPosts, replies, shown, thread, panelMessage, client,
-    press, submit,
+    press, submit, noticePosts,
+    /** 明確な失敗（Discord が拒否）を起こす */
     setDmFails: (v: boolean) => {
-      dmFails = v;
+      dmMode = v ? "api" : "ok";
     },
+    /** 送信結果が分からない状態にする */
+    setDmUnknown: (v: boolean) => {
+      dmMode = v ? "net" : "ok";
+    },
+    setThreadFails: (v: boolean) => {
+      threadMode = v ? "api" : "ok";
+    },
+    setThreadUnknown: (v: boolean) => {
+      threadMode = v ? "net" : "ok";
+    },
+    /**
+     * DM 送信を境界で止める。`entered` が解決した時点で「送信の途中」に確実に入っている
+     * ので、そこから競合を起こせる（時間待ちに頼らない）。
+     */
+    holdDm: () => {
+      let release!: () => void;
+      let signalEntered!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        signalEntered = resolve;
+      });
+      dmGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      dmGateEntered = signalEntered;
+      return { entered, release: () => release() };
+    },
+    threadPostTexts: (): string =>
+      threadPosts
+        .map((p) => {
+          const e = p.embeds?.[0];
+          const json = e?.toJSON ? e.toJSON() : e;
+          return [p.content ?? "", json?.description ?? ""].join(" ");
+        })
+        .join("\n"),
     row: () => confessions.get(id)!,
     /** パネル上に見えているボタンの customId */
     panelButtons: (): string[] =>
@@ -175,7 +249,75 @@ describe("受領確認は、どの回答希望でも使えて、回答にも終�
     await h.press(`mimi:ack:${h.id}`);
     await h.press(`mimi:ack:${h.id}`);
     expect(h.dms).toHaveLength(1);
-    expect(h.lastReply().content).toContain("既に受領確認を送っています");
+    expect(h.lastReply().content).toContain("既に受領確認が届いています");
+  });
+
+  // U16: 明確な失敗を「送信済み」に見せない
+  it("DM が明確に失敗したら、送信済みにならず未達だと分かる", async () => {
+    const h = harness("yes");
+    h.setDmFails(true);
+    await h.press(`mimi:ack:${h.id}`);
+
+    expect(h.row().acknowledged_at).toBeNull();
+    expect(h.services.confessions.ackState(h.id)).toBe("failed");
+    const said = h.lastReply().content ?? "";
+    expect(said).toContain("届けられませんでした");
+    expect(said).toContain("まだ受領確認は伝わっていません");
+    expect(said).not.toContain("伝えました");
+    // パネルも「送信済み」に見えない
+    const ack = h.panelMessage.components
+      .flatMap((r: any) => (r.toJSON ? r.toJSON() : r).components)
+      .find((c: any) => c.custom_id === `mimi:ack:${h.id}`);
+    expect(ack.disabled).toBe(false);
+    expect(ack.label).not.toContain("送信済み");
+    expect(h.threadPostTexts()).toContain("まだ「届きました」とは伝わっていません");
+  });
+
+  // U16: 結果不明を delivered にも failed にもしない
+  it("送信結果が分からないときは、届いたとも届かなかったとも言わない", async () => {
+    const h = harness("yes");
+    h.setDmUnknown(true);
+    await h.press(`mimi:ack:${h.id}`);
+
+    expect(h.row().acknowledged_at).toBeNull();
+    expect(h.services.confessions.ackState(h.id)).toBe("unknown");
+    expect(h.lastReply().content).toContain("送信結果を確認できませんでした");
+    expect(h.lastReply().content).not.toContain("伝えました");
+  });
+
+  // U17: 明確な失敗のあとは、そのまま押し直せる
+  it("明確な失敗のあとは押し直せて、届いたときだけ送信済みになる", async () => {
+    const h = harness("either");
+    h.setDmFails(true);
+    await h.press(`mimi:ack:${h.id}`);
+    expect(h.dms).toHaveLength(0);
+
+    h.setDmFails(false);
+    await h.press(`mimi:ack:${h.id}`);
+    expect(h.dms).toHaveLength(1);
+    expect(h.row().acknowledged_at).not.toBeNull();
+    expect(h.lastReply().content).toContain("伝えました");
+    expect(h.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_acknowledge'").get()).toEqual({ n: 1 });
+  });
+
+  // U17: 不明のあとは、重複を承知した明示操作でしか送り直さない
+  it("結果不明のあとは、重複の確認を挟まないと送り直さない", async () => {
+    const h = harness("yes");
+    h.setDmUnknown(true);
+    await h.press(`mimi:ack:${h.id}`);
+
+    h.setDmUnknown(false);
+    await h.press(`mimi:ack:${h.id}`);
+    expect(h.dms).toHaveLength(0); // まだ送っていない
+    expect(h.lastReply().content).toContain("既に投稿者へ届いている可能性");
+    const buttons = (h.lastReply().components ?? []).flatMap((r: any) =>
+      (r.toJSON ? r.toJSON() : r).components.map((c: any) => c.custom_id),
+    );
+    expect(buttons).toEqual([`mimi:ackretry:${h.id}`]);
+
+    await h.press(`mimi:ackretry:${h.id}`);
+    expect(h.dms).toHaveLength(1);
+    expect(h.row().acknowledged_at).not.toBeNull();
   });
 
   it("受領確認したあとのボタンは押せない形で残る（送信済みと分かる）", async () => {
@@ -196,16 +338,23 @@ describe("受領確認は、どの回答希望でも使えて、回答にも終�
     expect(h.replies.map((r) => r.content ?? "").join("\n")).toContain("✅ 終了");
   });
 
-  // 旧 confession-voice-received.test.ts が見ていた「DM できなかったことを担当者とスレッドに残す」を、
-  // 新しい契約（受領確認はクローズしない）へ置き換えて固定する。
-  it("DM が届かなくても、受領した事実は残り担当者にもスレッドにも知らされる", async () => {
+  // 旧 confession-voice-received.test.ts が見ていた「DM できなかったことを担当者とスレッドに残す」を
+  // 引き継ぐが、意味は正す。
+  //
+  // 旧テストは「DM が失敗しても受領した事実は残る」を正当化していた。しかし運営が声を
+  // 読んだことと、投稿者へ「届きました」が届いたことは別の事実で、**ユーザーへ出す
+  // ボタンが示すのは後者**でなければならない。試行として失敗を残しつつ、
+  // acknowledged は立てない。
+  it("DM が届かなくても案件は閉じず、届かなかったことが担当者にもスレッドにも残る", async () => {
     const h = harness("no");
     h.setDmFails(true);
     await h.press(`mimi:ack:${h.id}`);
-    expect(h.row().acknowledged_at).not.toBeNull();
+    expect(h.row().acknowledged_at).toBeNull();
+    expect(h.services.confessions.ackState(h.id)).toBe("failed");
+    expect(h.services.confessions.lastAckAttempt(h.id)?.outcome).toBe("failed");
     expect(h.lastReply().content).toContain("届けられませんでした");
-    expect(h.threadPosts.map((p) => p.content).join("\n")).toContain("DM を届けられませんでした");
-    // 旧実装と違い、DM の成否にかかわらず案件は閉じない
+    expect(h.threadPostTexts()).toContain("届けられませんでした");
+    // DM の成否にかかわらず案件は閉じない
     expect(h.row().status).toBe("claimed");
   });
 });
@@ -279,7 +428,7 @@ describe("自由返信は、待つのか終えるのかを必ず選ぶ", () => {
     expect(row.status).toBe("claimed"); // 終了していない
     expect(row.reply_deadline_at).toBeNull(); // 待機にもしていない
     expect(h.lastReply().content).toContain("状態は変えていません");
-    expect(h.db.prepare("SELECT outcome FROM confession_reply_drafts WHERE id=?").pluck().get(draftId)).toBe("undelivered");
+    expect(h.db.prepare("SELECT outcome FROM confession_reply_drafts WHERE id=?").pluck().get(draftId)).toBe("failed");
   });
 
   // R1
@@ -403,6 +552,84 @@ describe("投稿者の追記", () => {
     expect(relay?.allowedMentions).toEqual({ parse: [] });
   });
 
+  // U18: 届いていない本文を「届けました」と言わない
+  it("運営へ渡せなかったとき、届けましたと言わず本文も失わない", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "状況を教えてください。" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    await h.press(`mimi:replywait:${draftId}`);
+    expect(h.row().reply_deadline_at).not.toBeNull();
+
+    h.setThreadFails(true);
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "本当に困っています" });
+
+    const said = h.lastReply().content ?? "";
+    expect(said).not.toContain("運営に届けました");
+    expect(said).toContain("確かに預かりました");
+    expect(said).toContain("内容は失われていません");
+
+    // 本文は DB に残っている
+    const pending = h.services.confessions.listUnrelayedFollowUps(h.id);
+    expect(pending).toHaveLength(1);
+    expect(pending[0].body).toBe("本当に困っています");
+    // 期限は解除されたまま＝自動終了に巻き込まれない
+    expect(h.row().reply_deadline_at).toBeNull();
+    expect(h.row().stage).toBe("awaiting_staff");
+    // 担当者パネルにも未引き渡しとして出る
+    const embed = h.panelMessage.embeds[0];
+    const json = embed?.toJSON ? embed.toJSON() : embed;
+    expect(JSON.stringify(json)).toContain("未引き渡しの追記");
+  });
+
+  // U19: 明確な失敗だけ拾い直し、最終的に1回だけ届く
+  it("渡せなかった追記は拾い直され、最終的にスレッドへ1回だけ届く", async () => {
+    const h = harness("yes");
+    h.setThreadFails(true);
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "拾い直してほしい" });
+    expect(h.threadPostTexts()).not.toContain("拾い直してほしい");
+
+    h.setThreadFails(false);
+    expect(await retryPendingFollowUps(h.client as any, h.services)).toBe(1);
+    expect(h.threadPostTexts()).toContain("拾い直してほしい");
+    expect(h.services.confessions.listUnrelayedFollowUps(h.id)).toEqual([]);
+
+    // もう一度掃いても二重には届かない
+    expect(await retryPendingFollowUps(h.client as any, h.services)).toBe(0);
+    expect(h.threadPostTexts().split("拾い直してほしい").length - 1).toBe(1);
+    expect(h.row().stage).toBe("awaiting_staff");
+    expect(h.row().reply_deadline_at).toBeNull();
+  });
+
+  // unknown を自動で送り直さない
+  it("渡せたか分からない追記は、自動では送り直さない", async () => {
+    const h = harness("yes");
+    h.setThreadUnknown(true);
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "不明な追記" });
+    expect(h.lastReply().content).toContain("確認できませんでした");
+
+    h.setThreadUnknown(false);
+    expect(await retryPendingFollowUps(h.client as any, h.services)).toBe(0);
+    expect(h.threadPostTexts()).not.toContain("不明な追記");
+    // ただし担当者からは見える
+    expect(h.services.confessions.listUnrelayedFollowUps(h.id)).toHaveLength(1);
+  });
+
+  // R11: 中継に失敗しても、期限で勝手に閉じられない
+  it("中継に失敗した追記があっても、期限による自動終了は起きない", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "お返事ください。" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    await h.press(`mimi:replywait:${draftId}`);
+    const staleDeadline = h.row().reply_deadline_at!;
+
+    h.setThreadFails(true);
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "まだ困っています" });
+
+    expect(await closeExpiredSenderWaits(h.client as any, h.services, staleDeadline + 86_400 * 30)).toBe(0);
+    expect(h.row().status).toBe("claimed");
+    expect(h.services.confessions.listUnrelayedFollowUps(h.id)[0].body).toBe("まだ困っています");
+  });
+
   it("終了済みには追記できない", async () => {
     const h = harness("yes");
     await h.press(`mimi:senderclosego:${h.id}`, SENDER);
@@ -484,6 +711,188 @@ describe("自動終了は「返答を待つ」と決めた案件だけ", () => {
     expect(h.shown).toEqual([]);
     await h.press(`mimi:hold:${h.id}`);
     expect(h.row().status).toBe("closed");
+  });
+});
+
+describe("外部返信の経路は 💬 返信する だけ", () => {
+  const staffMessage = (h: ReturnType<typeof harness>, content: string, channelId = THREAD) => ({
+    author: { bot: false },
+    channel: {
+      isThread: () => true,
+      id: channelId,
+      send: async (o: Sent) => {
+        h.threadPosts.push(o);
+      },
+    },
+    content,
+    react: vi.fn(async () => undefined),
+  });
+
+  // U20
+  it("スレッドへ直接書いても、投稿者へは送らず期限も作らない", async () => {
+    const h = harness("yes");
+    const message = staffMessage(h, "こんにちは、確認しています");
+    await relayStaffMessage(h.client as any, h.services, message as any);
+
+    expect(h.dms).toHaveLength(0);
+    expect(h.row().reply_deadline_at).toBeNull();
+    expect(h.row().stage).toBe("active");
+    // 担当者へは canonical path を案内する
+    expect(h.threadPostTexts()).toContain("投稿者へ送信していません");
+    expect(h.threadPostTexts()).toContain("返信する");
+    expect(message.react).toHaveBeenCalledWith("📝");
+  });
+
+  it("案内は同じスレッドで繰り返さない（内部メモとしては書けるまま）", async () => {
+    const h = harness("yes");
+    const channelId = `${THREAD}-memo`;
+    h.db.prepare("UPDATE confession_tickets SET thread_id=? WHERE id=?").run(channelId, h.id);
+    await relayStaffMessage(h.client as any, h.services, staffMessage(h, "メモ1", channelId) as any);
+    await relayStaffMessage(h.client as any, h.services, staffMessage(h, "メモ2", channelId) as any);
+    expect(h.threadPostTexts().split("投稿者へ送信していません").length - 1).toBe(1);
+    expect(h.dms).toHaveLength(0);
+  });
+});
+
+describe("送信中に会話が終わったとき、あとから来た確定が終了を塗り替えない", () => {
+  // R8: staff「この返信で終了」送信中に sender close
+  it("返信して終了の送信中に投稿者が終了したら、投稿者の終了が正本のまま", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "対応しました。" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+
+    const gate = h.holdDm();
+    const sending = h.press(`mimi:replyend:${draftId}`);
+    await gate.entered; // ここで確実に「DM 送信中」
+    // 送信の途中で投稿者が終了する
+    await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+    const sealed = h.row();
+    expect(sealed.closed_side).toBe("sender");
+    gate.release();
+    await sending;
+
+    const after = h.row();
+    expect(after.closed_side).toBe("sender");
+    expect(after.close_reason).toBe("poster_ended");
+    expect(after.closed_by).toBe(SENDER);
+    expect(after.closed_at).toBe(sealed.closed_at);
+    // 担当者側の偽の終了ログを残さない
+    expect(h.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_close'").get()).toEqual({ n: 1 });
+    // 担当者には競合の結果を返す
+    expect(h.lastReply().content).toContain("送信中にこのやり取りは終了していました");
+    expect(h.lastReply().content).toContain("投稿者が「もう大丈夫です」で終了");
+  });
+
+  // R9: staff「返答を待つ」送信中に sender close
+  it("返答を待つの送信中に投稿者が終了したら、期限も待機イベントも作らない", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "教えてください。" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+
+    const gate = h.holdDm();
+    const sending = h.press(`mimi:replywait:${draftId}`);
+    await gate.entered;
+    await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+    gate.release();
+    await sending;
+
+    const after = h.row();
+    expect(after.status).toBe("closed");
+    expect(after.closed_side).toBe("sender");
+    expect(after.reply_deadline_at).toBeNull();
+    expect(after.stage).not.toBe("awaiting_poster");
+    expect(h.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_reply_wait'").get()).toEqual({ n: 0 });
+    expect(h.lastReply().content).toContain("送信中にこのやり取りは終了していました");
+  });
+
+  // R10: staff 送信中に期限で自動終了
+  it("送信中に期限で自動終了したら、その終了を維持して担当者へ知らせる", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "一度目。" });
+    const first = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    await h.press(`mimi:replywait:${first}`);
+    const deadline = h.row().reply_deadline_at!;
+
+    // 二度目の返信を送っている最中に、期限が来て自動終了する
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "二度目。" });
+    const second = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    const gate = h.holdDm();
+    const sending = h.press(`mimi:replyend:${second}`);
+    await gate.entered;
+    expect(await closeExpiredSenderWaits(h.client as any, h.services, deadline + 1)).toBe(1);
+    gate.release();
+    await sending;
+
+    const after = h.row();
+    expect(after.closed_side).toBe("timeout");
+    expect(after.close_reason).toBe("no_response");
+    expect(h.lastReply().content).toContain("送信中にこのやり取りは終了していました");
+    expect(h.lastReply().content).toContain("返答期限が過ぎて自動終了");
+    expect(h.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_close'").get()).toEqual({ n: 1 });
+  });
+});
+
+describe("会話本文を retention の外へ持ち出さない", () => {
+  // P1
+  it("届いた返信本文は DB から消え、監査メタだけが残る", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "秘密の返信です。" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    await h.press(`mimi:replyend:${draftId}`);
+
+    const draft = h.services.confessions.getReplyDraft(draftId)!;
+    expect(draft.body).toBeNull();
+    expect(draft.outcome).toBe("delivered");
+    expect(draft.staff_id).toBe(STAFF);
+    // 本文が監査記録へ写っていないことも見る
+    expect(JSON.stringify(h.db.prepare("SELECT * FROM events").all())).not.toContain("秘密の返信です");
+  });
+
+  it("届いた追記本文も DB から消える", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "秘密の追記です。" });
+    const stored = h.db.prepare("SELECT body, outcome FROM confession_follow_ups").get() as any;
+    expect(stored.outcome).toBe("delivered");
+    expect(stored.body).toBeNull();
+    expect(JSON.stringify(h.db.prepare("SELECT * FROM events").all())).not.toContain("秘密の追記です");
+  });
+
+  // P2
+  it("届かなかった本文も、保持期限を過ぎたら消える", async () => {
+    const h = harness("yes");
+    h.setThreadFails(true);
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "未引き渡しの秘密" });
+    h.setThreadFails(false);
+    h.setDmFails(true);
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "未達の秘密" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    await h.press(`mimi:replywait:${draftId}`);
+
+    const purgeAt = (h.db.prepare("SELECT MAX(body_purge_at) v FROM confession_follow_ups").get() as any).v as number;
+    expect(purgeAt).not.toBeNull();
+    const result = h.services.confessions.purgeExpiredConversationBodies(purgeAt);
+    expect(result.followUps).toBe(1);
+    expect(result.drafts).toBe(1);
+    expect(h.db.prepare("SELECT body FROM confession_follow_ups").pluck().get()).toBeNull();
+    expect(h.db.prepare("SELECT body FROM confession_reply_drafts").pluck().get()).toBeNull();
+  });
+});
+
+describe("回答不要の人への約束は、最初から正確にする", () => {
+  // U21: 投稿直後の DM を、実際の投稿経路を通して確認する
+  it("回答不要でも「例外がありうる」ことを投稿直後に伝える", async () => {
+    const h = harness("yes");
+    await h.submit("mimi:body:soudan:no", "brand-new-sender", { text: "言いたいことだけ言います" });
+
+    const dm = h.dmText();
+    expect(dm).toContain("回答不要として受け付けました");
+    expect(dm).toContain("原則として内容へのお返事はしません");
+    expect(dm).toContain("安全上・運営上どうしても必要な連絡がある場合");
+    // 「一切しません」と言い切らない
+    expect(dm).not.toContain("こちらから内容へのお返事はしません");
+    // 追記・終了の導線は回答不要でも出る
+    const created = (h.db.prepare("SELECT MAX(id) v FROM confession_tickets").get() as any).v as number;
+    expect(h.dmButtons()).toEqual([`mimi:reply:${created}`, `mimi:senderclose:${created}`]);
   });
 });
 

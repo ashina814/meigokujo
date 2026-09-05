@@ -222,41 +222,9 @@ export async function handleConfessionUserSelect(
   if (id !== null) await syncCasePanel(interaction.client, services, id);
 }
 
-/** 運営から投稿者への中継内容は維持し、利用者側の表示名だけ冥教会へ統一する。 */
-export async function relayStaffMessage(
-  client: Client,
-  services: Services,
-  message: Message,
-): Promise<void> {
-  if (message.author.bot || !message.channel.isThread()) return;
-  const row = services.confessions.byThread(message.channel.id);
-  if (!row || row.status === "closed") return;
-  const body = message.content.trim();
-  if (!body) return;
-
-  const user = await client.users.fetch(row.user_id).catch(() => null);
-  if (!user) return;
-  const sent = await user
-    .send({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x4c1d95)
-          .setAuthor({ name: `👂 トートの耳 #${row.id} — 冥教会より` })
-          .setDescription(body.slice(0, 4000))
-          .setFooter({ text: "下のボタンから匿名のまま返信できます" }),
-      ],
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(`mimi:reply:${row.id}`).setLabel("返信する").setEmoji("✍️").setStyle(ButtonStyle.Primary),
-        ),
-      ],
-    })
-    .then(() => true)
-    .catch(() => false);
-
-  await message.react(sent ? "📨" : "⚠️").catch(() => undefined);
-  if (sent && (row.stage === "active" || row.stage === "awaiting_staff" || row.stage === "awaiting_poster")) {
-    if (row.stage !== "awaiting_poster") services.confessions.setStage(row.id, "awaiting_poster", "system:relay");
-    await syncCasePanel(client, services, row.id);
-  }
-}
+/**
+ * 外部返信の経路は 💬 返信する だけ。**スレッドへ書いても投稿者へは送らない。**
+ * base 側の実装（スレッド内案内のみ）をそのまま使い、この overlay で
+ * 迂回路を作り直さない。
+ */
+export const relayStaffMessage = base.relayStaffMessage;

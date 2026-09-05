@@ -53,7 +53,9 @@ describe("Confessions", () => {
 
   it("close で終結し、closed_at が入る", () => {
     const row = ctx.confessions.create("user:dave");
-    const closed = ctx.confessions.close(row.id, "user:staff");
+    const result = ctx.confessions.close(row.id, "user:staff");
+    expect(result.ok).toBe(true);
+    const closed = ctx.confessions.get(row.id);
     expect(closed?.status).toBe("closed");
     expect(closed?.closed_at).not.toBeNull();
   });
@@ -92,7 +94,9 @@ describe("Confessions", () => {
   it("クローズは理由・担当者・purge予定を記録し、reopenで戻せる", () => {
     const row = ctx.confessions.create("user:a", { body: "秘密" });
     ctx.confessions.claim(row.id, "thread:1", "user:staff");
-    const closed = ctx.confessions.close(row.id, "user:staff", "resolved", 90);
+    const result = ctx.confessions.close(row.id, "user:staff", "resolved", 90);
+    expect(result.ok).toBe(true);
+    const closed = ctx.confessions.get(row.id);
     expect(closed?.status).toBe("closed");
     expect(closed?.close_reason).toBe("resolved");
     expect(closed?.closed_by).toBe("user:staff");
