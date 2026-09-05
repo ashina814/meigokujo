@@ -35,13 +35,16 @@ import {
   roleMention,
 } from "../church-roles.js";
 import type { Services } from "../services.js";
-import type {
-  ConfessionRow,
-  ConfessionStage,
-  ConfessionType,
-  Disposition,
-  CloseReason,
-  ReplyWish,
+import {
+  CONFESSION_SENDER_REPLY_DEADLINE_DAYS,
+  Confessions,
+  confessionBall,
+  type ConfessionRow,
+  type ConfessionStage,
+  type ConfessionType,
+  type Disposition,
+  type CloseReason,
+  type ReplyWish,
 } from "@meigokujo/core";
 
 /**
@@ -72,12 +75,20 @@ const TYPE_META: Record<ConfessionType, { emoji: string; label: string }> = {
 };
 const TYPE_ORDER: ConfessionType[] = ["soudan", "zange", "iken", "houkoku", "kinkyu"];
 
+/**
+ * 回答希望（response preference）。
+ *
+ * これは「この**内容について**運営から回答が必要か」だけを表す。
+ * 「トートから何か届いてよいか」ではない——受領確認・会話の終了・追記は、
+ * どの選択でも常に使える（Task #219 §1）。保存値 yes/either/no は据え置き、
+ * 意味が伝わる文言へ改めただけ。
+ */
 const WISH_META: Record<ReplyWish, { emoji: string; label: string }> = {
-  yes: { emoji: "✅", label: "返信を希望する" },
-  no: { emoji: "🚫", label: "返信は不要" },
-  either: { emoji: "🤷", label: "どちらでもよい" },
+  yes: { emoji: "✅", label: "回答がほしい" },
+  either: { emoji: "🤔", label: "必要なら回答してほしい" },
+  no: { emoji: "🕊️", label: "回答は不要" },
 };
-const WISH_ORDER: ReplyWish[] = ["yes", "no", "either"];
+const WISH_ORDER: ReplyWish[] = ["yes", "either", "no"];
 
 /** 緊急選択時に表示する警告（§6）。ファイル添付は今後も設けない方針 */
 const EMERGENCY_WARNING = [
@@ -113,6 +124,7 @@ const STAGE_META: Record<ConfessionStage, string> = {
   active: "🤝 対応中",
   awaiting_poster: "⏳ 投稿者からの返信待ち",
   awaiting_staff: "📥 担当者からの返信待ち",
+  internal_hold: "🛠️ 運営側の確認待ち",
   handoff: "🤝 対応中（旧: 外部引継ぎ中）",
   court_review: "🤝 対応中（旧: 裁判所送致確認中）",
   court_sent: "🤝 対応中（旧: 裁判所送致済み・現在は付帯情報として表示）",
@@ -136,6 +148,7 @@ const STAGE_ORDER: ConfessionStage[] = [
   "active",
   "awaiting_poster",
   "awaiting_staff",
+  "internal_hold",
 ];
 
 const CLOSE_META: Record<CloseReason, string> = {
@@ -163,10 +176,20 @@ const CLOSE_ORDER: CloseReason[] = [
   "other",
 ];
 
-/** 担当者向けの状態表示。open/closed は status、対応中の内訳は stage を見る */
-function statusText(row: ConfessionRow): string {
+/**
+ * 担当者向けの状態表示。**「次に誰の番か」が一意に読めることが目的**。
+ *
+ * 「投稿者の返答待ち」は期限つき（＝運営が明示的に待つと決めた）ものだけをそう呼ぶ。
+ * 期限のない既存の awaiting_poster は、根拠が無いので運営側の番として出す
+ * （勝手に投稿者待ちへ寄せて自動終了させない）。
+ */
+export function statusText(row: ConfessionRow): string {
   if (row.status === "open") return "🕯️ 未対応";
   if (row.status === "closed") return "✅ 終結";
+  const ball = confessionBall(row);
+  if (ball === "waiting_sender") return `⏳ 投稿者の返答待ち（<t:${row.reply_deadline_at}:R> に自動終了）`;
+  if (ball === "waiting_staff") return "🛠️ 運営側の確認待ち";
+  if (ball === "legacy_open") return "📥 要対応（既存案件・期限なし）";
   return STAGE_META[(row.stage as ConfessionStage) ?? "active"] ?? "🤝 対応中";
 }
 function dispoText(code: string | null): string {
@@ -219,7 +242,7 @@ function selectionMessage(type: string, wish: string) {
     );
   const wishMenu = new StringSelectMenuBuilder()
     .setCustomId("mimi:selwish")
-    .setPlaceholder("② 運営からの返信を希望する？")
+    .setPlaceholder("② この内容について、運営からの回答は必要？")
     .addOptions(
       WISH_ORDER.map((code) =>
         new StringSelectMenuOptionBuilder()
@@ -238,9 +261,12 @@ function selectionMessage(type: string, wish: string) {
     .setDisabled(!ready);
 
   const lines = [
-    "**匿名で届けます。** 種類と返信希望を選んでから「書く」を押してください。",
+    "**匿名で届けます。** 種類と回答希望を選んでから「書く」を押してください。",
     `　種類：${typeText(type === "-" ? null : type)}`,
-    `　返信希望：${wishText(wish === "-" ? null : wish)}`,
+    `　回答希望：${wishText(wish === "-" ? null : wish)}`,
+    "",
+    "> どれを選んでも、**届いたことのお知らせ**は必ず受け取れます。",
+    "> 追記も、やり取りの終了も、いつでもあなたから行えます。",
   ];
   if (isEmergency(type)) lines.push("", EMERGENCY_WARNING);
 
@@ -307,12 +333,12 @@ function bodyModal(type: string, wish: string): ModalBuilder {
 function replyModal(id: number): ModalBuilder {
   return new ModalBuilder()
     .setCustomId(`mimi:replybody:${id}`)
-    .setTitle(`トートの耳 #${id} へ返信`)
+    .setTitle(`トートの耳 #${id} へ追記`)
     .addComponents(
       new ActionRowBuilder<TextInputBuilder>().addComponents(
         new TextInputBuilder()
           .setCustomId("text")
-          .setLabel("返信（匿名のまま運営に届きます）")
+          .setLabel("追記（匿名のまま運営に届きます）")
           .setStyle(TextInputStyle.Paragraph)
           .setRequired(true)
           .setMaxLength(1800),
@@ -388,11 +414,18 @@ function buildCaseEmbed(
     .setTitle(`👂 トートの耳 ${recordNo(row.id)}`)
     .addFields(
       { name: "種別", value: typeText(row.type), inline: true },
-      { name: "返信希望", value: wishText(row.reply_wish), inline: true },
+      { name: "回答希望", value: wishText(row.reply_wish), inline: true },
       { name: "状態", value: statusText(row), inline: true },
       { name: "担当者", value: staff, inline: true },
       { name: "受付日時", value: jstStamp(row.created_at), inline: true },
     );
+  embed.addFields({
+    name: "受領確認",
+    value: row.acknowledged_at
+      ? `📨 送信済み（${jstStamp(row.acknowledged_at)}${row.acknowledged_by ? ` / <@${row.acknowledged_by}>` : ""}）`
+      : "— 未送信",
+    inline: true,
+  });
   if (extras.hasOpenEmergency) {
     embed.addFields({ name: "緊急共有", value: "🚨 登録あり（別ロールへ確認要請中）", inline: true });
   }
@@ -458,14 +491,30 @@ function managementControls(id: number, row: ConfessionRow): ActionRowBuilder<Bu
     courtBtn = new ButtonBuilder().setCustomId(`mimi:court:${id}`).setLabel("裁判所へ送致").setEmoji("⚖️").setStyle(ButtonStyle.Secondary);
   }
 
+  // Row1 は**会話**の操作だけ。受領・回答・終了を1列で見分けられるようにする（§9）。
+  const ackBtn = new ButtonBuilder()
+    .setCustomId(`mimi:ack:${id}`)
+    .setLabel(row.acknowledged_at ? "届きました（送信済み）" : "届きました")
+    .setEmoji("📨")
+    .setStyle(ButtonStyle.Success)
+    .setDisabled(!!row.acknowledged_at);
   const row1 = new ActionRowBuilder<ButtonBuilder>().addComponents(
-    new ButtonBuilder().setCustomId(`mimi:assign:${id}`).setLabel("担当管理").setEmoji("👥").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`mimi:support:${id}`).setLabel("支援を求める").setEmoji("🆘").setStyle(ButtonStyle.Primary),
-    courtBtn,
+    ackBtn,
+    new ButtonBuilder().setCustomId(`mimi:replystaff:${id}`).setLabel("返信する").setEmoji("💬").setStyle(ButtonStyle.Primary),
+    new ButtonBuilder()
+      .setCustomId(`mimi:hold:${id}`)
+      .setLabel("待機")
+      .setEmoji("⏳")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(row.stage === "internal_hold"),
+    new ButtonBuilder().setCustomId(`mimi:close:${id}`).setLabel("終了").setEmoji("✅").setStyle(ButtonStyle.Secondary),
   );
+  // Row2 は案件そのものの取り回し（既存機能はそのまま）
   const row2 = new ActionRowBuilder<ButtonBuilder>().addComponents(
+    new ButtonBuilder().setCustomId(`mimi:assign:${id}`).setLabel("担当管理").setEmoji("👥").setStyle(ButtonStyle.Secondary),
+    new ButtonBuilder().setCustomId(`mimi:support:${id}`).setLabel("支援を求める").setEmoji("🆘").setStyle(ButtonStyle.Secondary),
+    courtBtn,
     new ButtonBuilder().setCustomId(`mimi:emg:${id}`).setLabel("緊急共有").setEmoji("🚨").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(`mimi:close:${id}`).setLabel("クローズ").setEmoji("🔒").setStyle(ButtonStyle.Danger),
   );
   // 管理者用は「補助操作」に集約し、通常UIから隠す（実際の権限判定は各ハンドラで再確認）
   const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
@@ -565,6 +614,519 @@ async function notifyDispositionChange(
   return n;
 }
 
+// ═════════════════════════════════════════════════════
+// 会話の終端（Task #219）
+//
+// 受領確認 / 内容への回答 / 会話の終了 を、UI の上でも別々のものとして扱う。
+// 投稿者へ出す文面は**すべてこの1つの renderer** から作る（回答希望ごとに
+// 別ロジックを乱立させない）。
+// ═════════════════════════════════════════════════════
+
+/** 投稿者向けの見出し。内部語（case/close/resolve）は一切出さない */
+const SENDER_TITLE = "🕯️ トートの耳";
+
+/**
+ * 受領確認の文面。共通の1行＋回答希望ごとの一言だけが違う。
+ * 未選択(null)は「回答不要」と同じ扱いにはしない——控えめな汎用文にする。
+ */
+const ACK_TAIL: Record<string, string> = {
+  yes: "運営からの回答をお待ちください。",
+  either: "必要に応じて運営からお返事します。",
+  no: "ありがとうございます。",
+};
+function ackText(wish: string | null): string {
+  return `あなたの声は届きました。${ACK_TAIL[wish ?? ""] ?? "必要に応じて運営からお返事します。"}`;
+}
+
+/**
+ * 投稿者が自分で操作できる導線。**やり取りが続いている間は常に付ける。**
+ * 「終了」が履歴の削除だと誤解されないよう、確認画面で必ず明示する。
+ */
+function senderControls(id: number): ActionRowBuilder<ButtonBuilder>[] {
+  return [
+    new ActionRowBuilder<ButtonBuilder>().addComponents(
+      new ButtonBuilder().setCustomId(`mimi:reply:${id}`).setLabel("追記する").setEmoji("✏️").setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`mimi:senderclose:${id}`)
+        .setLabel("もう大丈夫です")
+        .setEmoji("✅")
+        .setStyle(ButtonStyle.Secondary),
+    ),
+  ];
+}
+
+type SenderNotice =
+  | { kind: "received"; wish: string | null }
+  | { kind: "acknowledged"; wish: string | null }
+  | { kind: "reply"; body: string; waiting: boolean; deadlineAt: number | null }
+  | { kind: "closed_by_staff"; body: string }
+  | { kind: "closed_by_sender" }
+  | { kind: "closed_by_timeout" };
+
+/**
+ * 投稿者へ届く1通を組み立てる唯一の場所。
+ *
+ * `allowedMentions` は常に空。自由文に @everyone / ロール / ユーザー宛てが混じっていても、
+ * それが誰かを呼び出すことはない（本文は embed に入れるが、二重の安全策として明示する）。
+ */
+function senderDm(id: number, notice: SenderNotice): MessageCreateOptions {
+  const embed = new EmbedBuilder().setColor(PANEL_COLOR).setAuthor({ name: `${SENDER_TITLE} #${id}` });
+  const open = notice.kind === "received" || notice.kind === "acknowledged" || notice.kind === "reply";
+
+  switch (notice.kind) {
+    case "received":
+      embed.setDescription(
+        [
+          "**あなたの声を預かりました。**",
+          "",
+          notice.wish === "no"
+            ? "回答は不要とのことなので、こちらから内容へのお返事はしません。"
+            : notice.wish === "yes"
+              ? "運営が確認しだい、この DM へ回答が届きます。"
+              : "必要があれば、運営からこの DM へお返事が届きます。",
+          "",
+          "伝え忘れたことは **追記する** から足せます。",
+          "もう十分だと思ったら、いつでも **もう大丈夫です** でこのやり取りを終えられます。",
+        ].join("\n"),
+      );
+      break;
+    case "acknowledged":
+      embed.setDescription(
+        [`**${ackText(notice.wish)}**`, "", "追記も、やり取りの終了も、引き続きあなたから行えます。"].join("\n"),
+      );
+      break;
+    case "reply":
+      embed.setDescription(notice.body.slice(0, 3500));
+      embed.addFields({
+        name: "​",
+        value: notice.waiting
+          ? [
+              "**必要なら追記できます。もう大丈夫であれば、このやり取りを終了できます。**",
+              notice.deadlineAt
+                ? `返信がない場合、このやり取りは <t:${notice.deadlineAt}:R>（${CONFESSION_SENDER_REPLY_DEADLINE_DAYS}日後）に自動で終了します。急ぐ必要はありません。`
+                : "",
+            ]
+              .filter(Boolean)
+              .join("\n")
+          : "**このやり取りはここで終了しました。**\nまた伝えたいことがあれば、新しくトートへ送れます。",
+      });
+      break;
+    case "closed_by_staff":
+      embed.setDescription(notice.body.slice(0, 3500));
+      embed.addFields({
+        name: "​",
+        value: "**このやり取りはここで終了しました。**\nまた伝えたいことがあれば、新しくトートへ送れます。",
+      });
+      break;
+    case "closed_by_sender":
+      embed.setDescription(
+        [
+          "**このやり取りを終了しました。**",
+          "",
+          "話してくれてありがとう。",
+          "また伝えたいことがあれば、いつでも新しくトートへ送れます。",
+        ].join("\n"),
+      );
+      break;
+    case "closed_by_timeout":
+      embed.setDescription(
+        [
+          "**一定期間返信がなかったため、このやり取りはいったん終了しました。**",
+          "",
+          "何かを断ったわけでも、拒否されたわけでもありません。",
+          "必要になった場合は、いつでも新しくトートへ送れます。",
+        ].join("\n"),
+      );
+      break;
+  }
+
+  return {
+    embeds: [embed],
+    components: open ? senderControls(id) : [],
+    allowedMentions: { parse: [] },
+  };
+}
+
+/** 投稿者へ1通届ける。届いたかどうかを呼び出し側が必ず受け取れるようにする */
+async function sendSenderDm(client: Client, userId: string, message: MessageCreateOptions): Promise<boolean> {
+  const user = await client.users.fetch(userId).catch(() => null);
+  if (!user) return false;
+  return user
+    .send(message)
+    .then(() => true)
+    .catch(() => false);
+}
+
+/** 終了時に使う本文保持日数（既存の運用設定をそのまま使う） */
+function retentionDaysFor(services: Services, row: ConfessionRow): number | undefined {
+  return row.court_status === "sent"
+    ? services.settings.getNumber("confession_court_retention_days")
+    : services.settings.getNumber("confession_body_retention_days");
+}
+
+// ── 📨 受領確認 ───────────────────────────────────────
+/**
+ * 「運営がこの声を受け取った」だけを伝える。
+ * 回答したことにも、終了したことにもしない——状態は一切動かさない。
+ */
+async function acknowledgeCase(interaction: ButtonInteraction, services: Services, id: number): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = services.confessions.acknowledgeAtomic(id, interaction.user.id);
+  if (!result.ok) {
+    await interaction.editReply({
+      content:
+        result.code === "already_acknowledged"
+          ? "📨 この案件へは既に受領確認を送っています（重ねては送りません）。"
+          : result.code === "already_closed"
+            ? "この会話は既に終了しています。"
+            : "この件が見つかりません。",
+    });
+    return;
+  }
+  const delivered = await sendSenderDm(
+    interaction.client,
+    result.row.user_id,
+    senderDm(id, { kind: "acknowledged", wish: result.row.reply_wish }),
+  );
+  await threadLog(
+    interaction.client,
+    services,
+    id,
+    delivered
+      ? `📨 <@${interaction.user.id}> が受領確認を送りました（回答・終了はしていません）。`
+      : `⚠️ <@${interaction.user.id}> が受領確認を送りましたが、投稿者へ DM を届けられませんでした。`,
+  );
+  await refreshPanel(interaction.client, services, id);
+  await interaction.editReply({
+    content: delivered
+      ? "📨 「あなたの声は届きました」と伝えました。案件は開いたままです。"
+      : "📨 受領確認を記録しましたが、投稿者へ DM を届けられませんでした（DM 拒否の可能性）。",
+  });
+}
+
+// ── ⏳ 待機（運営側の確認待ち）───────────────────────────
+/**
+ * 「運営側でまだやることがある」を明示する。投稿者待ちへ逃がさないので、
+ * 7日の自動終了には**絶対にかからない**。
+ */
+async function holdCase(interaction: ButtonInteraction, services: Services, id: number): Promise<void> {
+  const row = services.confessions.get(id);
+  if (!row || row.status === "closed") {
+    await interaction.reply({ content: "この会話は既に終了しています。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  services.confessions.setInternalHold(id, interaction.user.id);
+  await threadLog(interaction.client, services, id, `⏳ <@${interaction.user.id}> が「運営側の確認待ち」にしました（自動終了しません）。`);
+  await refreshPanel(interaction.client, services, id);
+  await interaction.reply({
+    content: "⏳ 運営側の確認待ちにしました。要対応の一覧からは下がりますが、自動では終了しません。",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+// ── 💬 自由返信 ───────────────────────────────────────
+function staffReplyModal(id: number): ModalBuilder {
+  return new ModalBuilder()
+    .setCustomId(`mimi:staffreplybody:${id}`)
+    .setTitle(`${recordNo(id)} へ返信`)
+    .addComponents(
+      new ActionRowBuilder<TextInputBuilder>().addComponents(
+        new TextInputBuilder()
+          .setCustomId("text")
+          .setLabel("投稿者へ届く本文（匿名のまま届きます）")
+          .setStyle(TextInputStyle.Paragraph)
+          .setRequired(true)
+          .setMaxLength(1800),
+      ),
+    );
+}
+
+/**
+ * 「返信する」の入口。
+ *
+ * 回答不要を選んでいる相手には、hard block ではなく**明示の確認**を挟む
+ * （重要な連絡が必要なことはある）。確認を通しても `reply_wish` は書き換えない。
+ */
+async function startStaffReply(interaction: ButtonInteraction, services: Services, id: number): Promise<void> {
+  const row = services.confessions.get(id);
+  if (!row) {
+    await interaction.reply({ content: "この件が見つかりません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (row.status === "closed") {
+    await interaction.reply({ content: "この会話は既に終了しています。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (row.reply_wish === "no") {
+    await interaction.reply({
+      content: [
+        "🕊️ **この方は「回答は不要」を選択しています。**",
+        "",
+        "それでも内容について返信しますか？",
+        "（受領確認だけを伝えたい場合は 📨 届きました をお使いください）",
+      ].join("\n"),
+      components: [
+        new ActionRowBuilder<ButtonBuilder>().addComponents(
+          new ButtonBuilder()
+            .setCustomId(`mimi:replyno:${id}`)
+            .setLabel("それでも返信する")
+            .setEmoji("💬")
+            .setStyle(ButtonStyle.Danger),
+        ),
+      ],
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
+  await interaction.showModal(staffReplyModal(id));
+}
+
+/**
+ * 本文を書いただけでは送らない。**「返答を待つ」か「この返信で終了する」かを必ず選ばせる。**
+ * 暗黙の open も暗黙の close も作らない（§3-A）。
+ */
+async function stageStaffReply(interaction: ModalSubmitInteraction, services: Services, id: number): Promise<void> {
+  const row = services.confessions.get(id);
+  if (!row || row.status === "closed") {
+    await interaction.reply({ content: "この会話は既に終了しています。返信は送っていません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const body = interaction.fields.getTextInputValue("text").trim();
+  if (!body) {
+    await interaction.reply({ content: "本文が空です。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  const draft = services.confessions.createReplyDraft(id, interaction.user.id, body);
+  const overrode = row.reply_wish === "no";
+  await interaction.reply({
+    content: [
+      `💬 **${recordNo(id)} への返信内容を預かりました。まだ送っていません。**`,
+      overrode ? "（この方は「回答は不要」を選んでいます。回答希望の記録は変更しません）" : "",
+      "",
+      "この返信のあと、どうしますか？",
+      `・**返答を待つ** … 投稿者へ届け、返答を待ちます（${CONFESSION_SENDER_REPLY_DEADLINE_DAYS}日返信が無ければ自動で終了します）`,
+      "・**この返信で終了する** … 投稿者へ届けたうえで、このやり取りを終えます",
+    ]
+      .filter(Boolean)
+      .join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mimi:replywait:${draft.id}`)
+          .setLabel("返答を待つ")
+          .setEmoji("⏳")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`mimi:replyend:${draft.id}`)
+          .setLabel("この返信で終了する")
+          .setEmoji("✅")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/**
+ * 預かった返信を実際に送る。
+ *
+ * 送信権は下書き行の消費で1つに絞られるので、二度押しでも本文は1回しか届かない。
+ * **届いたと確認できたときだけ**案件の状態を進める——送れたか分からないものを
+ * 「返信済み」「終了」にはしない。
+ */
+async function commitStaffReply(
+  interaction: ButtonInteraction,
+  services: Services,
+  draftId: number,
+  intent: "wait" | "close",
+): Promise<void> {
+  const pending = services.confessions.getReplyDraft(draftId);
+  if (!pending) {
+    await interaction.reply({ content: "この返信の下書きが見つかりません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (!canOperate(interaction, services, pending.confession_id)) {
+    await interaction.reply({ content: "この案件の担当者、または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+
+  const claim = services.confessions.claimReplyDraft(draftId, interaction.user.id, intent);
+  if (!claim.ok) {
+    await interaction.editReply({
+      content:
+        claim.code === "already_consumed"
+          ? "この返信は既に送信済みです（重ねては送りません）。"
+          : claim.code === "case_closed"
+            ? "この会話は既に終了しています。返信は送っていません。再開する場合は 🔓 再オープン を使ってください。"
+            : claim.code === "not_owner"
+              ? "この返信を書いた担当者だけが送信できます。"
+              : "この返信の下書きが見つかりません。",
+    });
+    return;
+  }
+
+  const id = claim.row.id;
+  const closing = intent === "close";
+  const deadlineAt = closing ? null : Confessions.senderReplyDeadlineFrom(Math.floor(Date.now() / 1000));
+  const delivered = await sendSenderDm(
+    interaction.client,
+    claim.row.user_id,
+    closing
+      ? senderDm(id, { kind: "closed_by_staff", body: claim.draft.body })
+      : senderDm(id, { kind: "reply", body: claim.draft.body, waiting: true, deadlineAt }),
+  );
+  services.confessions.finishReplyDraft(draftId, delivered ? "delivered" : "undelivered");
+
+  if (!delivered) {
+    // 届いたか分からないものを「返信した」ことにしない。状態は動かさず、担当者へ返す。
+    await threadLog(
+      interaction.client,
+      services,
+      id,
+      `⚠️ <@${interaction.user.id}> の返信を投稿者へ届けられませんでした。案件の状態は変えていません。`,
+    );
+    await refreshPanel(interaction.client, services, id);
+    await interaction.editReply({
+      content: "⚠️ 投稿者へ DM を届けられませんでした（DM 拒否の可能性）。状態は変えていません。もう一度 💬 返信する からやり直せます。",
+    });
+    return;
+  }
+
+  if (closing) {
+    services.confessions.close(id, interaction.user.id, "resolved", retentionDaysFor(services, claim.row), "staff");
+    const openEmg = services.confessions.openEmergencyFor(id);
+    if (openEmg) services.confessions.closeEmergency(openEmg.id, interaction.user.id);
+  } else {
+    services.confessions.applyStaffReplyWaiting(id, interaction.user.id);
+  }
+
+  await threadLog(
+    interaction.client,
+    services,
+    id,
+    closing
+      ? `✅ <@${interaction.user.id}> が返信を届けたうえで、このやり取りを終了しました。`
+      : `💬 <@${interaction.user.id}> が返信を届け、投稿者の返答を待っています（<t:${deadlineAt}:R> に自動終了）。`,
+  );
+  await refreshPanel(interaction.client, services, id);
+  await interaction.editReply({
+    content: closing
+      ? "✅ 返信を届けて、このやり取りを終了しました。"
+      : `💬 返信を届けました。投稿者の返答待ちです（返答が無ければ <t:${deadlineAt}:R> に自動終了）。`,
+  });
+
+  if (closing) {
+    const thread = claim.row.thread_id
+      ? await interaction.client.channels.fetch(claim.row.thread_id).catch(() => null)
+      : null;
+    if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
+  }
+}
+
+// ── ✅ 投稿者自身の終了 ────────────────────────────────
+/**
+ * 押した本人が投稿者であることを**サーバ側で確認する**。
+ * ボタンを出すかどうかの表示制御を権限の代わりにしない。
+ */
+async function confirmSenderClose(interaction: ButtonInteraction, services: Services, id: number): Promise<void> {
+  const row = services.confessions.get(id);
+  if (!row || row.user_id !== interaction.user.id) {
+    await interaction.reply({ content: "この操作はできません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  if (row.status === "closed") {
+    await interaction.reply({ content: "このやり取りは既に終了しています。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.reply({
+    content: [
+      "**このやり取りを終了しますか？**",
+      "",
+      "終了しても、これまでのやり取りが消えることはありません。",
+      "また伝えたいことがあれば、新しく送れます。",
+    ].join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mimi:senderclosego:${id}`)
+          .setLabel("終了する")
+          .setEmoji("✅")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder().setCustomId(`mimi:sendercloseno:${id}`).setLabel("戻る").setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+async function applySenderClose(interaction: ButtonInteraction, services: Services, id: number): Promise<void> {
+  const before = services.confessions.get(id);
+  if (!before || before.user_id !== interaction.user.id) {
+    await interaction.reply({ content: "この操作はできません。", flags: MessageFlags.Ephemeral });
+    return;
+  }
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const result = services.confessions.senderCloseAtomic(id, interaction.user.id, retentionDaysFor(services, before));
+  if (!result.ok) {
+    await interaction.editReply({
+      content: result.code === "already_closed" ? "このやり取りは既に終了しています。" : "この操作はできません。",
+    });
+    return;
+  }
+  const openEmg = services.confessions.openEmergencyFor(id);
+  if (openEmg) services.confessions.closeEmergency(openEmg.id, "system:sender_close");
+
+  await sendSenderDm(interaction.client, result.row.user_id, senderDm(id, { kind: "closed_by_sender" }));
+  await threadLog(
+    interaction.client,
+    services,
+    id,
+    "✅ **投稿者がこのやり取りを終了しました。**（履歴は残っています）",
+  );
+  await refreshPanel(interaction.client, services, id);
+  await interaction.editReply({ content: "✅ このやり取りを終了しました。話してくれてありがとう。" });
+
+  const thread = result.row.thread_id ? await interaction.client.channels.fetch(result.row.thread_id).catch(() => null) : null;
+  if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
+}
+
+// ── ⌛ 期限切れの自動終了（刻時盤から呼ぶ）──────────────
+/**
+ * 「運営が返答を待つと決めた」案件だけを、期限到来で終了する。
+ *
+ * 未対応・運営側の待機・期限のない既存案件は `listDueSenderTimeouts` の時点で入らない。
+ * 閉じるのは**読んだときの期限と一致する**ときだけなので、古い実行が新しい会話を閉じない。
+ */
+export async function closeExpiredSenderWaits(
+  client: Client,
+  services: Services,
+  atTs: number = Math.floor(Date.now() / 1000),
+): Promise<number> {
+  const due = services.confessions.listDueSenderTimeouts(atTs);
+  let closed = 0;
+  for (const row of due) {
+    const deadline = row.reply_deadline_at;
+    if (deadline === null) continue;
+    const result = services.confessions.autoCloseExpiredAtomic(row.id, deadline, retentionDaysFor(services, row));
+    if (!result.ok) continue;
+    closed += 1;
+    const openEmg = services.confessions.openEmergencyFor(row.id);
+    if (openEmg) services.confessions.closeEmergency(openEmg.id, "system:scheduler");
+    await sendSenderDm(client, result.row.user_id, senderDm(row.id, { kind: "closed_by_timeout" }));
+    await threadLog(
+      client,
+      services,
+      row.id,
+      `⌛ 返答が無いまま期限を過ぎたため、このやり取りを自動で終了しました（履歴は残ります）。`,
+    );
+    await refreshPanel(client, services, row.id);
+    const thread = result.row.thread_id ? await client.channels.fetch(result.row.thread_id).catch(() => null) : null;
+    if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
+  }
+  return closed;
+}
+
 // ─────────────────────────────────────────────────────
 // ボタン
 // ─────────────────────────────────────────────────────
@@ -582,22 +1144,44 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
     const type = idStr ?? "-";
     const wish = interaction.customId.split(":")[3] ?? "-";
     if (type === "-" || wish === "-") {
-      await interaction.reply({ content: "種類と返信希望を先に選んでください。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({ content: "種類と回答希望を先に選んでください。", flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.showModal(bodyModal(type, wish));
     return;
   }
 
-  // 告発者: DM の「返信する」→ モーダル
+  // 投稿者: DM の「追記する」→ モーダル
   if (action === "reply") {
     const id = Number(idStr);
     const row = services.confessions.get(id);
     if (!row || row.status === "closed") {
-      await interaction.reply({ content: "この件は既に閉じられています。", flags: MessageFlags.Ephemeral });
+      await interaction.reply({
+        content: "このやり取りは既に終了しています。伝えたいことがあれば、トートの耳から新しく送ってください。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+    // 追記できるのは本人だけ（表示制御に頼らない）
+    if (row.user_id !== interaction.user.id) {
+      await interaction.reply({ content: "この操作はできません。", flags: MessageFlags.Ephemeral });
       return;
     }
     await interaction.showModal(replyModal(id));
+    return;
+  }
+
+  // 投稿者: 「もう大丈夫です」→ 確認 → 終了（本人確認は各段で行う）
+  if (action === "senderclose") {
+    await confirmSenderClose(interaction, services, Number(idStr));
+    return;
+  }
+  if (action === "senderclosego") {
+    await applySenderClose(interaction, services, Number(idStr));
+    return;
+  }
+  if (action === "sendercloseno") {
+    await interaction.update({ content: "やり取りはそのまま続いています。", components: [] });
     return;
   }
 
@@ -628,6 +1212,39 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
   };
 
   switch (action) {
+    // ── 会話の操作（Task #219）──
+    // 受領確認。回答希望に関係なく常に使える。回答でも終了でもない。
+    case "ack":
+      await opGuarded(() => acknowledgeCase(interaction, services, id));
+      return;
+    // 旧「あなたの声は届きました」ボタン（返信不要案件のパネルにだけ出ていた）。
+    // 押すと即クローズする実装は廃止したので、受領確認だけを行い、終了は別操作だと案内する。
+    case "voice_received":
+      await opGuarded(async () => {
+        await acknowledgeCase(interaction, services, id);
+        await interaction.followUp({
+          content: "ℹ️ このボタンは受領確認のみになりました。やり取りを終える場合は ✅ 終了 を押してください。",
+          flags: MessageFlags.Ephemeral,
+        });
+      });
+      return;
+    case "replystaff":
+      await opGuarded(() => startStaffReply(interaction, services, id));
+      return;
+    // 「回答は不要」の相手への返信を、担当者が明示的に確認した後の入口
+    case "replyno":
+      await opGuarded(() => interaction.showModal(staffReplyModal(id)));
+      return;
+    case "hold":
+      await opGuarded(() => holdCase(interaction, services, id));
+      return;
+    // 預かった返信の送信。idStr は案件ではなく下書きID（権限は下書きから案件を引いて確認する）
+    case "replywait":
+      await commitStaffReply(interaction, services, Number(idStr), "wait");
+      return;
+    case "replyend":
+      await commitStaffReply(interaction, services, Number(idStr), "close");
+      return;
     // 旧「対応先」ボタン。新規UIから廃止したが、旧メッセージの押下で例外にしないため no-op ephemeral で応答
     case "disp":
       await interaction.reply({
@@ -945,7 +1562,7 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
       .setTitle(recordNo(row.id))
       .addFields(
         { name: "種別", value: typeText(row.type), inline: true },
-        { name: "返信希望", value: wishText(row.reply_wish), inline: true },
+        { name: "回答希望", value: wishText(row.reply_wish), inline: true },
         { name: "状態", value: "🕯️ 未対応", inline: true },
         { name: "受付日時", value: jstStamp(row.created_at), inline: false },
       )
@@ -965,8 +1582,13 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
       })
       .catch(() => undefined);
 
+    // **投稿者にも手元の窓口を渡す。** これが無いと、届いたのか・何を待てばいいのか・
+    // どうやって終えればいいのかが本人からは一切見えない。
+    const handed = await sendSenderDm(interaction.client, uid, senderDm(row.id, { kind: "received", wish: row.reply_wish }));
     await interaction.editReply({
-      content: "🕯 あなたの声は、トートの耳に届いた。運営から返信があれば、この DM にそっと届く。",
+      content: handed
+        ? "🕯 あなたの声は、トートの耳に届いた。DM に受付の控えを送ったので、追記も終了もそこから行える。"
+        : "🕯 あなたの声は、トートの耳に届いた。（DM を送れなかったため、追記・終了のボタンは届いていない。DM を開けておくと使える）",
     });
     return;
   }
@@ -985,6 +1607,15 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
       return;
     }
     const text = interaction.fields.getTextInputValue("text").trim();
+    // **先に受理してから中継する。** 受理（＝期限の解除）が済んでいれば、直前に期限を
+    // 読んでいた自動終了は「期限が一致しない」ので何もできない。
+    const accepted = services.confessions.senderFollowUp(id, interaction.user.id);
+    if (!accepted.ok) {
+      await interaction.editReply({
+        content: "このやり取りは既に終了しています。伝えたいことがあれば、トートの耳から新しく送ってください。",
+      });
+      return;
+    }
     const thread = await interaction.client.channels.fetch(row.thread_id).catch(() => null);
     if (thread?.isThread()) {
       await thread
@@ -992,19 +1623,22 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
           embeds: [
             new EmbedBuilder()
               .setColor(0x0ea5e9)
-              .setAuthor({ name: "🗣 告発者より（匿名）" })
+              .setAuthor({ name: "🗣 投稿者より（匿名・追記）" })
               .setDescription(text.slice(0, 4000))
               .setTimestamp(new Date()),
           ],
+          allowedMentions: { parse: [] },
         })
         .catch(() => undefined);
     }
-    // 投稿者が返信した → 担当者の番。状態を「担当者からの返信待ち」へ
-    if (row.stage !== "emergency" && row.stage !== "court_sent") {
-      services.confessions.setStage(id, "awaiting_staff", "system:relay");
-      await refreshPanel(interaction.client, services, id);
-    }
-    await interaction.editReply({ content: "📨 運営に届けた。" });
+    await refreshPanel(interaction.client, services, id);
+    await interaction.editReply({ content: "✏️ 運営に届けました。自動終了の予定は解除されています。" });
+    return;
+  }
+
+  // 担当者: 自由返信の本文（送信はまだしない。次の選択で確定する）
+  if (action === "staffreplybody") {
+    await stageStaffReply(interaction, services, Number(parts[2]));
     return;
   }
 
@@ -1155,26 +1789,28 @@ async function applyClose(
     row.court_status === "sent"
       ? services.settings.getNumber("confession_court_retention_days")
       : services.settings.getNumber("confession_body_retention_days");
-  services.confessions.close(id, interaction.user.id, reason, retentionDays);
+  services.confessions.close(id, interaction.user.id, reason, retentionDays, "staff");
   // 未終了の緊急対応があれば併せて終了
   const openEmg = services.confessions.openEmergencyFor(id);
   if (openEmg) services.confessions.closeEmergency(openEmg.id, interaction.user.id);
 
   // 告発者へ終了通知（§16 の文面）
-  const user = await interaction.client.users.fetch(row.user_id).catch(() => null);
-  await user
-    ?.send(
-      [
-        "# 🕯️ トートの耳",
-        "",
-        "この相談への対応は終了しました。",
-        "",
-        `**終了理由：** ${CLOSE_META[reason]}`,
-        "",
-        "再び伝えたいことがある場合は、トートの耳から新しく囁くことができます。",
-      ].join("\n"),
-    )
-    .catch(() => undefined);
+  await sendSenderDm(interaction.client, row.user_id, {
+    embeds: [
+      new EmbedBuilder()
+        .setColor(PANEL_COLOR)
+        .setAuthor({ name: `${SENDER_TITLE} #${id}` })
+        .setDescription(
+          [
+            "**このやり取りはここで終了しました。**",
+            "",
+            "終了しても、これまでのやり取りが消えることはありません。",
+            "また伝えたいことがあれば、新しくトートへ送れます。",
+          ].join("\n"),
+        ),
+    ],
+    allowedMentions: { parse: [] },
+  });
 
   await threadLog(interaction.client, services, id, `🔒 <@${interaction.user.id}> が「${CLOSE_META[reason]}」でクローズしました。`);
   await refreshPanel(interaction.client, services, id);
@@ -1222,35 +1858,29 @@ export async function relayStaffMessage(client: Client, services: Services, mess
   const body = message.content.trim();
   if (!body) return;
 
-  const user = await client.users.fetch(row.user_id).catch(() => null);
-  if (!user) return;
-  const sent = await user
-    .send({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(PANEL_COLOR)
-          .setAuthor({ name: `👂 トートの耳 #${row.id} — 運営より` })
-          .setDescription(body.slice(0, 4000))
-          .setFooter({ text: "下のボタンから匿名のまま返信できます" }),
-      ],
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(`mimi:reply:${row.id}`).setLabel("返信する").setEmoji("✍️").setStyle(ButtonStyle.Primary),
-        ),
-      ],
-    })
-    .then(() => true)
-    .catch(() => false);
+  const sent = await sendSenderDm(client, row.user_id, {
+    embeds: [
+      new EmbedBuilder()
+        .setColor(PANEL_COLOR)
+        .setAuthor({ name: `👂 トートの耳 #${row.id} — 運営より` })
+        .setDescription(body.slice(0, 4000))
+        .setFooter({ text: "追記も、やり取りの終了も、下のボタンから行えます" }),
+    ],
+    components: senderControls(row.id),
+    allowedMentions: { parse: [] },
+  });
 
   // 届いたか/届かなかったかをスレッドに小さくフィードバック（リアクション）
   await message.react(sent ? "📨" : "⚠️").catch(() => undefined);
 
-  // 担当者が発信した → 投稿者の番。通常の対応中のみ状態を更新（緊急/送致済みは維持）
-  if (sent && (row.stage === "active" || row.stage === "awaiting_staff" || row.stage === "awaiting_poster")) {
-    if (row.stage !== "awaiting_poster") {
-      services.confessions.setStage(row.id, "awaiting_poster", "system:relay");
-      await refreshPanel(client, services, row.id);
-    }
+  // **スレッドへ書いただけでは「投稿者待ち」にしない。**
+  // 返答を待つのか、この返信で終えるのかは 💬 返信する で明示的に選ぶ（§3-A）。
+  // ここでは「担当者の番」フラグを下ろすだけで、期限は置かない——期限を持つ経路を
+  // 1つに絞っておかないと、自動終了が「誰も待つと決めていない会話」まで畳んでしまう。
+  // 既に明示的な待機に入っている案件は、その決定を上書きしない。
+  if (sent && row.stage === "awaiting_staff") {
+    services.confessions.setStage(row.id, "active", "system:relay");
+    await refreshPanel(client, services, row.id);
   }
 }
 

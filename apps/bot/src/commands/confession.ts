@@ -59,18 +59,8 @@ function confessionId(customId: string): number | null {
   return null;
 }
 
-function caseStatusText(row: ConfessionRow): string {
-  if (row.status === "open") return "🕯️ 未対応";
-  if (row.status === "closed") return "✅ 終結";
-  switch (row.stage) {
-    case "awaiting_poster":
-      return "⏳ 投稿者からの返信待ち";
-    case "awaiting_staff":
-      return "📥 担当者からの返信待ち";
-    default:
-      return "🤝 対応中";
-  }
-}
+/** 状態表示は base の正本を使う（期限付きの投稿者待ち・運営側の確認待ちをこちらで二重定義しない） */
+const caseStatusText = base.statusText;
 
 function canOperate(interaction: ButtonInteraction, services: Services, row: ConfessionRow): boolean {
   if (isAdmin(interaction, services)) return true;
@@ -146,18 +136,8 @@ async function syncCasePanel(client: Client, services: Services, id: number): Pr
     };
   });
 
-  if (row.reply_wish === "no") {
-    const button = new ButtonBuilder()
-      .setCustomId(`mimi:voice_received:${id}`)
-      .setLabel(VOICE_RECEIVED_LABEL)
-      .setEmoji("🕯️")
-      .setStyle(ButtonStyle.Success)
-      .toJSON();
-    const closeRow = rows.find((actionRow) =>
-      (actionRow.components ?? []).some((component) => component.custom_id === `mimi:close:${id}`),
-    );
-    if (closeRow && (closeRow.components?.length ?? 0) < 5) closeRow.components?.splice(-1, 0, button);
-  }
+  // 受領確認は base の 📨 ボタンが全案件へ常設する。
+  // ここでは古いパネルに残っている voice_received ボタンを取り除くだけ。
 
   await message.edit({ embeds, components: rows as any }).catch(() => undefined);
 }
@@ -190,108 +170,12 @@ async function rewriteAcknowledgement(interaction: ModalSubmitInteraction): Prom
   if (content !== message.content) await interaction.editReply({ content }).catch(() => undefined);
 }
 
-export async function closeAsVoiceReceived(
-  interaction: ButtonInteraction,
-  services: Services,
-  id: number,
-): Promise<void> {
-  const row = services.confessions.get(id);
-  if (!row) {
-    await interaction.reply({ content: "この件が見つかりません。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (!canOperate(interaction, services, row)) {
-    await interaction.reply({ content: "この案件の担当者、または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (row.status === "closed") {
-    await interaction.reply({ content: "この件は既に閉じられています。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (row.reply_wish !== "no") {
-    await interaction.reply({
-      content: "「あなたの声は届きました」は、返信不要を選んだ案件でのみ利用できます。",
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  const retentionDays =
-    row.court_status === "sent"
-      ? services.settings.getNumber("confession_court_retention_days")
-      : services.settings.getNumber("confession_body_retention_days");
-  const closed = services.confessions.closeVoiceReceivedAtomic(id, interaction.user.id, retentionDays);
-  if (!closed.ok) {
-    await interaction.editReply({
-      content:
-        closed.code === "already_closed"
-          ? "この件は既に閉じられています。"
-          : "「あなたの声は届きました」は、返信不要を選んだ案件でのみ利用できます。",
-    });
-    return;
-  }
-
-  const openEmergency = services.confessions.openEmergencyFor(id);
-  if (openEmergency) services.confessions.closeEmergency(openEmergency.id, interaction.user.id);
-
-  const user = await interaction.client.users.fetch(closed.row.user_id).catch(() => null);
-  const dmSent = user
-    ? await user
-        .send(
-          [
-            "# 🕯️ トートの耳",
-            "",
-            "あなたの声は、たしかに届きました。",
-            "",
-            "返信は不要とのことでしたので、この件はここでそっと閉じます。",
-            "",
-            "伝えてくれて、ありがとう。",
-          ].join("\n"),
-        )
-        .then(() => true)
-        .catch(() => false)
-    : false;
-
-  if (closed.row.thread_id) {
-    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
-    if (thread?.isThread()) {
-      await thread
-        .send({
-          content: dmSent
-            ? `🕯️ 「${VOICE_RECEIVED_LABEL}」でクローズしました。投稿者へのDM送信にも成功しました。`
-            : `⚠️ 「${VOICE_RECEIVED_LABEL}」でクローズしましたが、投稿者へDMを送れませんでした。`,
-          allowedMentions: { parse: [] },
-        })
-        .catch(() => undefined);
-    }
-  }
-
-  await syncCasePanel(interaction.client, services, id);
-  await interaction.editReply({
-    content: dmSent
-      ? `投稿者へ『${VOICE_RECEIVED_LABEL}』と伝えてクローズしました`
-      : "案件はクローズしましたが、投稿者へDMを送れませんでした",
-  });
-
-  if (closed.row.thread_id) {
-    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
-    if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
-  }
-}
-
 export async function handleConfessionButton(
   interaction: ButtonInteraction,
   services: Services,
 ): Promise<void> {
   const action = interaction.customId.split(":")[1];
   const id = confessionId(interaction.customId);
-
-  if (action === "voice_received" && id !== null) {
-    await closeAsVoiceReceived(interaction, services, id);
-    return;
-  }
 
   await base.handleConfessionButton(interaction, services);
   if (action === "new") await rewriteSelectionReply(interaction);

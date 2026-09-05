@@ -302,17 +302,27 @@ export {
 export { ensureTicketOpenUniqueness } from "./tickets/constraints.js";
 export {
   Confessions,
+  confessionBall,
+  CONFESSION_SENDER_REPLY_DEADLINE_DAYS,
+  CONFESSION_SENDER_REPLY_DEADLINE_SECONDS,
   type ConfessionRow,
   type ConfessionStatus,
   type ConfessionType,
   type ReplyWish,
   type ConfessionMeta,
   type ConfessionStage,
+  type ConfessionBall,
+  type ClosedSide,
   type Disposition,
   type CloseReason,
   type AssigneeRow,
   type EmergencyRow,
   type VoiceReceivedCloseResult,
+  type ReplyDraftRow,
+  type ReplyDraftClaim,
+  type AcknowledgeResult,
+  type SenderCloseResult,
+  type SenderFollowUpResult,
 } from "./confession/service.js";
 export {
   Evaluation,

@@ -27,6 +27,7 @@ import {
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
 import { cancelUnpaidSubAccounts, syncSubAccountRanks } from "./sub-account-jobs.js";
+import { closeExpiredSenderWaits } from "./commands/confession.js";
 import { reconcileTimedAccessForClient } from "./timed-access.js";
 import {
   convergePendingNicknameChanges,
@@ -240,6 +241,12 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         ).catch((e) => console.error("[評価] 実績更新失敗:", e));
       }
     }
+
+    // ── トートの耳: 返答期限の切れたやり取りを終了する ──
+    // 対象は「運営が返答を待つと明示した」案件だけ（reply_deadline_at が入っているもの）。
+    // 未対応・運営側の確認待ち・期限のない既存案件は core の抽出条件に入らない。
+    // 期限が来ていなければ SELECT が空で返るだけで、行も event も作らない。
+    await closeExpiredSenderWaits(client, services).catch((e) => console.error("[トート] 返答期限の自動終了に失敗:", e));
 
     // ── トートの耳: 保存期間を過ぎた相談本文を毎日 04:00 台にpurge（メタ・操作ログは残す）──
     if (now.hour === 4) {

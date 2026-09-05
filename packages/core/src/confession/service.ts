@@ -27,6 +27,7 @@ export type ConfessionStage =
   | "active" // 対応中
   | "awaiting_poster" // 投稿者からの返信待ち
   | "awaiting_staff" // 担当者からの返信待ち
+  | "internal_hold" // 運営側の確認・作業待ち（投稿者待ちではない＝自動終了の対象外）
   | "handoff" // 外部への引継ぎ中（通常運営/諧和廷）
   | "court_review" // 裁判所への送致確認中
   | "court_sent" // 裁判所へ送致済み
@@ -72,6 +73,11 @@ export interface ConfessionRow {
   body_purged_at: number | null; // 実際にpurgeした時刻（非NULL＝本文は削除済み）
   body_retention_reason: string | null; // 保持延長の理由
   panel_msg_id: string | null; // 対応スレッドの管理パネルのメッセージID
+  // 会話の終端（Task #219）で加算
+  acknowledged_at: number | null; // 受領確認（📨 届きました）を送った時刻。回答でも終了でもない
+  acknowledged_by: string | null;
+  reply_deadline_at: number | null; // 「返答を待つ」で明示的に置いた投稿者の返答期限。これがある案件だけ自動終了する
+  closed_side: string | null; // sender | staff | timeout
   // Phase 3（冥府裁判所への送致）で加算
   court_status: string | null; // pending_consent | sent | canceled
   court_category: string | null; // civil | criminal | joined | enma
@@ -108,6 +114,71 @@ export interface EmergencyRow {
   confirmed_by: string | null;
   closed_at: number | null;
 }
+
+/**
+ * 「返答を待つ」で返信したあと、投稿者からの反応が無いまま自動終了するまでの日数。
+ *
+ * **この値の正本はここだけ。** Bot 側の予告文・自動終了・期限計算はすべてこの定数（または
+ * `senderReplyDeadlineFrom()`）を通す。literal をコピーしないこと。
+ */
+export const CONFESSION_SENDER_REPLY_DEADLINE_DAYS = 7;
+
+/** 上の日数を秒で。期限計算はここから導出する（日数と秒の二重定義を作らない） */
+export const CONFESSION_SENDER_REPLY_DEADLINE_SECONDS = CONFESSION_SENDER_REPLY_DEADLINE_DAYS * 86_400;
+
+/** 「いま次に動くのは誰か」。stage の数ではなく、この一意な答えが運用UIの正本。 */
+export type ConfessionBall =
+  | "staff_attention" // 運営が見るべき（未対応 / 対応中 / 投稿者から反応があった）
+  | "waiting_sender" // 投稿者の返答待ち（明示的な期限つき）
+  | "waiting_staff" // 運営側の確認・作業待ち（自動終了しない）
+  | "legacy_open" // 期限の根拠が無い既存 open。推測で投稿者待ちにしない
+  | "closed";
+
+/**
+ * 次のball。`reply_deadline_at` が付いている案件だけを本当の「投稿者待ち」と見なす。
+ *
+ * 既存DBの `awaiting_poster` は「担当者がスレッドに書いた」だけで自動的に付いた値であって、
+ * 「運営が返答を待つと決めた」証拠ではない。だから期限が無いものは `legacy_open` に落とし、
+ * 自動終了の対象にしない（Task #219 §11）。
+ */
+export function confessionBall(row: ConfessionRow): ConfessionBall {
+  if (row.status === "closed") return "closed";
+  if (row.status === "open") return "staff_attention";
+  if (row.stage === "internal_hold") return "waiting_staff";
+  if (row.stage === "awaiting_poster") return row.reply_deadline_at !== null ? "waiting_sender" : "legacy_open";
+  return "staff_attention";
+}
+
+/** 誰がこの会話を終わらせたか。運営内部の理由(close_reason)とは別の軸。 */
+export type ClosedSide = "sender" | "staff" | "timeout";
+
+/** 担当者の自由返信の下書き。Discord へ送る前に必ずここへ置き、行の消費で二重送信を防ぐ */
+export interface ReplyDraftRow {
+  id: number;
+  confession_id: number;
+  staff_id: string;
+  body: string;
+  intent: string; // wait | close（下書き時点では未定なので consume 時に確定する）
+  created_at: number;
+  consumed_at: number | null;
+  outcome: string | null; // delivered | undelivered
+}
+
+export type AcknowledgeResult =
+  | { ok: true; row: ConfessionRow }
+  | { ok: false; code: "not_found" | "already_closed" | "already_acknowledged"; row?: ConfessionRow };
+
+export type SenderCloseResult =
+  | { ok: true; row: ConfessionRow }
+  | { ok: false; code: "not_found" | "not_sender" | "already_closed"; row?: ConfessionRow };
+
+export type SenderFollowUpResult =
+  | { ok: true; row: ConfessionRow }
+  | { ok: false; code: "not_found" | "not_sender" | "already_closed"; row?: ConfessionRow };
+
+export type ReplyDraftClaim =
+  | { ok: true; draft: ReplyDraftRow; row: ConfessionRow }
+  | { ok: false; code: "not_found" | "already_consumed" | "case_closed" | "not_owner"; row?: ConfessionRow };
 
 /** create に渡す任意メタ（未指定でも従来通り動く） */
 export interface ConfessionMeta {
@@ -172,6 +243,20 @@ export class Confessions {
         closed_at     INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_confession_emergency ON confession_emergency(confession_id, status);
+      -- Task #219: 担当者の自由返信の下書き。
+      -- Discord への送信は外部effectなので、押した瞬間に行を「消費」してから送る。
+      -- 二度押し・retry は消費に負けて何も送らない（changes=1 の勝者だけが送信へ進む）。
+      CREATE TABLE IF NOT EXISTS confession_reply_drafts (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        confession_id INTEGER NOT NULL,
+        staff_id      TEXT NOT NULL,
+        body          TEXT NOT NULL,
+        intent        TEXT,
+        created_at    INTEGER NOT NULL,
+        consumed_at   INTEGER,
+        outcome       TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_confession_reply_draft ON confession_reply_drafts(confession_id, consumed_at);
     `);
     // Phase 1 加算列（既存DBには後付け。SQLite は ADD COLUMN IF NOT EXISTS が無いので存在確認して追加）
     this.addColumn("type", "TEXT");
@@ -198,6 +283,20 @@ export class Confessions {
     this.addColumn("court_sent_at", "INTEGER");
     this.addColumn("court_sent_by", "TEXT");
     this.addColumn("court_form", "TEXT"); // 担当者が入力した送致概要のJSON {reason, summary, wants}
+    // Task #219 加算列（会話の終端）
+    this.addColumn("acknowledged_at", "INTEGER");
+    this.addColumn("acknowledged_by", "TEXT");
+    this.addColumn("reply_deadline_at", "INTEGER");
+    this.addColumn("closed_side", "TEXT");
+    // 期限つきの投稿者待ちだけを走査するための索引（期限なしの既存行は入らない）
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_confession_reply_deadline ON confession_tickets(reply_deadline_at) WHERE reply_deadline_at IS NOT NULL",
+    );
+  }
+
+  /** 「返答を待つ」を選んだ時刻から、投稿者の返答期限を導く（日数literalをここ以外に置かない） */
+  static senderReplyDeadlineFrom(atTs: number): number {
+    return atTs + CONFESSION_SENDER_REPLY_DEADLINE_SECONDS;
   }
 
   /** confession_tickets に列が無ければ追加する（冪等な後付けマイグレーション） */
@@ -253,15 +352,24 @@ export class Confessions {
    * クローズ。理由・担当者・本文purge予定を記録する。
    * retentionDays を渡すと closed_at + N日 を body_purge_at に設定（0/未指定なら purge予定なし）。
    */
-  close(id: number, staffId: string, reason?: CloseReason, retentionDays?: number): ConfessionRow | undefined {
+  close(
+    id: number,
+    staffId: string,
+    reason?: CloseReason,
+    retentionDays?: number,
+    closedSide: ClosedSide = "staff",
+  ): ConfessionRow | undefined {
     const ts = now();
     const purgeAt = retentionDays && retentionDays > 0 ? ts + retentionDays * 86_400 : null;
     this.db
       .prepare(
-        "UPDATE confession_tickets SET status='closed', closed_at=?, close_reason=?, closed_by=?, body_purge_at=COALESCE(body_purge_at, ?) WHERE id=?",
+        `UPDATE confession_tickets
+         SET status='closed', closed_at=?, close_reason=?, closed_by=?, closed_side=?,
+             reply_deadline_at=NULL, body_purge_at=COALESCE(body_purge_at, ?)
+         WHERE id=?`,
       )
-      .run(ts, reason ?? null, staffId, purgeAt, id);
-    this.events.log("confession_close", { actor: staffId, payload: { id, reason: reason ?? null } });
+      .run(ts, reason ?? null, staffId, closedSide, purgeAt, id);
+    this.events.log("confession_close", { actor: staffId, payload: { id, reason: reason ?? null, side: closedSide } });
     return this.get(id);
   }
 
@@ -284,6 +392,194 @@ export class Confessions {
     if (!row) return { ok: false, code: "not_found" };
     if (row.status === "closed") return { ok: false, code: "already_closed", row };
     return { ok: false, code: "reply_wish_not_no", row };
+  }
+
+  // ══ 会話の終端（Task #219） ═════════════════════════════
+  //
+  // 受領確認 / 内容への回答 / 会話の終了 は**別の概念**として扱う。
+  // ここにある操作はどれも、そのうち1つだけを起こす。
+
+  /**
+   * 📨 受領確認。「運営がこの声を受け取った」以上の意味を持たせない。
+   *
+   * - `reply_wish` を一切見ない。**回答不要でも回答希望でも送れる**（元バグの本体）
+   * - status/stage を動かさない。回答したことにも、終了したことにもならない
+   * - 案件につき一度だけ。二度押し・retry は changes=0 で負け、DM は飛ばない
+   */
+  acknowledgeAtomic(id: number, staffId: string): AcknowledgeResult {
+    const ts = now();
+    const info = this.db
+      .prepare(
+        "UPDATE confession_tickets SET acknowledged_at=?, acknowledged_by=? WHERE id=? AND acknowledged_at IS NULL AND status<>'closed'",
+      )
+      .run(ts, staffId, id);
+    const row = this.get(id);
+    if (info.changes === 1) {
+      this.events.log("confession_acknowledge", { actor: staffId, payload: { id } });
+      return { ok: true, row: row! };
+    }
+    if (!row) return { ok: false, code: "not_found" };
+    if (row.status === "closed") return { ok: false, code: "already_closed", row };
+    return { ok: false, code: "already_acknowledged", row };
+  }
+
+  /** 自由返信の下書きを置く。本文の正本はここで、EventLog へは複製しない */
+  createReplyDraft(id: number, staffId: string, body: string): ReplyDraftRow {
+    const info = this.db
+      .prepare("INSERT INTO confession_reply_drafts (confession_id, staff_id, body, created_at) VALUES (?, ?, ?, ?)")
+      .run(id, staffId, body, now());
+    return this.getReplyDraft(Number(info.lastInsertRowid))!;
+  }
+
+  getReplyDraft(draftId: number): ReplyDraftRow | undefined {
+    return this.db.prepare("SELECT * FROM confession_reply_drafts WHERE id=?").get(draftId) as ReplyDraftRow | undefined;
+  }
+
+  /**
+   * 下書きを消費して送信権を得る。**勝者だけが Discord へ送る。**
+   *
+   * 二度押しの2発目は changes=0 で `already_consumed` になり、同じ本文を二重に届けない。
+   * 送信より先に消費するのは、「送ったのに未消費」より「消費したのに未送信」の方が安全だから
+   * ——未送信は下書きに `undelivered` として残り、案件の状態遷移も起こさない
+   * （送れたか分からないものを「送った」ことにしない）。
+   */
+  claimReplyDraft(draftId: number, staffId: string, intent: "wait" | "close"): ReplyDraftClaim {
+    const draft = this.getReplyDraft(draftId);
+    if (!draft) return { ok: false, code: "not_found" };
+    if (draft.staff_id !== staffId) return { ok: false, code: "not_owner" };
+    // 既に送ったものを二度押ししたのか、書いている間に会話が終わったのか——
+    // 担当者にとっては別の出来事なので、原因の近い順に見る。
+    if (draft.consumed_at !== null) return { ok: false, code: "already_consumed" };
+    const row = this.get(draft.confession_id);
+    if (!row) return { ok: false, code: "not_found" };
+    // 下書きの間に投稿者が終了していたら、返信で会話を勝手に再開させない
+    if (row.status === "closed") return { ok: false, code: "case_closed", row };
+    const info = this.db
+      .prepare("UPDATE confession_reply_drafts SET consumed_at=?, intent=? WHERE id=? AND consumed_at IS NULL")
+      .run(now(), intent, draftId);
+    if (info.changes !== 1) return { ok: false, code: "already_consumed", row };
+    return { ok: true, draft: this.getReplyDraft(draftId)!, row };
+  }
+
+  /** 送信できたか／できなかったかを下書きへ残す。delivered のときだけ案件の状態を進める */
+  finishReplyDraft(draftId: number, outcome: "delivered" | "undelivered"): void {
+    this.db.prepare("UPDATE confession_reply_drafts SET outcome=? WHERE id=?").run(outcome, draftId);
+  }
+
+  /**
+   * 「返答を待つ」で返信したあとの状態。投稿者待ちにして**明示的な期限**を置く。
+   * 期限を持つのはこの経路だけ——ここを通っていない案件は自動終了しない。
+   */
+  applyStaffReplyWaiting(id: number, staffId: string, atTs: number = now()): ConfessionRow | undefined {
+    const deadline = Confessions.senderReplyDeadlineFrom(atTs);
+    this.db
+      .prepare("UPDATE confession_tickets SET stage='awaiting_poster', reply_deadline_at=? WHERE id=? AND status<>'closed'")
+      .run(deadline, id);
+    this.events.log("confession_reply_wait", { actor: staffId, payload: { id, deadlineAt: deadline } });
+    return this.get(id);
+  }
+
+  /** ⏳ 運営側の確認待ち。投稿者待ちへ逃がさないので、自動終了の対象にならない */
+  setInternalHold(id: number, staffId: string): ConfessionRow | undefined {
+    this.db
+      .prepare("UPDATE confession_tickets SET stage='internal_hold', reply_deadline_at=NULL WHERE id=? AND status<>'closed'")
+      .run(id);
+    this.events.log("confession_internal_hold", { actor: staffId, payload: { id } });
+    return this.get(id);
+  }
+
+  /**
+   * ✅ 投稿者自身による終了。**本人以外は絶対に通さない**（表示の出し分けだけに頼らない）。
+   * 履歴は消さない——status と終了メタだけが変わる。
+   */
+  senderCloseAtomic(id: number, senderId: string, retentionDays?: number): SenderCloseResult {
+    const ts = now();
+    const purgeAt = retentionDays && retentionDays > 0 ? ts + retentionDays * 86_400 : null;
+    const info = this.db
+      .prepare(
+        `UPDATE confession_tickets
+         SET status='closed', closed_at=?, close_reason='poster_ended', closed_by=?, closed_side='sender',
+             reply_deadline_at=NULL, body_purge_at=COALESCE(body_purge_at, ?)
+         WHERE id=? AND user_id=? AND status<>'closed'`,
+      )
+      .run(ts, senderId, purgeAt, id, senderId);
+    const row = this.get(id);
+    if (info.changes === 1) {
+      this.events.log("confession_close", { actor: senderId, payload: { id, reason: "poster_ended", side: "sender" } });
+      return { ok: true, row: row! };
+    }
+    if (!row) return { ok: false, code: "not_found" };
+    if (row.user_id !== senderId) return { ok: false, code: "not_sender", row };
+    return { ok: false, code: "already_closed", row };
+  }
+
+  /**
+   * ✏️ 投稿者の追記。運営の番へ戻し、**期限を必ず消す**。
+   *
+   * 追記が受理されたのに、直前に読まれた古い期限で数秒後に自動終了する——という競合を
+   * ここで断つ（自動終了側も期限値の一致を条件にしている）。
+   */
+  senderFollowUp(id: number, senderId: string): SenderFollowUpResult {
+    const info = this.db
+      .prepare(
+        `UPDATE confession_tickets SET stage='awaiting_staff', reply_deadline_at=NULL
+         WHERE id=? AND user_id=? AND status<>'closed'`,
+      )
+      .run(id, senderId);
+    const row = this.get(id);
+    if (info.changes === 1) {
+      this.events.log("confession_sender_followup", { actor: senderId, payload: { id } });
+      return { ok: true, row: row! };
+    }
+    if (!row) return { ok: false, code: "not_found" };
+    if (row.user_id !== senderId) return { ok: false, code: "not_sender", row };
+    return { ok: false, code: "already_closed", row };
+  }
+
+  /**
+   * 期限が到来した「投稿者の返答待ち」案件。
+   *
+   * `reply_deadline_at IS NOT NULL` が条件なので、**運営側の待機・未対応・既存の
+   * 根拠なき awaiting_poster は決して入らない**。
+   */
+  listDueSenderTimeouts(atTs: number = now(), limit = 50): ConfessionRow[] {
+    return this.db
+      .prepare(
+        `SELECT * FROM confession_tickets
+         WHERE status<>'closed' AND stage='awaiting_poster'
+           AND reply_deadline_at IS NOT NULL AND reply_deadline_at <= ?
+         ORDER BY reply_deadline_at LIMIT ?`,
+      )
+      .all(atTs, limit) as ConfessionRow[];
+  }
+
+  /**
+   * 期限切れの自動終了。**読んだときの期限値と一致するときだけ**閉じる。
+   *
+   * 古い期限を掴んだまま眠っていた実行が、その後 staff が返信して更新された新しい会話を
+   * 閉じてしまわないための条件。二重実行も changes=0 で自然に落ちる。
+   */
+  autoCloseExpiredAtomic(id: number, expectedDeadlineAt: number, retentionDays?: number): SenderCloseResult {
+    const ts = now();
+    const purgeAt = retentionDays && retentionDays > 0 ? ts + retentionDays * 86_400 : null;
+    const info = this.db
+      .prepare(
+        `UPDATE confession_tickets
+         SET status='closed', closed_at=?, close_reason='no_response', closed_by='system:scheduler', closed_side='timeout',
+             reply_deadline_at=NULL, body_purge_at=COALESCE(body_purge_at, ?)
+         WHERE id=? AND status<>'closed' AND stage='awaiting_poster' AND reply_deadline_at=?`,
+      )
+      .run(ts, purgeAt, id, expectedDeadlineAt);
+    const row = this.get(id);
+    if (info.changes === 1) {
+      this.events.log("confession_close", {
+        actor: "system:scheduler",
+        payload: { id, reason: "no_response", side: "timeout" },
+      });
+      return { ok: true, row: row! };
+    }
+    if (!row) return { ok: false, code: "not_found" };
+    return { ok: false, code: "already_closed", row };
   }
 
   /** 再オープン（誤クローズ・相談再開）。status=claimed に戻し、purge予定は据え置く */
