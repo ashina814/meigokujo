@@ -206,6 +206,20 @@ export type ConditionalCloseResult =
   | { ok: true; row: ConfessionRow }
   | { ok: false; code: "not_found" | "already_closed"; row?: ConfessionRow };
 
+/**
+ * 外部送信が済んだあとの1回の確定。**送信できた事実は、会話の遷移に負けても失わない。**
+ *
+ * `transition`:
+ *  - `closed`  … この返信で終了できた
+ *  - `waiting` … 投稿者の返答待ちにできた（`deadlineAt` あり）
+ *  - `lost`    … 送っている間に会話が終わっていた。終了はそのまま維持する
+ */
+export interface StaffReplyFinalizeResult {
+  readonly transition: "closed" | "waiting" | "lost";
+  readonly deadlineAt: number | null;
+  readonly row: ConfessionRow | undefined;
+}
+
 /** 「返答を待つ」の確定も同じ。閉じた会話へ期限を生やさない。 */
 export type StaffWaitResult =
   | { ok: true; row: ConfessionRow }
@@ -213,6 +227,42 @@ export type StaffWaitResult =
 
 /** 明確な失敗だけを自動で再試行する。unknown は人が判断する。 */
 export const CONFESSION_FOLLOW_UP_MAX_ATTEMPTS = 5;
+
+/**
+ * 外部送信を伴う行の進み具合。**「まだ触っていない」と「触った途中」を同じ値にしない。**
+ *
+ * プロセスが落ちると `sending` だけが取り残される。再起動時にそれを見て
+ * `unknown` へ寄せられるのは、両者が別の値だからこそ。`NULL`（pending）を
+ * 送信中と兼ねると、一度も送っていない行まで「届いたかもしれない」に
+ * 格下げしてしまう。
+ */
+export type EffectProgress = "pending" | "sending" | "delivered" | "failed" | "unknown";
+
+/** 未解決の追記が、運営から見てどの箱に入っているか */
+export type FollowUpBucket =
+  | "not_ready" // 対応スレッドがまだ無い（宛先未確定）。失敗ではない
+  | "pending" // 渡せる状態だが、まだ渡していない
+  | "sending" // 送信中（このプロセスが生きている間だけ）
+  | "failed" // 明確に渡せなかった。自動で拾い直す
+  | "unknown" // 渡せたか分からない。自動では送り直さない
+  | "exhausted"; // 自動再試行の上限に達した。人が決める
+
+export interface FollowUpTriage {
+  readonly notReady: number;
+  readonly pending: number;
+  readonly sending: number;
+  readonly failed: number;
+  readonly unknown: number;
+  readonly exhausted: number;
+  readonly total: number;
+}
+
+/** 起動時に回収した、前プロセスの置き土産 */
+export interface OrphanRecovery {
+  readonly ackAttempts: number;
+  readonly replyDrafts: number;
+  readonly followUps: number;
+}
 
 /** 担当者の自由返信の下書き。Discord へ送る前に必ずここへ置き、行の消費で二重送信を防ぐ */
 export interface ReplyDraftRow {
@@ -343,6 +393,8 @@ export class Confessions {
         body_purge_at INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_confession_follow_up ON confession_follow_ups(confession_id, outcome);
+      CREATE INDEX IF NOT EXISTS idx_confession_follow_up_open ON confession_follow_ups(outcome)
+        WHERE relayed_at IS NULL;
       CREATE INDEX IF NOT EXISTS idx_confession_follow_up_purge ON confession_follow_ups(body_purge_at)
         WHERE body IS NOT NULL;
     `);
@@ -515,9 +567,15 @@ export class Confessions {
         .prepare("INSERT INTO confession_ack_attempts (confession_id, staff_id, started_at) VALUES (?, ?, ?)")
         .run(id, staffId, now());
       return { ok: true, attemptId: Number(info.lastInsertRowid), row };
-    } catch {
-      // 部分ユニーク索引の衝突＝既に誰かが送信中
-      return { ok: false, code: "attempt_in_flight", row };
+    } catch (error) {
+      // **「送信中だった」と言ってよいのは、部分ユニーク索引に負けたときだけ。**
+      // ディスク不full・破損・型違反まで in-flight へ潰すと、本物の異常が
+      // 「いま誰かが送っています」という無害な顔で隠れてしまう。
+      const code = (error as { code?: unknown } | null)?.code;
+      if (typeof code === "string" && code.startsWith("SQLITE_CONSTRAINT")) {
+        return { ok: false, code: "attempt_in_flight", row };
+      }
+      throw error;
     }
   }
 
@@ -528,27 +586,33 @@ export class Confessions {
    * 受領確認が届いた証拠にはならないので案件側は何も動かさない。
    */
   settleAcknowledgement(attemptId: number, outcome: DeliveryOutcome, staffId: string): ConfessionRow | undefined {
-    const ts = now();
     const attempt = this.db
       .prepare("SELECT * FROM confession_ack_attempts WHERE id=?")
       .get(attemptId) as AckAttemptRow | undefined;
     if (!attempt) return undefined;
-    this.db
-      .prepare("UPDATE confession_ack_attempts SET outcome=?, finished_at=? WHERE id=? AND outcome IS NULL")
-      .run(outcome, ts, attemptId);
-    if (outcome === "delivered") {
+    // **試行の決着と案件側の受領記録を1つのトランザクションで書く。**
+    // 別々に書くと、その間で落ちたときに「試行は delivered なのに acknowledged_at は
+    // NULL」という半端な状態ができる。すると ackState は none へ落ち、**届いている
+    // DM をもう一通送れてしまう**。
+    const settle = this.db.transaction((ts: number) => {
       this.db
-        .prepare(
-          "UPDATE confession_tickets SET acknowledged_at=?, acknowledged_by=? WHERE id=? AND acknowledged_at IS NULL",
-        )
-        .run(ts, staffId, attempt.confession_id);
-      this.events.log("confession_acknowledge", { actor: staffId, payload: { id: attempt.confession_id } });
-    } else {
-      this.events.log("confession_acknowledge_failed", {
-        actor: staffId,
-        payload: { id: attempt.confession_id, outcome },
-      });
-    }
+        .prepare("UPDATE confession_ack_attempts SET outcome=?, finished_at=? WHERE id=? AND outcome IS NULL")
+        .run(outcome, ts, attemptId);
+      if (outcome === "delivered") {
+        this.db
+          .prepare(
+            "UPDATE confession_tickets SET acknowledged_at=?, acknowledged_by=? WHERE id=? AND acknowledged_at IS NULL",
+          )
+          .run(ts, staffId, attempt.confession_id);
+        this.events.log("confession_acknowledge", { actor: staffId, payload: { id: attempt.confession_id } });
+      } else {
+        this.events.log("confession_acknowledge_failed", {
+          actor: staffId,
+          payload: { id: attempt.confession_id, outcome },
+        });
+      }
+    });
+    settle(now());
     return this.get(attempt.confession_id);
   }
 
@@ -614,8 +678,13 @@ export class Confessions {
     if (!row) return { ok: false, code: "not_found" };
     // 下書きの間に投稿者が終了していたら、返信で会話を勝手に再開させない
     if (row.status === "closed") return { ok: false, code: "case_closed", row };
+    // `sending` を立てるのは、落ちたときに「外へ触った可能性がある行」を
+    // 起動時に見つけられるようにするため（consumed_at だけでは、決着済みと
+    // 送信中を区別できない）。
     const info = this.db
-      .prepare("UPDATE confession_reply_drafts SET consumed_at=?, intent=? WHERE id=? AND consumed_at IS NULL")
+      .prepare(
+        "UPDATE confession_reply_drafts SET consumed_at=?, intent=?, outcome='sending' WHERE id=? AND consumed_at IS NULL",
+      )
       .run(now(), intent, draftId);
     if (info.changes !== 1) return { ok: false, code: "already_consumed", row };
     return { ok: true, draft: this.getReplyDraft(draftId)!, row };
@@ -634,6 +703,58 @@ export class Confessions {
       return;
     }
     this.db.prepare("UPDATE confession_reply_drafts SET outcome=? WHERE id=?").run(outcome, draftId);
+  }
+
+  /**
+   * 外部送信が済んだあとの確定を**1つのトランザクション**でやりきる。
+   *
+   * ここを分けて書くと「DM は届いたのに、下書きは送信中のまま」「本文だけ消えて
+   * 会話は動いていない」といった隙間ができる。送信できた事実（delivered / 本文の消去）は
+   * 常に確定し、会話の遷移だけが条件付きで、負ければ `lost` を返して終了を維持する。
+   */
+  finalizeStaffReply(input: {
+    draftId: number;
+    intent: "wait" | "close";
+    staffId: string;
+    retentionDays?: number;
+    atTs?: number;
+  }): StaffReplyFinalizeResult {
+    const ts = input.atTs ?? now();
+    const draft = this.getReplyDraft(input.draftId);
+    if (!draft) return { transition: "lost", deadlineAt: null, row: undefined };
+    const id = draft.confession_id;
+    const purgeAt = input.retentionDays && input.retentionDays > 0 ? ts + input.retentionDays * 86_400 : null;
+    const deadline = input.intent === "wait" ? Confessions.senderReplyDeadlineFrom(ts) : null;
+
+    const apply = this.db.transaction((): StaffReplyFinalizeResult["transition"] => {
+      // 届いた事実と本文の消去は無条件（会話の遷移に負けても失わない）
+      this.db
+        .prepare("UPDATE confession_reply_drafts SET outcome='delivered', body=NULL WHERE id=?")
+        .run(input.draftId);
+      if (input.intent === "close") {
+        const closed = this.db
+          .prepare(
+            `UPDATE confession_tickets
+             SET status='closed', closed_at=?, close_reason='resolved', closed_by=?, closed_side='staff',
+                 reply_deadline_at=NULL, body_purge_at=COALESCE(body_purge_at, ?)
+             WHERE id=? AND status<>'closed'`,
+          )
+          .run(ts, input.staffId, purgeAt, id);
+        return closed.changes === 1 ? "closed" : "lost";
+      }
+      const waited = this.db
+        .prepare("UPDATE confession_tickets SET stage='awaiting_poster', reply_deadline_at=? WHERE id=? AND status<>'closed'")
+        .run(deadline, id);
+      return waited.changes === 1 ? "waiting" : "lost";
+    });
+
+    const transition = apply();
+    if (transition === "closed") {
+      this.events.log("confession_close", { actor: input.staffId, payload: { id, reason: "resolved", side: "staff" } });
+    } else if (transition === "waiting") {
+      this.events.log("confession_reply_wait", { actor: input.staffId, payload: { id, deadlineAt: deadline } });
+    }
+    return { transition, deadlineAt: transition === "waiting" ? deadline : null, row: this.get(id) };
   }
 
   /**
@@ -751,33 +872,142 @@ export class Confessions {
         .prepare("UPDATE confession_follow_ups SET outcome='delivered', relayed_at=?, body=NULL WHERE id=?")
         .run(ts, followUpId);
     } else {
-      this.db
-        .prepare("UPDATE confession_follow_ups SET outcome=?, attempts=attempts+1 WHERE id=?")
-        .run(outcome, followUpId);
+      // 試行回数は所有権を取った時点で増えている。ここで二重に数えない。
+      this.db.prepare("UPDATE confession_follow_ups SET outcome=? WHERE id=?").run(outcome, followUpId);
     }
     return this.getFollowUp(followUpId);
   }
 
   /**
-   * 自動で再試行してよい追記＝**明確に失敗した**もの（届いていないと言い切れる）だけ。
-   * `unknown` は入らない——届いている可能性がある本文を、勝手にもう一度送らない。
+   * 刻時盤が自動で渡してよい追記。
+   *
+   * - **対応スレッドがまだ無い案件は入らない。** 宛先が決まっていないのは配送の失敗ではなく、
+   *   まだ順番が来ていないだけ。ここへ入れると毎分 attempts を焼いて、担当者が
+   *   「対応する」を押す前に上限へ達してしまう
+   * - `unknown` も入らない——届いている可能性がある本文を、勝手にもう一度送らない
+   * - まだ一度も渡していない `pending` と、明確に失敗した `failed` だけが対象
    */
-  listRetryableFollowUps(limit = 20): FollowUpRow[] {
+  listRelayableFollowUps(limit = 20): FollowUpRow[] {
     return this.db
       .prepare(
-        `SELECT * FROM confession_follow_ups
-         WHERE outcome='failed' AND body IS NOT NULL AND attempts < ?
-         ORDER BY id LIMIT ?`,
+        `SELECT f.* FROM confession_follow_ups f
+         JOIN confession_tickets t ON t.id = f.confession_id
+         WHERE f.relayed_at IS NULL AND f.body IS NOT NULL
+           AND (f.outcome IS NULL OR f.outcome='failed')
+           AND f.attempts < ?
+           AND t.thread_id IS NOT NULL
+         ORDER BY f.id LIMIT ?`,
       )
       .all(CONFESSION_FOLLOW_UP_MAX_ATTEMPTS, limit) as FollowUpRow[];
   }
 
-  /** 再試行の所有権。勝った1つだけが Discord へ渡す */
-  claimFollowUpRetry(followUpId: number): FollowUpRow | undefined {
+  /**
+   * 送信の所有権。勝った1つだけが Discord へ渡す。
+   *
+   * **試行回数を増やすのはここだけ。** 宛先未確定で見送った回は消費しない。
+   */
+  claimFollowUpRelay(followUpId: number): FollowUpRow | undefined {
     const info = this.db
-      .prepare("UPDATE confession_follow_ups SET outcome='retrying' WHERE id=? AND outcome='failed'")
+      .prepare(
+        `UPDATE confession_follow_ups SET outcome='sending', attempts=attempts+1
+         WHERE id=? AND relayed_at IS NULL AND (outcome IS NULL OR outcome='failed')`,
+      )
       .run(followUpId);
     return info.changes === 1 ? this.getFollowUp(followUpId) : undefined;
+  }
+
+  /**
+   * 担当者が「重複しうる」と承知したうえでの手動再送。
+   * `unknown` と、自動再試行の上限に達したものが対象——自動では絶対に拾わないもの。
+   */
+  claimFollowUpManualRetry(followUpId: number): FollowUpRow | undefined {
+    const row = this.getFollowUp(followUpId);
+    if (!row || row.relayed_at !== null || row.body === null) return undefined;
+    const eligible = row.outcome === "unknown" || (row.outcome === "failed" && row.attempts >= CONFESSION_FOLLOW_UP_MAX_ATTEMPTS);
+    if (!eligible) return undefined;
+    const info = this.db
+      .prepare("UPDATE confession_follow_ups SET outcome='sending', attempts=attempts+1 WHERE id=? AND outcome=?")
+      .run(followUpId, row.outcome);
+    return info.changes === 1 ? this.getFollowUp(followUpId) : undefined;
+  }
+
+  /** 未解決の追記を、運営が処理を選べる箱へ分ける */
+  followUpTriage(confessionId: number): FollowUpTriage {
+    const row = this.get(confessionId);
+    const hasThread = !!row?.thread_id;
+    const open = this.listUnrelayedFollowUps(confessionId);
+    const t = { notReady: 0, pending: 0, sending: 0, failed: 0, unknown: 0, exhausted: 0 };
+    for (const f of open) {
+      if (f.outcome === "sending") t.sending += 1;
+      else if (f.outcome === "unknown") t.unknown += 1;
+      else if (f.outcome === "failed") {
+        if (f.attempts >= CONFESSION_FOLLOW_UP_MAX_ATTEMPTS) t.exhausted += 1;
+        else t.failed += 1;
+      } else if (!hasThread) t.notReady += 1;
+      else t.pending += 1;
+    }
+    return { ...t, total: open.length };
+  }
+
+  /** 手動対応が要るもの（unknown / 上限到達）を担当者へ出す */
+  listFollowUpsNeedingDecision(confessionId: number): FollowUpRow[] {
+    return this.listUnrelayedFollowUps(confessionId).filter(
+      (f) =>
+        f.body !== null &&
+        (f.outcome === "unknown" || (f.outcome === "failed" && f.attempts >= CONFESSION_FOLLOW_UP_MAX_ATTEMPTS)),
+    );
+  }
+
+  /**
+   * 担当者が「もう渡さなくてよい」と判断して閉じる出口。
+   * 本文は消し、届いたことにはしない——`resolved_manually` として残す。
+   */
+  resolveFollowUpManually(followUpId: number, staffId: string): FollowUpRow | undefined {
+    const info = this.db
+      .prepare("UPDATE confession_follow_ups SET outcome='resolved_manually', relayed_at=?, body=NULL WHERE id=? AND relayed_at IS NULL")
+      .run(now(), followUpId);
+    if (info.changes === 1) {
+      this.events.log("confession_followup_resolved", { actor: staffId, payload: { followUpId } });
+    }
+    return this.getFollowUp(followUpId);
+  }
+
+  /**
+   * 前のプロセスが残した「送信中」を回収する。**起動時に一度だけ。**
+   *
+   * 送信を始めていたかもしれないのだから、`delivered` でも `failed` でもなく
+   * `unknown` へ寄せる。自動再送はしない（`unknown` は自動対象に入らない）。
+   * これをやらないと、部分ユニーク索引が受領確認を永久に塞ぎ、消費済みの下書きが
+   * 永久に送れないままになる。
+   */
+  recoverOrphanedEffects(actor = "system:startup"): OrphanRecovery {
+    const ts = now();
+    const run = this.db.transaction((): OrphanRecovery => {
+      const ackAttempts = this.db
+        .prepare("UPDATE confession_ack_attempts SET outcome='unknown', finished_at=? WHERE outcome IS NULL")
+        .run(ts).changes;
+      const replyDrafts = this.db
+        .prepare("UPDATE confession_reply_drafts SET outcome='unknown' WHERE outcome='sending'")
+        .run().changes;
+      const followUps = this.db
+        .prepare("UPDATE confession_follow_ups SET outcome='unknown' WHERE outcome IN ('sending','retrying') AND relayed_at IS NULL")
+        .run().changes;
+      return { ackAttempts, replyDrafts, followUps };
+    });
+    const result = run();
+    if (result.ackAttempts + result.replyDrafts + result.followUps > 0) {
+      this.events.log("confession_orphan_recovered", { actor, payload: { ...result } });
+    }
+    return result;
+  }
+
+  /** 起動時回収で `unknown` になった、まだ決着していない返信の下書き */
+  listUnresolvedReplyDrafts(confessionId: number): ReplyDraftRow[] {
+    return this.db
+      .prepare(
+        "SELECT * FROM confession_reply_drafts WHERE confession_id=? AND body IS NOT NULL AND outcome IN ('unknown','failed') ORDER BY id",
+      )
+      .all(confessionId) as ReplyDraftRow[];
   }
 
   /** まだ運営へ渡せていない追記（担当者パネルに出す） */

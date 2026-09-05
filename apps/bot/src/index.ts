@@ -93,6 +93,7 @@ import { trackVoiceState } from "./vc-tracking.js";
 import { handleDenVoice } from "./dens.js";
 import { handlePaydayButton } from "./payday.js";
 import { startScheduler } from "./scheduler.js";
+import { armConfessionStartupRecovery } from "./confession-startup.js";
 import { armExternalEffectStartupRecovery } from "./scheduler-recovery.js";
 import { reconcileTimedAccessForClient, reconcileTimedAccessForGuild } from "./timed-access.js";
 import { enforceConversationCourtRestrictionForGuild, handleConversationCourtVoiceUpdate } from "./conversation-court.js";
@@ -164,6 +165,8 @@ client.once(Events.ClientReady, async (ready) => {
   //
   // 関門はプロセス内の順序づけだけで、所有権の正本ではない（正本はDB）。
   armExternalEffectStartupRecovery(ready, services);
+  // トート: 前プロセスが残した「送信中」を回収してから、外部送信と刻時盤を動かす
+  armConfessionStartupRecovery(services);
 
   initializeVcPublicSocialPresence(ready, services);
   // 外部Discord APIへ触る復旧より先に、同期の賭場安全確認を必ず完了させる。

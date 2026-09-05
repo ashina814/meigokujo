@@ -33,10 +33,21 @@ function asJson(value: unknown): any {
   return value;
 }
 
+/**
+ * 利用者向けの文面だけ、返信元を冥教会へ統一する。
+ *
+ * base の文言が変わったらここも足す——**base と overlay で言葉がズレると、
+ * 同じ機能が案内と DM で別の相手を名乗ることになる。**
+ */
 function replaceReplyOrigin(text: string): string {
   return text
     .replaceAll("運営から返信がある場合は", "冥教会から返信がある場合は")
     .replaceAll("運営から返信があれば", "冥教会から返信があれば")
+    .replaceAll("運営からの回答をお待ちください", "冥教会からの回答をお待ちください")
+    .replaceAll("必要に応じて運営からお返事します", "必要に応じて冥教会からお返事します")
+    .replaceAll("運営が確認しだい", "冥教会が確認しだい")
+    .replaceAll("必要があれば、運営から", "必要があれば、冥教会から")
+    .replaceAll("運営からの回答は必要", "冥教会からの回答は必要")
     .replaceAll("— 運営より", "— 冥教会より");
 }
 
@@ -154,7 +165,7 @@ async function rewriteSelectionReply(
       ...json,
       components: (json.components ?? []).map((component) =>
         component.custom_id === "mimi:selwish"
-          ? { ...component, placeholder: "② 冥教会からの返信を希望する？" }
+          ? { ...component, placeholder: "② この内容について、冥教会からの回答は必要？" }
           : component,
       ),
     };

@@ -34,6 +34,7 @@ import {
   getRoleIds,
   roleMention,
 } from "../church-roles.js";
+import { awaitConfessionReady } from "../confession-startup.js";
 import type { Services } from "../services.js";
 import {
   CONFESSION_SENDER_REPLY_DEADLINE_DAYS,
@@ -41,6 +42,7 @@ import {
   confessionBall,
   type AckState,
   type DeliveryOutcome,
+  type FollowUpTriage,
   type ConfessionRow,
   type ConfessionStage,
   type ConfessionType,
@@ -402,7 +404,12 @@ function bodyOrPurgeNotice(row: ConfessionRow): string {
 function buildCaseEmbed(
   row: ConfessionRow,
   assigneeIds: string[],
-  extras: { hasOpenEmergency?: boolean; ackState?: AckState; unrelayedFollowUps?: number } = {},
+  extras: {
+    hasOpenEmergency?: boolean;
+    ackState?: AckState;
+    followUps?: FollowUpTriage;
+    unresolvedDrafts?: number;
+  } = {},
 ): EmbedBuilder {
   const color =
     row.type === "kinkyu" || extras.hasOpenEmergency
@@ -431,11 +438,25 @@ function buildCaseEmbed(
     unknown: "❓ 送信結果を確認できず",
   };
   embed.addFields({ name: "受領確認", value: ackValue[extras.ackState ?? "none"], inline: true });
-  if (extras.unrelayedFollowUps && extras.unrelayedFollowUps > 0) {
+  const triage = extras.followUps;
+  if (triage && triage.total > 0) {
+    // **箱を分ける。** 「まだ順番が来ていない」「自動で拾い直す」「人が決めるしかない」を
+    // 同じ「未引き渡し」に混ぜると、何をすればよいのか誰にも分からない。
+    const lines = [
+      triage.notReady > 0 ? `・${triage.notReady}件 … 対応スレッドが無いため保留中（担当を開始すると届きます）` : "",
+      triage.pending > 0 ? `・${triage.pending}件 … これから渡します` : "",
+      triage.sending > 0 ? `・${triage.sending}件 … 送信中` : "",
+      triage.failed > 0 ? `・${triage.failed}件 … 渡せず。トートが自動で拾い直します` : "",
+      triage.unknown > 0 ? `・**${triage.unknown}件 … 渡せたか不明。担当者の判断が要ります**` : "",
+      triage.exhausted > 0 ? `・**${triage.exhausted}件 … 自動再試行の上限に達しました。担当者の判断が要ります**` : "",
+    ].filter(Boolean);
+    embed.addFields({ name: `未引き渡しの追記（${triage.total}件）`, value: lines.join("\n"), inline: false });
+  }
+  if (extras.unresolvedDrafts && extras.unresolvedDrafts > 0) {
     embed.addFields({
-      name: "未引き渡しの追記",
-      value: `⚠️ ${extras.unrelayedFollowUps}件。投稿者からは受け取れていますが、このスレッドへ渡せていません。`,
-      inline: true,
+      name: "未確定の返信",
+      value: `❓ ${extras.unresolvedDrafts}件。届いたか確認できていません。必要なら 💬 返信する からやり直してください。`,
+      inline: false,
     });
   }
   if (extras.hasOpenEmergency) {
@@ -482,6 +503,7 @@ function managementControls(
   id: number,
   row: ConfessionRow,
   ackState: AckState = row.acknowledged_at ? "delivered" : "none",
+  followUps?: FollowUpTriage,
 ): ActionRowBuilder<ButtonBuilder>[] {
   if (row.status === "closed") {
     // クローズ済み案件: 再オープン中心。本文が残っていれば管理者用の保持延長・削除を並置。
@@ -544,6 +566,18 @@ function managementControls(
   const row3 = new ActionRowBuilder<ButtonBuilder>().addComponents(
     new ButtonBuilder().setCustomId(`mimi:admin:${id}`).setLabel("補助操作").setEmoji("🛠️").setStyle(ButtonStyle.Secondary),
   );
+  // 人が決めるしかない追記（渡せたか不明 / 自動の上限に達した）があるときだけ出す出口。
+  // これが無いと、unknown が永久に「未引き渡し」として残り続ける。
+  const needsDecision = (followUps?.unknown ?? 0) + (followUps?.exhausted ?? 0);
+  if (needsDecision > 0) {
+    row3.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`mimi:followup:${id}`)
+        .setLabel(`未確定の追記 ${needsDecision}件`)
+        .setEmoji("📬")
+        .setStyle(ButtonStyle.Danger),
+    );
+  }
   return [row1, row2, row3];
 }
 
@@ -562,10 +596,11 @@ async function refreshPanel(client: Client, services: Services, id: number): Pro
         buildCaseEmbed(row, services.confessions.assignees(id), {
           hasOpenEmergency: !!services.confessions.openEmergencyFor(id),
           ackState,
-          unrelayedFollowUps: services.confessions.listUnrelayedFollowUps(id).length,
+          followUps: services.confessions.followUpTriage(id),
+          unresolvedDrafts: services.confessions.listUnresolvedReplyDrafts(id).length,
         }),
       ],
-      components: managementControls(id, row, ackState),
+      components: managementControls(id, row, ackState, services.confessions.followUpTriage(id)),
     })
     .catch(() => undefined);
 }
@@ -702,8 +737,11 @@ function senderControls(id: number): ActionRowBuilder<ButtonBuilder>[] {
 type SenderNotice =
   | { kind: "received"; wish: string | null }
   | { kind: "acknowledged"; wish: string | null }
+  /** 遷移が確定する前に届ける中立な1通（本文だけ・操作も期限も書かない） */
+  | { kind: "reply_pending"; body: string }
   | { kind: "reply"; body: string; waiting: boolean; deadlineAt: number | null }
   | { kind: "closed_by_staff"; body: string }
+  | { kind: "reply_after_close"; body: string; closedBySender: boolean }
   | { kind: "closed_by_sender" }
   | { kind: "closed_by_timeout" };
 
@@ -715,6 +753,8 @@ type SenderNotice =
  */
 function senderDm(id: number, notice: SenderNotice): MessageCreateOptions {
   const embed = new EmbedBuilder().setColor(PANEL_COLOR).setAuthor({ name: `${SENDER_TITLE} #${id}` });
+  // 操作を出してよいのは、やり取りが確かに開いているときだけ。
+  // `reply_pending` は「まだ分からない」ので、開いているようにも閉じているようにも見せない。
   const open = notice.kind === "received" || notice.kind === "acknowledged" || notice.kind === "reply";
 
   switch (notice.kind) {
@@ -741,6 +781,12 @@ function senderDm(id: number, notice: SenderNotice): MessageCreateOptions {
         [`**${ackText(notice.wish)}**`, "", "追記も、やり取りの終了も、引き続きあなたから行えます。"].join("\n"),
       );
       break;
+    case "reply_pending":
+      // **まだ成立していない state を書かない。** 送っている最中に投稿者が終了したり
+      // 期限が来たりすると、DB は closed なのにこの DM だけが「7日後に終了します」と
+      // 言い続けることになる。だから最初は本文だけを届け、遷移が確定してから編集する。
+      embed.setDescription(notice.body.slice(0, 3500));
+      break;
     case "reply":
       embed.setDescription(notice.body.slice(0, 3500));
       embed.addFields({
@@ -762,6 +808,21 @@ function senderDm(id: number, notice: SenderNotice): MessageCreateOptions {
       embed.addFields({
         name: "​",
         value: "**このやり取りはここで終了しました。**\nまた伝えたいことがあれば、新しくトートへ送れます。",
+      });
+      break;
+    case "reply_after_close":
+      // 送っている間に会話が終わっていた場合。届いた本文は見せるが、
+      // 「開いている」ように見える案内は付けない。
+      embed.setDescription(notice.body.slice(0, 3500));
+      embed.addFields({
+        name: "​",
+        value: [
+          "**この返信は届きましたが、このやり取りは既に終了しています。**",
+          notice.closedBySender
+            ? "あなたが終了を選んだためです。"
+            : "返答の期限が過ぎたためです。",
+          "続きがある場合は、新しくトートへ送れます。",
+        ].join("\n"),
       });
       break;
     case "closed_by_sender":
@@ -799,6 +860,8 @@ async function sendSenderDm(
   userId: string,
   message: MessageCreateOptions,
 ): Promise<DeliveryOutcome> {
+  // 前プロセスの置き土産を回収し終えるまで、新しい外部送信を始めない
+  await awaitConfessionReady();
   const user = await client.users.fetch(userId).catch((error: unknown) => {
     // 「そんなユーザーはいない」は確定応答、接続の問題は不明。
     throw Object.assign(new Error("fetch failed"), { code: (error as { code?: unknown })?.code });
@@ -812,12 +875,52 @@ async function sendSenderDm(
   }
 }
 
+/**
+ * 投稿者へ1通届け、**あとで編集できるようにメッセージも返す**。
+ * 遷移が確定してから最終形へ書き換えるために使う。
+ */
+async function sendSenderDmMessage(
+  client: Client,
+  userId: string,
+  message: MessageCreateOptions,
+): Promise<{ outcome: DeliveryOutcome; sent: { edit: (o: MessageCreateOptions) => Promise<unknown> } | null }> {
+  await awaitConfessionReady();
+  let user;
+  try {
+    user = await client.users.fetch(userId);
+  } catch (error) {
+    return { outcome: classifyDeliveryError(error), sent: null };
+  }
+  try {
+    const sent = (await user.send(message)) as unknown as { edit: (o: MessageCreateOptions) => Promise<unknown> };
+    return { outcome: "delivered", sent };
+  } catch (error) {
+    return { outcome: classifyDeliveryError(error), sent: null };
+  }
+}
+
+/** 届いた1通を最終形へ書き換える。編集の結末も3値のまま（雑に真偽値化しない）。 */
+async function editSenderDm(
+  sent: { edit: (o: MessageCreateOptions) => Promise<unknown> } | null,
+  message: MessageCreateOptions,
+): Promise<DeliveryOutcome> {
+  if (!sent) return "failed";
+  try {
+    await sent.edit(message);
+    return "delivered";
+  } catch (error) {
+    return classifyDeliveryError(error);
+  }
+}
+
 /** 運営スレッドへ1通届ける。こちらも結末を3値で返す。 */
 async function sendThreadMessage(
   client: Client,
   threadId: string | null,
   message: MessageCreateOptions,
 ): Promise<DeliveryOutcome> {
+  await awaitConfessionReady();
+  // 宛先が無いのは配送の失敗ではない。ここへ来る前に呼び出し側が弾く。
   if (!threadId) return "failed";
   try {
     const thread = await client.channels.fetch(threadId);
@@ -1080,18 +1183,19 @@ async function commitStaffReply(
 
   const id = claim.row.id;
   const closing = intent === "close";
-  const deadlineAt = closing ? null : Confessions.senderReplyDeadlineFrom(Math.floor(Date.now() / 1000));
   const body = claim.draft.body ?? "";
-  const outcome = await sendSenderDm(
+
+  // **まだ成立していない結末を先に書かない。** 最初に届けるのは本文だけの中立な1通で、
+  // 「7日後に自動終了します」も「終了しました」も、その時点では嘘になりうる
+  // （送っている最中に投稿者が終えたり、期限が来たりする）。
+  const { outcome, sent } = await sendSenderDmMessage(
     interaction.client,
     claim.row.user_id,
-    closing
-      ? senderDm(id, { kind: "closed_by_staff", body })
-      : senderDm(id, { kind: "reply", body, waiting: true, deadlineAt }),
+    senderDm(id, { kind: "reply_pending", body }),
   );
-  services.confessions.finishReplyDraft(draftId, outcome);
 
   if (outcome !== "delivered") {
+    services.confessions.finishReplyDraft(draftId, outcome);
     // 届いたか分からないものを「返信した」ことにしない。状態は動かさず、担当者へ返す。
     await threadLog(
       interaction.client,
@@ -1111,13 +1215,26 @@ async function commitStaffReply(
     return;
   }
 
-  // ここから先は「届いた」あと。送信中に投稿者が終えていたら、その終了が正本。
-  const settled = closing
-    ? services.confessions.close(id, interaction.user.id, "resolved", retentionDaysFor(services, claim.row), "staff")
-    : services.confessions.applyStaffReplyWaiting(id, interaction.user.id);
+  // 届いた事実・本文の消去・会話の遷移を**1つのトランザクション**で確定する。
+  // 遷移に負けても「DM は届いた」という事実は失わない。
+  const finalized = services.confessions.finalizeStaffReply({
+    draftId,
+    intent,
+    staffId: interaction.user.id,
+    retentionDays: retentionDaysFor(services, claim.row),
+  });
+  const after = finalized.row;
 
-  if (!settled.ok) {
-    const after = services.confessions.get(id);
+  // 確定した内容へ、届いた1通を書き換える。ここで初めて期限や操作を見せてよい。
+  const finalDm: SenderNotice =
+    finalized.transition === "waiting"
+      ? { kind: "reply", body, waiting: true, deadlineAt: finalized.deadlineAt }
+      : finalized.transition === "closed"
+        ? { kind: "closed_by_staff", body }
+        : { kind: "reply_after_close", body, closedBySender: after?.closed_side === "sender" };
+  const editOutcome = await editSenderDm(sent, senderDm(id, finalDm));
+
+  if (finalized.transition === "lost") {
     await threadLog(
       interaction.client,
       services,
@@ -1135,15 +1252,13 @@ async function commitStaffReply(
           : after?.closed_side === "timeout"
             ? "返答期限が過ぎて自動終了しています。その終了を維持しました。"
             : "先に成立していた終了を維持しました。",
+        editOutcome === "delivered"
+          ? "投稿者側の表示も「終了しています」へ直しました。"
+          : "※ 投稿者側の表示は書き換えられませんでした（本文だけが届いています）。",
         "続ける必要がある場合は 🔓 再オープン を使ってください。",
       ].join("\n"),
     });
     return;
-  }
-
-  if (closing) {
-    const openEmg = services.confessions.openEmergencyFor(id);
-    if (openEmg) services.confessions.closeEmergency(openEmg.id, interaction.user.id);
   }
 
   await threadLog(
@@ -1152,21 +1267,45 @@ async function commitStaffReply(
     id,
     closing
       ? `✅ <@${interaction.user.id}> が返信を届けたうえで、このやり取りを終了しました。`
-      : `💬 <@${interaction.user.id}> が返信を届け、投稿者の返答を待っています（<t:${deadlineAt}:R> に自動終了）。`,
+      : `💬 <@${interaction.user.id}> が返信を届け、投稿者の返答を待っています（<t:${finalized.deadlineAt}:R> に自動終了）。`,
   );
   await refreshPanel(interaction.client, services, id);
   await interaction.editReply({
-    content: closing
-      ? "✅ 返信を届けて、このやり取りを終了しました。"
-      : `💬 返信を届けました。投稿者の返答待ちです（返答が無ければ <t:${deadlineAt}:R> に自動終了）。`,
+    content: [
+      closing
+        ? "✅ 返信を届けて、このやり取りを終了しました。"
+        : `💬 返信を届けました。投稿者の返答待ちです（返答が無ければ <t:${finalized.deadlineAt}:R> に自動終了）。`,
+      editOutcome === "delivered"
+        ? ""
+        : "※ 投稿者側の表示に、期限や操作を書き足せませんでした（本文は届いています）。",
+    ]
+      .filter(Boolean)
+      .join("\n"),
   });
 
-  if (closing) {
-    const thread = claim.row.thread_id
-      ? await interaction.client.channels.fetch(claim.row.thread_id).catch(() => null)
-      : null;
-    if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
+  if (closing) await archiveIfSettled(interaction.client, services, id);
+}
+
+/**
+ * 終了した会話のスレッドを畳む。**ただし緊急対応が open のときは畳まない。**
+ *
+ * 会話が終わったことと、緊急の安全対応が終わったことは別。アーカイブすると
+ * 運営の目に触れなくなるので、未解決の緊急を抱えた案件は開いたままにしておく。
+ */
+async function archiveIfSettled(client: Client, services: Services, id: number): Promise<void> {
+  const row = services.confessions.get(id);
+  if (!row?.thread_id) return;
+  if (services.confessions.openEmergencyFor(id)) {
+    await threadLog(
+      client,
+      services,
+      id,
+      "🚨 このやり取りは終了しましたが、**緊急対応が未解決のため**スレッドは開いたままにしています。緊急対応の終了は担当者が判断してください。",
+    );
+    return;
   }
+  const thread = await client.channels.fetch(row.thread_id).catch(() => null);
+  if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
 }
 
 // ── ✏️ 投稿者の追記 ────────────────────────────────────
@@ -1219,6 +1358,30 @@ async function submitSenderFollowUp(
     return;
   }
 
+  // **担当者がまだ「対応する」を押していない案件は、配送の失敗ではない。**
+  // 宛先（対応スレッド）が存在しないだけで、送ろうとしてもいない。ここを failed に
+  // すると刻時盤が毎分試行回数を焼き、担当者が対応を始める前に上限へ達してしまう。
+  // 本文は預かったまま `pending` で待ち、スレッドができたら初めて渡す。
+  if (!row.thread_id) {
+    await refreshPanel(interaction.client, services, id);
+    await interaction.editReply({
+      content: [
+        "✏️ **あなたの追記を預かりました。**",
+        "この件はまだ担当者が対応を始めていません。担当者がついた時点で、最初の相談と一緒に届きます。",
+        "",
+        "内容は失われていません。自動終了の予定も解除されています。",
+      ].join("\n"),
+    });
+    return;
+  }
+
+  // 送る前に所有権を取る（試行回数が増えるのはここだけ）
+  const claimed = services.confessions.claimFollowUpRelay(accepted.followUpId);
+  if (!claimed) {
+    await refreshPanel(interaction.client, services, id);
+    await interaction.editReply({ content: "✏️ あなたの追記を預かりました。運営へは順次お渡しします。" });
+    return;
+  }
   const outcome = await sendThreadMessage(interaction.client, row.thread_id, followUpRelayMessage(text));
   services.confessions.settleFollowUpRelay(accepted.followUpId, outcome);
   await refreshPanel(interaction.client, services, id);
@@ -1241,16 +1404,133 @@ async function submitSenderFollowUp(
 }
 
 /**
+ * 人が決めるしかない追記（渡せたか不明 / 自動の上限に達した）の一覧。
+ *
+ * **本文はここでは出さない。** 出すのは運営専用スレッドの中だけで、しかも
+ * 担当者が明示的に選んだときに限る。EventLog へも複製しない。
+ */
+function followUpDecisionMsg(id: number, services: Services) {
+  const items = services.confessions.listFollowUpsNeedingDecision(id);
+  if (items.length === 0) {
+    return { content: "📬 判断が必要な追記はありません。", components: [] };
+  }
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`mimi:followupsel:${id}`)
+    .setPlaceholder("どの追記をどうするか選ぶ")
+    .addOptions(
+      items.slice(0, 25).map((f) =>
+        new StringSelectMenuOptionBuilder()
+          .setValue(String(f.id))
+          .setLabel(
+            f.outcome === "unknown"
+              ? `#${f.id} 渡せたか不明（${jstStamp(f.created_at).replace(/[<>]/g, "")}）`.slice(0, 100)
+              : `#${f.id} 自動再試行の上限に達しました`.slice(0, 100),
+          )
+          .setEmoji(f.outcome === "unknown" ? "❓" : "🚧"),
+      ),
+    );
+  return {
+    content: [
+      "📬 **判断が必要な追記**",
+      "",
+      "・**もう一度渡す** … 既にこのスレッドへ届いている可能性があります（重複しても構わない場合）",
+      "・**対応済みにする** … 届いたことにはせず、この追記の追跡だけを終えます",
+      "",
+      "どちらも投稿者へは通知しません。",
+    ].join("\n"),
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
+  };
+}
+
+function followUpActionMsg(id: number, followUpId: number, unknownOutcome: boolean) {
+  return {
+    content: unknownOutcome
+      ? [
+          `❓ **追記 #${followUpId} は、運営へ渡せたか確認できていません。**`,
+          "既にこのスレッドへ届いている可能性があります（届いていない可能性もあります）。",
+          "もう一度渡すと、同じ内容が二重に並ぶことがあります。それでも渡しますか？",
+        ].join("\n")
+      : [
+          `🚧 **追記 #${followUpId} は自動再試行の上限に達しました。**`,
+          "手動でもう一度渡すか、これ以上追わないと決めることができます。",
+        ].join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mimi:followupretry:${followUpId}:${id}`)
+          .setLabel("重複を承知でもう一度渡す")
+          .setEmoji("📬")
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(`mimi:followupdone:${followUpId}:${id}`)
+          .setLabel("対応済みにする")
+          .setEmoji("✔️")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+/** 手動の再送。担当者が重複の可能性を承知したうえでのみ通る */
+async function manualFollowUpRetry(
+  interaction: ButtonInteraction,
+  services: Services,
+  id: number,
+  followUpId: number,
+): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const claimed = services.confessions.claimFollowUpManualRetry(followUpId);
+  if (!claimed?.body) {
+    await interaction.editReply({ content: "この追記は既に処理されています。" });
+    return;
+  }
+  const row = services.confessions.get(id);
+  const outcome = await sendThreadMessage(interaction.client, row?.thread_id ?? null, followUpRelayMessage(claimed.body));
+  services.confessions.settleFollowUpRelay(followUpId, outcome);
+  await refreshPanel(interaction.client, services, id);
+  await interaction.editReply({
+    content:
+      outcome === "delivered"
+        ? "📬 このスレッドへ渡しました。"
+        : outcome === "failed"
+          ? "⚠️ 渡せませんでした。もう一度試せます。"
+          : "❓ 渡せたか確認できませんでした。状態は「不明」のままです。",
+  });
+}
+
+/** これ以上追わないと決める出口。届いたことにはしない */
+async function resolveFollowUp(
+  interaction: ButtonInteraction,
+  services: Services,
+  id: number,
+  followUpId: number,
+): Promise<void> {
+  services.confessions.resolveFollowUpManually(followUpId, interaction.user.id);
+  await threadLog(
+    interaction.client,
+    services,
+    id,
+    `✔️ <@${interaction.user.id}> が未確定の追記 #${followUpId} を「対応済み」として閉じました（届いたことにはしていません）。`,
+  );
+  await refreshPanel(interaction.client, services, id);
+  await interaction.reply({
+    content: "✔️ 対応済みにしました（届いたことにはしていません）。",
+    flags: MessageFlags.Ephemeral,
+  });
+}
+
+/**
  * 明確に失敗した追記だけを、刻時盤から拾い直して運営へ渡す。
  *
  * `unknown`（送れたか分からない）は入れない——届いている可能性のある本文を
  * 勝手にもう一度送ると、匿名の相談が二重に運営へ流れる。
  */
 export async function retryPendingFollowUps(client: Client, services: Services): Promise<number> {
-  const pending = services.confessions.listRetryableFollowUps();
+  await awaitConfessionReady();
+  const pending = services.confessions.listRelayableFollowUps();
   let relayed = 0;
   for (const item of pending) {
-    const claimed = services.confessions.claimFollowUpRetry(item.id);
+    const claimed = services.confessions.claimFollowUpRelay(item.id);
     if (!claimed?.body) continue;
     const row = services.confessions.get(claimed.confession_id);
     const outcome = await sendThreadMessage(client, row?.thread_id ?? null, followUpRelayMessage(claimed.body));
@@ -1313,9 +1593,11 @@ async function applySenderClose(interaction: ButtonInteraction, services: Servic
     });
     return;
   }
-  const openEmg = services.confessions.openEmergencyFor(id);
-  if (openEmg) services.confessions.closeEmergency(openEmg.id, "system:sender_close");
-
+  // **緊急対応には触らない。**
+  // 「もう大丈夫です」は会話を終える権限であって、「緊急の安全対応は完了した」と
+  // 言える権限ではない。既存契約でも緊急の終了は担当者が明示的に行うもの
+  // （`closeEmergency` は staffId を取る人間の操作）で、その権限を投稿者へ
+  // 自動で広げてよい根拠は無い。
   await sendSenderDm(interaction.client, result.row.user_id, senderDm(id, { kind: "closed_by_sender" }));
   await threadLog(
     interaction.client,
@@ -1325,9 +1607,7 @@ async function applySenderClose(interaction: ButtonInteraction, services: Servic
   );
   await refreshPanel(interaction.client, services, id);
   await interaction.editReply({ content: "✅ このやり取りを終了しました。話してくれてありがとう。" });
-
-  const thread = result.row.thread_id ? await interaction.client.channels.fetch(result.row.thread_id).catch(() => null) : null;
-  if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
+  await archiveIfSettled(interaction.client, services, id);
 }
 
 // ── ⌛ 期限切れの自動終了（刻時盤から呼ぶ）──────────────
@@ -1342,6 +1622,7 @@ export async function closeExpiredSenderWaits(
   services: Services,
   atTs: number = Math.floor(Date.now() / 1000),
 ): Promise<number> {
+  await awaitConfessionReady();
   const due = services.confessions.listDueSenderTimeouts(atTs);
   let closed = 0;
   for (const row of due) {
@@ -1350,8 +1631,7 @@ export async function closeExpiredSenderWaits(
     const result = services.confessions.autoCloseExpiredAtomic(row.id, deadline, retentionDaysFor(services, row));
     if (!result.ok) continue;
     closed += 1;
-    const openEmg = services.confessions.openEmergencyFor(row.id);
-    if (openEmg) services.confessions.closeEmergency(openEmg.id, "system:scheduler");
+    // 期限切れも同じ。会話の終端と緊急対応の運用は別のライフサイクル。
     await sendSenderDm(client, result.row.user_id, senderDm(row.id, { kind: "closed_by_timeout" }));
     await threadLog(
       client,
@@ -1360,8 +1640,7 @@ export async function closeExpiredSenderWaits(
       `⌛ 返答が無いまま期限を過ぎたため、このやり取りを自動で終了しました（履歴は残ります）。`,
     );
     await refreshPanel(client, services, row.id);
-    const thread = result.row.thread_id ? await client.channels.fetch(result.row.thread_id).catch(() => null) : null;
-    if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
+    await archiveIfSettled(client, services, row.id);
   }
   return closed;
 }
@@ -1481,6 +1760,31 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
     case "hold":
       await opGuarded(() => holdCase(interaction, services, id));
       return;
+    // 人が決めるしかない追記の出口（unknown / 自動の上限に達したもの）
+    case "followup":
+      await opGuarded(() => interaction.reply({ ...followUpDecisionMsg(id, services), flags: MessageFlags.Ephemeral }));
+      return;
+    case "followupretry": {
+      // mimi:followupretry:<followUpId>:<caseId>（案件IDを末尾に置く既存の並びに合わせる）
+      const [, , fuS, caseS] = interaction.customId.split(":");
+      const cid = Number(caseS);
+      if (!canOperate(interaction, services, cid)) {
+        await interaction.reply({ content: "担当者または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await manualFollowUpRetry(interaction, services, cid, Number(fuS));
+      return;
+    }
+    case "followupdone": {
+      const [, , fuS, caseS] = interaction.customId.split(":");
+      const cid = Number(caseS);
+      if (!canOperate(interaction, services, cid)) {
+        await interaction.reply({ content: "担当者または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await resolveFollowUp(interaction, services, cid, Number(fuS));
+      return;
+    }
     // 預かった返信の送信。idStr は案件ではなく下書きID（権限は下書きから案件を引いて確認する）
     case "replywait":
       await commitStaffReply(interaction, services, Number(idStr), "wait");
@@ -1687,6 +1991,18 @@ export async function handleConfessionStringSelect(
     return;
   }
 
+  // ── 未確定の追記をどうするか（§B4）──
+  if (action === "followupsel") {
+    if (!canOperate(interaction, services, id)) {
+      await interaction.update({ content: "担当者または管理者のみ操作できます。", components: [] });
+      return;
+    }
+    const followUpId = Number(interaction.values[0]);
+    const target = services.confessions.getFollowUp(followUpId);
+    await interaction.update(followUpActionMsg(id, followUpId, target?.outcome === "unknown"));
+    return;
+  }
+
   // ── クローズ理由の確定（§Phase2-4） ──
   if (action === "closeset") {
     if (!canOperate(interaction, services, id)) {
@@ -1827,12 +2143,19 @@ export async function handleConfessionModal(interaction: ModalSubmitInteraction,
 
     // **投稿者にも手元の窓口を渡す。** これが無いと、届いたのか・何を待てばいいのか・
     // どうやって終えればいいのかが本人からは一切見えない。
+    // **`DeliveryOutcome` を真偽値として読まない。** "failed" も "unknown" も
+    // 非空文字列なので truthy になり、届いていない DM を「送りました」と
+    // 言ってしまう。3つの結末それぞれに、正しいことだけを書く。
     const handed = await sendSenderDm(interaction.client, uid, senderDm(row.id, { kind: "received", wish: row.reply_wish }));
-    await interaction.editReply({
-      content: handed
-        ? "🕯 あなたの声は、トートの耳に届いた。DM に受付の控えを送ったので、追記も終了もそこから行える。"
-        : "🕯 あなたの声は、トートの耳に届いた。（DM を送れなかったため、追記・終了のボタンは届いていない。DM を開けておくと使える）",
-    });
+    const receiptCopy: Record<DeliveryOutcome, string> = {
+      delivered:
+        "🕯 あなたの声は、トートの耳に届いた。DM に受付の控えを送ったので、追記も終了もそこから行える。",
+      failed:
+        "🕯 あなたの声は、トートの耳に届いた。ただし **DM を届けられなかった**（追記・終了のボタンも届いていない）。DM を開けておくと、次から受け取れる。",
+      unknown:
+        "🕯 あなたの声は、トートの耳に届いた。ただし **DM が届いたかは確認できなかった**。DM が来ていれば、そこから追記・終了ができる。",
+    };
+    await interaction.editReply({ content: receiptCopy[handed] });
     return;
   }
 
@@ -1970,10 +2293,11 @@ async function claimConfession(interaction: ButtonInteraction, services: Service
       buildCaseEmbed(claimed, services.confessions.assignees(id), {
         hasOpenEmergency: !!services.confessions.openEmergencyFor(id),
         ackState: services.confessions.ackState(id),
-        unrelayedFollowUps: services.confessions.listUnrelayedFollowUps(id).length,
+        followUps: services.confessions.followUpTriage(id),
+        unresolvedDrafts: services.confessions.listUnresolvedReplyDrafts(id).length,
       }),
     ],
-    components: managementControls(id, claimed, services.confessions.ackState(id)),
+    components: managementControls(id, claimed, services.confessions.ackState(id), services.confessions.followUpTriage(id)),
   });
   services.confessions.setPanelMsg(id, panel.id);
 
