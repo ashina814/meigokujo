@@ -146,6 +146,36 @@ describe("受領確認は回答でも終了でもなく、届いたときだけ�
     expect(confessions.get(row.id)!.acknowledged_by).toBe("staff-1");
   });
 
+  /**
+   * **決着の途中で落ちても、片方だけ書かれた状態を残さない。**
+   *
+   * ここが分割されていると「試行は delivered なのに acknowledged_at は NULL」が生まれ、
+   * `ackState` が none へ落ちて**届いている DM をもう一通送れてしまう**。
+   * プロセスを本当に殺すことはできないので、決着の途中で確実に失敗する箇所
+   * （監査記録の書き込み）を壊して同じ境界を作る。
+   */
+  it("決着の途中で失敗したら、試行も案件側も書かれない", () => {
+    const row = seed("yes");
+    const begun = confessions.beginAcknowledgement(row.id, "staff-1") as { ok: true; attemptId: number };
+    expect(begun.ok).toBe(true);
+
+    const events = new EventLog(db);
+    const broken = new Confessions(db, events);
+    const original = events.log.bind(events);
+    events.log = ((type: string, opts: unknown) => {
+      if (type === "confession_acknowledge") throw new Error("監査記録の書き込みに失敗");
+      return original(type, opts as never);
+    }) as typeof events.log;
+
+    expect(() => broken.settleAcknowledgement(begun.attemptId, "delivered", "staff-1")).toThrow();
+
+    // 片方だけ進んだ状態が残っていない
+    expect(confessions.get(row.id)!.acknowledged_at).toBeNull();
+    expect(confessions.lastAckAttempt(row.id)!.outcome).toBeNull();
+    // したがって「送信中」のまま＝二重送信の窓が開かない
+    expect(confessions.ackState(row.id)).toBe("in_flight");
+  });
+
   it("終了済みの案件へは受領確認を始められない", () => {
     const row = seed("no");
     confessions.close(row.id, "staff-1", "resolved");
