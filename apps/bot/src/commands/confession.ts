@@ -33,10 +33,21 @@ function asJson(value: unknown): any {
   return value;
 }
 
+/**
+ * 利用者向けの文面だけ、返信元を冥教会へ統一する。
+ *
+ * base の文言が変わったらここも足す——**base と overlay で言葉がズレると、
+ * 同じ機能が案内と DM で別の相手を名乗ることになる。**
+ */
 function replaceReplyOrigin(text: string): string {
   return text
     .replaceAll("運営から返信がある場合は", "冥教会から返信がある場合は")
     .replaceAll("運営から返信があれば", "冥教会から返信があれば")
+    .replaceAll("運営からの回答をお待ちください", "冥教会からの回答をお待ちください")
+    .replaceAll("必要に応じて運営からお返事します", "必要に応じて冥教会からお返事します")
+    .replaceAll("運営が確認しだい", "冥教会が確認しだい")
+    .replaceAll("必要があれば、運営から", "必要があれば、冥教会から")
+    .replaceAll("運営からの回答は必要", "冥教会からの回答は必要")
     .replaceAll("— 運営より", "— 冥教会より");
 }
 
@@ -59,18 +70,8 @@ function confessionId(customId: string): number | null {
   return null;
 }
 
-function caseStatusText(row: ConfessionRow): string {
-  if (row.status === "open") return "🕯️ 未対応";
-  if (row.status === "closed") return "✅ 終結";
-  switch (row.stage) {
-    case "awaiting_poster":
-      return "⏳ 投稿者からの返信待ち";
-    case "awaiting_staff":
-      return "📥 担当者からの返信待ち";
-    default:
-      return "🤝 対応中";
-  }
-}
+/** 状態表示は base の正本を使う（期限付きの投稿者待ち・運営側の確認待ちをこちらで二重定義しない） */
+const caseStatusText = base.statusText;
 
 function canOperate(interaction: ButtonInteraction, services: Services, row: ConfessionRow): boolean {
   if (isAdmin(interaction, services)) return true;
@@ -146,18 +147,8 @@ async function syncCasePanel(client: Client, services: Services, id: number): Pr
     };
   });
 
-  if (row.reply_wish === "no") {
-    const button = new ButtonBuilder()
-      .setCustomId(`mimi:voice_received:${id}`)
-      .setLabel(VOICE_RECEIVED_LABEL)
-      .setEmoji("🕯️")
-      .setStyle(ButtonStyle.Success)
-      .toJSON();
-    const closeRow = rows.find((actionRow) =>
-      (actionRow.components ?? []).some((component) => component.custom_id === `mimi:close:${id}`),
-    );
-    if (closeRow && (closeRow.components?.length ?? 0) < 5) closeRow.components?.splice(-1, 0, button);
-  }
+  // 受領確認は base の 📨 ボタンが全案件へ常設する。
+  // ここでは古いパネルに残っている voice_received ボタンを取り除くだけ。
 
   await message.edit({ embeds, components: rows as any }).catch(() => undefined);
 }
@@ -174,7 +165,7 @@ async function rewriteSelectionReply(
       ...json,
       components: (json.components ?? []).map((component) =>
         component.custom_id === "mimi:selwish"
-          ? { ...component, placeholder: "② 冥教会からの返信を希望する？" }
+          ? { ...component, placeholder: "② この内容について、冥教会からの回答は必要？" }
           : component,
       ),
     };
@@ -190,108 +181,12 @@ async function rewriteAcknowledgement(interaction: ModalSubmitInteraction): Prom
   if (content !== message.content) await interaction.editReply({ content }).catch(() => undefined);
 }
 
-export async function closeAsVoiceReceived(
-  interaction: ButtonInteraction,
-  services: Services,
-  id: number,
-): Promise<void> {
-  const row = services.confessions.get(id);
-  if (!row) {
-    await interaction.reply({ content: "この件が見つかりません。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (!canOperate(interaction, services, row)) {
-    await interaction.reply({ content: "この案件の担当者、または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (row.status === "closed") {
-    await interaction.reply({ content: "この件は既に閉じられています。", flags: MessageFlags.Ephemeral });
-    return;
-  }
-  if (row.reply_wish !== "no") {
-    await interaction.reply({
-      content: "「あなたの声は届きました」は、返信不要を選んだ案件でのみ利用できます。",
-      flags: MessageFlags.Ephemeral,
-    });
-    return;
-  }
-
-  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-
-  const retentionDays =
-    row.court_status === "sent"
-      ? services.settings.getNumber("confession_court_retention_days")
-      : services.settings.getNumber("confession_body_retention_days");
-  const closed = services.confessions.closeVoiceReceivedAtomic(id, interaction.user.id, retentionDays);
-  if (!closed.ok) {
-    await interaction.editReply({
-      content:
-        closed.code === "already_closed"
-          ? "この件は既に閉じられています。"
-          : "「あなたの声は届きました」は、返信不要を選んだ案件でのみ利用できます。",
-    });
-    return;
-  }
-
-  const openEmergency = services.confessions.openEmergencyFor(id);
-  if (openEmergency) services.confessions.closeEmergency(openEmergency.id, interaction.user.id);
-
-  const user = await interaction.client.users.fetch(closed.row.user_id).catch(() => null);
-  const dmSent = user
-    ? await user
-        .send(
-          [
-            "# 🕯️ トートの耳",
-            "",
-            "あなたの声は、たしかに届きました。",
-            "",
-            "返信は不要とのことでしたので、この件はここでそっと閉じます。",
-            "",
-            "伝えてくれて、ありがとう。",
-          ].join("\n"),
-        )
-        .then(() => true)
-        .catch(() => false)
-    : false;
-
-  if (closed.row.thread_id) {
-    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
-    if (thread?.isThread()) {
-      await thread
-        .send({
-          content: dmSent
-            ? `🕯️ 「${VOICE_RECEIVED_LABEL}」でクローズしました。投稿者へのDM送信にも成功しました。`
-            : `⚠️ 「${VOICE_RECEIVED_LABEL}」でクローズしましたが、投稿者へDMを送れませんでした。`,
-          allowedMentions: { parse: [] },
-        })
-        .catch(() => undefined);
-    }
-  }
-
-  await syncCasePanel(interaction.client, services, id);
-  await interaction.editReply({
-    content: dmSent
-      ? `投稿者へ『${VOICE_RECEIVED_LABEL}』と伝えてクローズしました`
-      : "案件はクローズしましたが、投稿者へDMを送れませんでした",
-  });
-
-  if (closed.row.thread_id) {
-    const thread = await interaction.client.channels.fetch(closed.row.thread_id).catch(() => null);
-    if (thread?.isThread()) await thread.setArchived(true).catch(() => undefined);
-  }
-}
-
 export async function handleConfessionButton(
   interaction: ButtonInteraction,
   services: Services,
 ): Promise<void> {
   const action = interaction.customId.split(":")[1];
   const id = confessionId(interaction.customId);
-
-  if (action === "voice_received" && id !== null) {
-    await closeAsVoiceReceived(interaction, services, id);
-    return;
-  }
 
   await base.handleConfessionButton(interaction, services);
   if (action === "new") await rewriteSelectionReply(interaction);
@@ -338,41 +233,9 @@ export async function handleConfessionUserSelect(
   if (id !== null) await syncCasePanel(interaction.client, services, id);
 }
 
-/** 運営から投稿者への中継内容は維持し、利用者側の表示名だけ冥教会へ統一する。 */
-export async function relayStaffMessage(
-  client: Client,
-  services: Services,
-  message: Message,
-): Promise<void> {
-  if (message.author.bot || !message.channel.isThread()) return;
-  const row = services.confessions.byThread(message.channel.id);
-  if (!row || row.status === "closed") return;
-  const body = message.content.trim();
-  if (!body) return;
-
-  const user = await client.users.fetch(row.user_id).catch(() => null);
-  if (!user) return;
-  const sent = await user
-    .send({
-      embeds: [
-        new EmbedBuilder()
-          .setColor(0x4c1d95)
-          .setAuthor({ name: `👂 トートの耳 #${row.id} — 冥教会より` })
-          .setDescription(body.slice(0, 4000))
-          .setFooter({ text: "下のボタンから匿名のまま返信できます" }),
-      ],
-      components: [
-        new ActionRowBuilder<ButtonBuilder>().addComponents(
-          new ButtonBuilder().setCustomId(`mimi:reply:${row.id}`).setLabel("返信する").setEmoji("✍️").setStyle(ButtonStyle.Primary),
-        ),
-      ],
-    })
-    .then(() => true)
-    .catch(() => false);
-
-  await message.react(sent ? "📨" : "⚠️").catch(() => undefined);
-  if (sent && (row.stage === "active" || row.stage === "awaiting_staff" || row.stage === "awaiting_poster")) {
-    if (row.stage !== "awaiting_poster") services.confessions.setStage(row.id, "awaiting_poster", "system:relay");
-    await syncCasePanel(client, services, row.id);
-  }
-}
+/**
+ * 外部返信の経路は 💬 返信する だけ。**スレッドへ書いても投稿者へは送らない。**
+ * base 側の実装（スレッド内案内のみ）をそのまま使い、この overlay で
+ * 迂回路を作り直さない。
+ */
+export const relayStaffMessage = base.relayStaffMessage;

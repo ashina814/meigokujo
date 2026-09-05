@@ -27,6 +27,7 @@ import {
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
 import { cancelUnpaidSubAccounts, syncSubAccountRanks } from "./sub-account-jobs.js";
+import { closeExpiredSenderWaits, retryPendingFollowUps } from "./commands/confession.js";
 import { reconcileTimedAccessForClient } from "./timed-access.js";
 import {
   convergePendingNicknameChanges,
@@ -241,6 +242,17 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
       }
     }
 
+    // ── トートの耳: 返答期限の切れたやり取りを終了する ──
+    // 対象は「運営が返答を待つと明示した」案件だけ（reply_deadline_at が入っているもの）。
+    // 未対応・運営側の確認待ち・期限のない既存案件は core の抽出条件に入らない。
+    // 期限が来ていなければ SELECT が空で返るだけで、行も event も作らない。
+    await closeExpiredSenderWaits(client, services).catch((e) => console.error("[トート] 返答期限の自動終了に失敗:", e));
+
+    // ── トートの耳: 運営へ渡せていない追記を渡し直す ──
+    // 対象は**明確に失敗した**ものだけ。送れたか分からないものは入らない
+    // （届いている可能性のある匿名の相談を、勝手にもう一度流さない）。
+    await retryPendingFollowUps(client, services).catch((e) => console.error("[トート] 追記の再中継に失敗:", e));
+
     // ── トートの耳: 保存期間を過ぎた相談本文を毎日 04:00 台にpurge（メタ・操作ログは残す）──
     if (now.hour === 4) {
       const marker = `confession_purge:${now.dateStr}`;
@@ -248,7 +260,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         await runSchedulerTaskOnce(services, marker, "system:scheduler", async () => {
           const due = services.confessions.listPurgeable();
           for (const c of due) services.confessions.purgeBody(c.id, "system:scheduler", { auto: true });
-          if (due.length > 0) console.log(`[トート] 保存期間切れの相談本文 ${due.length}件 をpurgeしました`);
+          // 返信の下書き・未引き渡しの追記も、同じ保持期限で本文を落とす
+          // （相談本文の retention を迂回する保存先を作らない）
+          const conv = services.confessions.purgeExpiredConversationBodies();
+          if (due.length + conv.drafts + conv.followUps > 0) {
+            console.log(
+              `[トート] 保存期間切れの本文をpurgeしました 相談=${due.length} 返信=${conv.drafts} 追記=${conv.followUps}`,
+            );
+          }
         }).catch((e) => console.error("[トート] 本文purge失敗:", e));
       }
     }
