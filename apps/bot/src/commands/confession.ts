@@ -135,7 +135,21 @@ async function syncCasePanel(client: Client, services: Services, id: number): Pr
     : [];
 
   if (row.status === "closed") {
-    await message.edit({ embeds, components: closedControls(id, row) }).catch(() => undefined);
+    // **終了済みでも、未処理の内容への出口を消さない。**
+    // overlay が独自の縮小版ボタン列で上書きすると、投稿者が送った追記や
+    // 届いたか分からない返信へ辿り着く手段がパネルから消えてしまう。
+    await message
+      .edit({
+        embeds,
+        components: base.managementControls(
+          id,
+          row,
+          services.confessions.ackState(id),
+          services.confessions.followUpTriage(id),
+          services.confessions.listReplyDraftsNeedingDecision(id).length,
+        ),
+      })
+      .catch(() => undefined);
     return;
   }
 

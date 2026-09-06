@@ -49,11 +49,22 @@ afterEach(() => {
   }
 });
 
-function boot() {
+/**
+ * 前のプロセスが「もういない」状態を作る。
+ *
+ * 起動時回収は**鼓動が途切れた所有者の行だけ**を回収するので、単に DB を開き直しても
+ * それだけでは回収されない（生きているかもしれない相手を奪わないのが正しい）。
+ * 実際の再起動と同じく、貸出期限を過ぎさせてから見る。
+ */
+function killPreviousInstances(db: { prepare: (sql: string) => { run: (...a: unknown[]) => unknown } }, keep: string) {
+  db.prepare("UPDATE confession_instances SET heartbeat_at=0 WHERE instance_id<>?").run(keep);
+}
+
+function boot(instanceId?: string) {
   const db = openDb(dbPath);
   handles.push(db);
   const events = new EventLog(db);
-  const confessions = new Confessions(db, events);
+  const confessions = new Confessions(db, events, instanceId);
   const services = {
     db,
     events,
@@ -82,6 +93,7 @@ describe("起動時の回収は、外部送信より先に走る", () => {
     // ── ここでプロセスが消える（DBを開き直す）──
     const after = boot();
     expect(after.confessions.ackState(row.id)).toBe("in_flight");
+    killPreviousInstances(after.db, after.confessions.instance);
 
     armConfessionStartupRecovery(after.services);
     // 回収は関門の裏で走る。外部へ触る前に必ずここを通るので、テストも同じ順で待つ
@@ -141,7 +153,9 @@ describe("起動時の回収は、外部送信より先に走る", () => {
     before.confessions.claimFollowUpRelay(follow.followUpId);
 
     const after = boot();
+    killPreviousInstances(after.db, after.confessions.instance);
     armConfessionStartupRecovery(after.services);
+    await awaitConfessionReady();
 
     const posted: unknown[] = [];
     const client = {

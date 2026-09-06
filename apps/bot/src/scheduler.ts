@@ -27,7 +27,7 @@ import {
   sendChunkedLinesResumable,
 } from "./scheduler-utils.js";
 import { cancelUnpaidSubAccounts, syncSubAccountRanks } from "./sub-account-jobs.js";
-import { closeExpiredSenderWaits, retryPendingFollowUps } from "./commands/confession.js";
+import { closeExpiredSenderWaits, convergePendingRenders, retryPendingFollowUps } from "./commands/confession.js";
 import { reconcileTimedAccessForClient } from "./timed-access.js";
 import {
   convergePendingNicknameChanges,
@@ -252,6 +252,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
     // 対象は**明確に失敗した**ものだけ。送れたか分からないものは入らない
     // （届いている可能性のある匿名の相談を、勝手にもう一度流さない）。
     await retryPendingFollowUps(client, services).catch((e) => console.error("[トート] 追記の再中継に失敗:", e));
+
+    // ── トート: このプロセスが生きていることをDBへ残す ──
+    // 起動時回収は鼓動の途絶えた所有者だけを回収するので、生きているあいだは必ず打つ。
+    services.confessions.heartbeatInstance(services.confessions.instance);
+
+    // ── トート: 投稿者に見えている表示を、確定した結末へ収束させる ──
+    // 編集の前に落ちた分をここで拾う。新しい DM は送らず、同じメッセージを直すだけ。
+    await convergePendingRenders(client, services).catch((e) => console.error("[トート] 表示の収束に失敗:", e));
 
     // ── トートの耳: 保存期間を過ぎた相談本文を毎日 04:00 台にpurge（メタ・操作ログは残す）──
     if (now.hour === 4) {

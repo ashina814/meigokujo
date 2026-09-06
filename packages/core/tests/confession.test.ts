@@ -42,7 +42,9 @@ describe("Confessions", () => {
 
   it("claim でスレッドを紐付け、byThread で引ける", () => {
     const row = ctx.confessions.create("user:carol", { type: "soudan" });
-    const claimed = ctx.confessions.claim(row.id, "thread:123", "user:staff");
+    const result = ctx.confessions.claim(row.id, "thread:123", "user:staff");
+    expect(result.ok).toBe(true);
+    const claimed = ctx.confessions.get(row.id);
     expect(claimed?.status).toBe("claimed");
     expect(claimed?.thread_id).toBe("thread:123");
     expect(claimed?.claimed_by).toBe("user:staff");

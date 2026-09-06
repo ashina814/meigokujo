@@ -62,7 +62,11 @@ export function recoverConfessionOrphans(services: Services): void {
 
 /** 起動時に一度だけ呼ぶ配線。 */
 export function armConfessionStartupRecovery(services: Services): void {
-  beginConfessionStartup(() => recoverConfessionOrphans(services));
+  beginConfessionStartup(() => {
+    // 自分の生存をまず刻む（自分の行を自分で孤児と見なさないため）
+    services.confessions.heartbeatInstance(services.confessions.instance);
+    recoverConfessionOrphans(services);
+  });
 }
 
 /** テスト用。関門の状態を差し替える／解除する。 */
