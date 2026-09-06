@@ -52,10 +52,10 @@ export async function awaitConfessionReady(): Promise<void> {
  */
 export function recoverConfessionOrphans(services: Services): void {
   const recovered = services.confessions.recoverOrphanedEffects();
-  const total = recovered.ackAttempts + recovered.replyDrafts + recovered.followUps;
+  const total = recovered.ackAttempts + recovered.replyDrafts + recovered.followUps + recovered.renders;
   if (total > 0) {
     console.log(
-      `[トート] 前プロセスの未決着を回収しました 受領確認=${recovered.ackAttempts} 返信=${recovered.replyDrafts} 追記=${recovered.followUps}（いずれも「送信結果不明」として扱います）`,
+      `[トート] 前プロセスの未決着を回収しました 受領確認=${recovered.ackAttempts} 返信=${recovered.replyDrafts} 追記=${recovered.followUps} 表示=${recovered.renders}（送信は「結果不明」、表示は収束をやり直します）`,
     );
   }
 }
@@ -67,6 +67,43 @@ export function armConfessionStartupRecovery(services: Services): void {
     services.confessions.heartbeatInstance(services.confessions.instance);
     recoverConfessionOrphans(services);
   });
+}
+
+/**
+ * 鼓動の間隔。貸出期限（150秒）に対して十分短く取る。
+ *
+ * **重い刻時盤の列に混ぜない。** 刻時盤は1周が長く、しかも前の周が終わるまで
+ * 次が始まらない。鼓動より前の無関係な処理が貸出期限より長く詰まると、
+ * プロセスは生きているのに「死んだ所有者」に見え、別インスタンスが実行を奪える。
+ * だから鼓動だけは、他の待ちに巻き込まれない独立した間隔で打つ。
+ */
+const HEARTBEAT_INTERVAL_MS = 30_000;
+
+let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+
+/** 鼓動を打ち始める。停止するまで、他タスクの完了を待たずに更新し続ける */
+export function startConfessionHeartbeat(
+  services: Services,
+  intervalMs = HEARTBEAT_INTERVAL_MS,
+): ReturnType<typeof setInterval> {
+  stopConfessionHeartbeat();
+  services.confessions.heartbeatInstance(services.confessions.instance);
+  const timer = setInterval(() => {
+    try {
+      services.confessions.heartbeatInstance(services.confessions.instance);
+    } catch (error) {
+      console.error("[トート] 生存の記録に失敗:", error);
+    }
+  }, intervalMs);
+  if (typeof timer.unref === "function") timer.unref();
+  heartbeatTimer = timer;
+  return timer;
+}
+
+/** 停止（テストと shutdown 用）。止めれば貸出期限の経過で回収対象になる */
+export function stopConfessionHeartbeat(): void {
+  if (heartbeatTimer) clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
 }
 
 /** テスト用。関門の状態を差し替える／解除する。 */

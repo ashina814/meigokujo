@@ -56,6 +56,28 @@ const seed = (wish: "yes" | "either" | "no" | null = "yes"): ConfessionRow => {
 const eventsOf = (type: string): number =>
   (db.prepare("SELECT COUNT(*) n FROM events WHERE type=?").get(type) as { n: number }).n;
 
+/**
+ * 追記の中継を「所有権を取った世代で決着させる」——本番の経路と同じ形。
+ * 世代を渡さずに決着させる API はもう無い（型で漏れが止まる）。
+ */
+const settleFollow = (followUpId: number, outcome: "delivered" | "failed" | "unknown", generation?: number) => {
+  const gen = generation ?? confessions.getFollowUp(followUpId)!.generation;
+  return confessions.settleFollowUpRelay({ followUpId, generation: gen, outcome });
+};
+const settleFollowVia = (
+  svc: Confessions,
+  followUpId: number,
+  outcome: "delivered" | "failed" | "unknown",
+  generation?: number,
+) => {
+  const gen = generation ?? svc.getFollowUp(followUpId)!.generation;
+  return svc.settleFollowUpRelay({ followUpId, generation: gen, outcome });
+};
+/** 返信も同じ。いま現役の世代で決着させる */
+const finishDraft = (draftId: number, outcome: "delivered" | "failed" | "unknown") =>
+  confessions.finishReplyDraft({ draftId, generation: confessions.getReplyDraft(draftId)!.generation, outcome });
+
+
 /** 受領確認を1往復ぶん動かす。outcome は Discord から返ってきた結末。 */
 const ack = (id: number, staffId: string, outcome: "delivered" | "failed" | "unknown" = "delivered") => {
   const begun = confessions.beginAcknowledgement(id, staffId);
@@ -215,7 +237,7 @@ describe("自由返信は、待つのか終えるのかを明示してはじめ�
     expect(confessions.getReplyDraft(draft.id)!.body_purge_at).not.toBeNull();
 
     confessions.claimReplyDraft(draft.id, "staff-1", "close");
-    confessions.finishReplyDraft(draft.id, "delivered");
+    finishDraft(draft.id, "delivered");
 
     const after = confessions.getReplyDraft(draft.id)!;
     expect(after.body).toBeNull();
@@ -230,7 +252,7 @@ describe("自由返信は、待つのか終えるのかを明示してはじめ�
     const row = seed("yes");
     const draft = confessions.createReplyDraft(row.id, "staff-1", "秘密の連絡", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "wait");
-    confessions.finishReplyDraft(draft.id, "unknown");
+    finishDraft(draft.id, "unknown");
     expect(confessions.getReplyDraft(draft.id)!.body).toBe("秘密の連絡");
 
     const purgeAt = confessions.getReplyDraft(draft.id)!.body_purge_at!;
@@ -322,7 +344,7 @@ describe("投稿者の追記は運営の番へ戻し、期限を消す", () => {
     const result = confessions.recordSenderFollowUp(row.id, "sender-1", "助けてほしい", 90) as { ok: true; followUpId: number };
     // 実際の経路と同じく、所有権を取ってから送る（試行回数はここで増える）
     expect(confessions.claimFollowUpRelay(result.followUpId)).toBeDefined();
-    confessions.settleFollowUpRelay(result.followUpId, "failed");
+    settleFollow(result.followUpId, "failed");
 
     const stored = confessions.getFollowUp(result.followUpId)!;
     expect(stored.body).toBe("助けてほしい"); // 失われない
@@ -337,7 +359,7 @@ describe("投稿者の追記は運営の番へ戻し、期限を消す", () => {
     const row = seed("yes");
     const result = confessions.recordSenderFollowUp(row.id, "sender-1", "追記", 90) as { ok: true; followUpId: number };
     confessions.claimFollowUpRelay(result.followUpId);
-    confessions.settleFollowUpRelay(result.followUpId, "failed");
+    settleFollow(result.followUpId, "failed");
 
     expect(confessions.listRelayableFollowUps().map((r: { id: number }) => r.id)).toEqual([result.followUpId]);
     const claimed = confessions.claimFollowUpRelay(result.followUpId);
@@ -345,7 +367,7 @@ describe("投稿者の追記は運営の番へ戻し、期限を消す", () => {
     // 所有権は1つだけ（同時に2回中継しない）
     expect(confessions.claimFollowUpRelay(result.followUpId)).toBeUndefined();
 
-    confessions.settleFollowUpRelay(result.followUpId, "delivered");
+    settleFollow(result.followUpId, "delivered");
     const after = confessions.getFollowUp(result.followUpId)!;
     expect(after.relayed_at).not.toBeNull();
     expect(after.body).toBeNull(); // P1: 届いた本文は残さない
@@ -357,7 +379,7 @@ describe("投稿者の追記は運営の番へ戻し、期限を消す", () => {
     const row = seed("yes");
     const result = confessions.recordSenderFollowUp(row.id, "sender-1", "追記", 90) as { ok: true; followUpId: number };
     confessions.claimFollowUpRelay(result.followUpId);
-    confessions.settleFollowUpRelay(result.followUpId, "unknown");
+    settleFollow(result.followUpId, "unknown");
     expect(confessions.listRelayableFollowUps()).toEqual([]);
     expect(confessions.claimFollowUpRelay(result.followUpId)).toBeUndefined();
     // ただし担当者からは見える
@@ -369,7 +391,7 @@ describe("投稿者の追記は運営の番へ戻し、期限を消す", () => {
     const row = seed("yes");
     const result = confessions.recordSenderFollowUp(row.id, "sender-1", "秘密", 90) as { ok: true; followUpId: number };
     confessions.claimFollowUpRelay(result.followUpId);
-    confessions.settleFollowUpRelay(result.followUpId, "unknown");
+    settleFollow(result.followUpId, "unknown");
     const purgeAt = confessions.getFollowUp(result.followUpId)!.body_purge_at!;
     expect(confessions.purgeExpiredConversationBodies(purgeAt - 1).followUps).toBe(0);
     expect(confessions.purgeExpiredConversationBodies(purgeAt).followUps).toBe(1);
@@ -677,7 +699,7 @@ describe("プロセスが落ちても、送信中が永遠に残らない", () =
     const row = seed("yes");
     const draft = confessions.createReplyDraft(row.id, "staff-1", "確認しました", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "wait");
-    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, intent: "wait", staffId: "staff-1", retentionDays: 90 });
+    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, generation: confessions.getReplyDraft(draft.id)!.generation, intent: "wait", actorId: "staff-1", retentionDays: 90 });
     expect(finalized.transition).toBe("waiting");
 
     const after = restart();
@@ -695,7 +717,7 @@ describe("プロセスが落ちても、送信中が永遠に残らない", () =
     // 送っている間に投稿者が終了した
     confessions.senderCloseAtomic(row.id, "sender-1");
 
-    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, intent: "close", staffId: "staff-1", retentionDays: 90 });
+    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, generation: confessions.getReplyDraft(draft.id)!.generation, intent: "close", actorId: "staff-1", retentionDays: 90 });
     expect(finalized.transition).toBe("lost");
     // DM は届いている：その事実は残す
     expect(confessions.getReplyDraft(draft.id)!.outcome).toBe("delivered");
@@ -729,10 +751,10 @@ describe("プロセスが落ちても、送信中が永遠に残らない", () =
     const row = seed("yes");
     const f = confessions.recordSenderFollowUp(row.id, "sender-1", "届いた追記", 90) as { ok: true; followUpId: number };
     confessions.claimFollowUpRelay(f.followUpId);
-    confessions.settleFollowUpRelay(f.followUpId, "delivered");
+    settleFollow(f.followUpId, "delivered");
 
     const after = restart();
-    expect(after.recoverOrphanedEffects("system:startup", afterLease())).toEqual({ ackAttempts: 0, replyDrafts: 0, followUps: 0 });
+    expect(after.recoverOrphanedEffects("system:startup", afterLease())).toEqual({ ackAttempts: 0, replyDrafts: 0, followUps: 0, renders: 0 });
     expect(after.getFollowUp(f.followUpId)!.outcome).toBe("delivered");
   });
 });
@@ -760,7 +782,7 @@ describe("担当者が「対応する」を押す前の追記", () => {
     confessions.claim(row.id, "thread-late", "staff-1");
     expect(confessions.listRelayableFollowUps().map((r: { id: number }) => r.id)).toEqual([f.followUpId]);
     expect(confessions.claimFollowUpRelay(f.followUpId)!.attempts).toBe(1);
-    confessions.settleFollowUpRelay(f.followUpId, "delivered");
+    settleFollow(f.followUpId, "delivered");
     expect(confessions.getFollowUp(f.followUpId)!.body).toBeNull();
     expect(confessions.followUpTriage(row.id).total).toBe(0);
   });
@@ -770,7 +792,7 @@ describe("未解決の追記には、人が決められる出口がある", () =
   const exhaust = (followUpId: number) => {
     for (let i = 0; i < CONFESSION_FOLLOW_UP_MAX_ATTEMPTS; i += 1) {
       confessions.claimFollowUpRelay(followUpId);
-      confessions.settleFollowUpRelay(followUpId, "failed");
+      settleFollow(followUpId, "failed");
     }
   };
 
@@ -779,7 +801,7 @@ describe("未解決の追記には、人が決められる出口がある", () =
     const row = seed("yes");
     const f = confessions.recordSenderFollowUp(row.id, "sender-1", "不明な追記", 90) as { ok: true; followUpId: number };
     confessions.claimFollowUpRelay(f.followUpId);
-    confessions.settleFollowUpRelay(f.followUpId, "unknown");
+    settleFollow(f.followUpId, "unknown");
 
     expect(confessions.listRelayableFollowUps()).toEqual([]);
     expect(confessions.claimFollowUpRelay(f.followUpId)).toBeUndefined();
@@ -789,7 +811,7 @@ describe("未解決の追記には、人が決められる出口がある", () =
     expect(claimed).toBeDefined();
     // 二重には取れない
     expect(confessions.claimFollowUpManualRetry(row.id, f.followUpId)).toBeUndefined();
-    confessions.settleFollowUpRelay(f.followUpId, "delivered");
+    settleFollow(f.followUpId, "delivered");
     expect(confessions.followUpTriage(row.id).total).toBe(0);
   });
 
@@ -808,7 +830,7 @@ describe("未解決の追記には、人が決められる出口がある", () =
     expect(confessions.followUpTriage(row.id)).toMatchObject({ exhausted: 1, failed: 0 });
     // 手動で送り直せる
     expect(confessions.claimFollowUpManualRetry(row.id, f.followUpId)).toBeDefined();
-    confessions.settleFollowUpRelay(f.followUpId, "delivered");
+    settleFollow(f.followUpId, "delivered");
     expect(confessions.followUpTriage(row.id).total).toBe(0);
   });
 
@@ -816,7 +838,7 @@ describe("未解決の追記には、人が決められる出口がある", () =
     const row = seed("yes");
     const f = confessions.recordSenderFollowUp(row.id, "sender-1", "諦める追記", 90) as { ok: true; followUpId: number };
     confessions.claimFollowUpRelay(f.followUpId);
-    confessions.settleFollowUpRelay(f.followUpId, "unknown");
+    settleFollow(f.followUpId, "unknown");
 
     confessions.resolveFollowUpManually(row.id, f.followUpId, "staff-1");
     const after = confessions.getFollowUp(f.followUpId)!;
@@ -944,7 +966,7 @@ describe("追記・下書きの所属案件はDBだけが決める", () => {
       followUpId: number;
     };
     confessions.claimFollowUpRelay(f.followUpId);
-    confessions.settleFollowUpRelay(f.followUpId, "unknown");
+    settleFollow(f.followUpId, "unknown");
     return { a, b, followUpId: f.followUpId };
   };
 
@@ -986,13 +1008,13 @@ describe("追記・下書きの所属案件はDBだけが決める", () => {
     confessions.claim(bRow.id, "thread-b", "staff-2");
     const draft = confessions.createReplyDraft(bRow.id, "staff-2", "Bへの返信", 90);
     confessions.claimReplyDraft(draft.id, "staff-2", "wait");
-    confessions.finishReplyDraft(draft.id, "unknown");
+    finishDraft(draft.id, "unknown");
 
-    expect(confessions.claimReplyDraftManualRetry(a.id, draft.id)).toBeUndefined();
+    expect(confessions.claimReplyDraftManualRetry(a.id, draft.id, "staff-1")).toBeUndefined();
     expect(confessions.resolveReplyDraftManually(a.id, draft.id, "staff-1")?.outcome).toBe("unknown");
     expect(confessions.getReplyDraft(draft.id)!.body).toBe("Bへの返信");
     // 正しい案件でなら通る
-    expect(confessions.claimReplyDraftManualRetry(bRow.id, draft.id)).toBeDefined();
+    expect(confessions.claimReplyDraftManualRetry(bRow.id, draft.id, "other-staff")).toBeDefined();
   });
 });
 
@@ -1001,7 +1023,7 @@ describe("未確定の返信にも、人が決められる出口がある", () =
     const row = seed("yes");
     const draft = confessions.createReplyDraft(row.id, "staff-1", "届いたか分からない返信", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "wait");
-    confessions.finishReplyDraft(draft.id, outcome);
+    finishDraft(draft.id, outcome);
     return { row, draft };
   };
 
@@ -1013,10 +1035,10 @@ describe("未確定の返信にも、人が決められる出口がある", () =
 
   it("もう一度送ると決めたら所有権を取り直す", () => {
     const { row, draft } = stuck("unknown");
-    const claimed = confessions.claimReplyDraftManualRetry(row.id, draft.id);
+    const claimed = confessions.claimReplyDraftManualRetry(row.id, draft.id, "staff-2");
     expect(claimed?.outcome).toBe("sending");
     // 二重には取れない
-    expect(confessions.claimReplyDraftManualRetry(row.id, draft.id)).toBeUndefined();
+    expect(confessions.claimReplyDraftManualRetry(row.id, draft.id, "staff-2")).toBeUndefined();
   });
 
   it("これ以上送らないと決めても、届いたことにはしない", () => {
@@ -1039,7 +1061,7 @@ describe("配送の時刻は、人の決着で埋めない", () => {
       followUpId: number;
     };
     confessions.claimFollowUpRelay(f.followUpId);
-    confessions.settleFollowUpRelay(f.followUpId, "unknown");
+    settleFollow(f.followUpId, "unknown");
 
     confessions.resolveFollowUpManually(row.id, f.followUpId, "staff-1");
     const after = confessions.getFollowUp(f.followUpId)!;
@@ -1059,7 +1081,7 @@ describe("配送の時刻は、人の決着で埋めない", () => {
       followUpId: number;
     };
     confessions.claimFollowUpRelay(f.followUpId);
-    confessions.settleFollowUpRelay(f.followUpId, "delivered");
+    settleFollow(f.followUpId, "delivered");
     expect(confessions.getFollowUp(f.followUpId)!.relayed_at).not.toBeNull();
   });
 });
@@ -1087,11 +1109,43 @@ describe("古い実行の帰りが、新しい状態を壊さない", () => {
     confessions.recoverOrphanedEffects("system:startup", afterLease2());
     expect(confessions.getReplyDraft(draft.id)!.outcome).toBe("unknown");
 
-    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, intent: "wait", staffId: "staff-1" });
-    expect(finalized.transition).toBe("lost");
+    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, generation: confessions.getReplyDraft(draft.id)!.generation, intent: "wait", actorId: "staff-1" });
+    // **`lost`（会話が終わっていた）ではなく `superseded`（この試行が現役でない）。**
+    // 会話は終わっていないので、担当者へ「終了していました」と言ってはならない。
+    expect(finalized.transition).toBe("superseded");
     expect(confessions.getReplyDraft(draft.id)!.outcome).toBe("unknown");
     expect(confessions.get(row.id)!.reply_deadline_at).toBeNull();
     expect(eventsOf("confession_reply_wait")).toBe(0);
+  });
+
+  it("送り直しが始まったあとの古い確定は、会話にも本文にも触れない", () => {
+    // 回収（outcome が動く）だけでなく、**世代そのもの**でも止まることを見る。
+    // 手動の送り直しは outcome を `sending` に戻すので、世代が無ければ素通りする。
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const stale = confessions.getReplyDraft(draft.id)!.generation;
+    confessions.recoverOrphanedEffects("system:startup", afterLease2());
+    // 別の担当者が送り直す＝新しい世代が現役になる
+    confessions.claimReplyDraftManualRetry(row.id, draft.id, "staff-2");
+    expect(confessions.getReplyDraft(draft.id)!.outcome).toBe("sending");
+
+    const late = confessions.finalizeStaffReply({ draftId: draft.id, generation: stale, intent: "wait", actorId: "staff-1" });
+    expect(late.transition).toBe("superseded");
+    expect(confessions.get(row.id)!.reply_deadline_at).toBeNull();
+    expect(confessions.getReplyDraft(draft.id)!.body).toBe("本文");
+    expect(confessions.listPendingRenders()).toHaveLength(0);
+    expect(eventsOf("confession_reply_wait")).toBe(0);
+
+    // 現役の世代なら通る
+    const live = confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: confessions.getReplyDraft(draft.id)!.generation,
+      intent: "wait",
+      actorId: "staff-2",
+    });
+    expect(live.transition).toBe("waiting");
+    expect(confessions.get(row.id)!.reply_deadline_at).not.toBeNull();
   });
 
   it("回収後に帰ってきた追記の中継結果を受け付けない", () => {
@@ -1101,7 +1155,7 @@ describe("古い実行の帰りが、新しい状態を壊さない", () => {
     confessions.recoverOrphanedEffects("system:startup", afterLease2());
     expect(confessions.getFollowUp(f.followUpId)!.outcome).toBe("unknown");
 
-    confessions.settleFollowUpRelay(f.followUpId, "delivered", claimed.generation);
+    settleFollow(f.followUpId, "delivered", claimed.generation);
     expect(confessions.getFollowUp(f.followUpId)!.outcome).toBe("unknown");
     expect(confessions.getFollowUp(f.followUpId)!.relayed_at).toBeNull();
   });
@@ -1111,17 +1165,17 @@ describe("古い実行の帰りが、新しい状態を壊さない", () => {
     const row = seed("yes");
     const f = confessions.recordSenderFollowUp(row.id, "sender-1", "本文", 90) as { ok: true; followUpId: number };
     const first = confessions.claimFollowUpRelay(f.followUpId)!;
-    confessions.settleFollowUpRelay(f.followUpId, "failed", first.generation);
+    settleFollow(f.followUpId, "failed", first.generation);
     const second = confessions.claimFollowUpRelay(f.followUpId)!;
     expect(second.generation).toBeGreaterThan(first.generation);
 
     // 1回目の callback がいまごろ delivered で帰ってきた
-    confessions.settleFollowUpRelay(f.followUpId, "delivered", first.generation);
+    settleFollow(f.followUpId, "delivered", first.generation);
     expect(confessions.getFollowUp(f.followUpId)!.outcome).toBe("sending"); // 2回目のまま
     expect(confessions.getFollowUp(f.followUpId)!.relayed_at).toBeNull();
 
     // 2回目の結果は通る
-    confessions.settleFollowUpRelay(f.followUpId, "delivered", second.generation);
+    settleFollow(f.followUpId, "delivered", second.generation);
     expect(confessions.getFollowUp(f.followUpId)!.relayed_at).not.toBeNull();
   });
 });
@@ -1206,7 +1260,7 @@ describe("会話が終わっても、未処理の内容は残り続ける", () =
     });
     const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "wait");
-    confessions.finishReplyDraft(draft.id, "unknown");
+    finishDraft(draft.id, "unknown");
 
     const ob = confessions.obligations(row.id);
     expect(ob.openEmergency).toBe(true);
@@ -1227,10 +1281,7 @@ describe("投稿者に見える最終形は、再起動しても収束する", (
     const row = seed("yes");
     const draft = confessions.createReplyDraft(row.id, "staff-1", "確認しました", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "wait");
-    const finalized = confessions.finalizeStaffReply({
-      draftId: draft.id,
-      intent: "wait",
-      staffId: "staff-1",
+    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, generation: confessions.getReplyDraft(draft.id)!.generation, intent: "wait", actorId: "staff-1",
       retentionDays: 90,
       renderTarget: { channelId: "dm-1", messageId: "msg-1" },
     });
@@ -1240,28 +1291,34 @@ describe("投稿者に見える最終形は、再起動しても収束する", (
     const after = restartFor();
     const pending = after.listPendingRenders();
     expect(pending).toHaveLength(1);
+    // **行が持つのは宛先だけ。** 見せる中身は収束のたびに現在の案件から導く。
     expect(pending[0]!).toMatchObject({
       confession_id: row.id,
       channel_id: "dm-1",
       message_id: "msg-1",
-      render_kind: "reply_waiting",
       state: "pending",
     });
-    expect(pending[0]!.deadline_at).toBe(finalized.deadlineAt);
+    expect(after.desiredRender(row.id)).toEqual({
+      kind: "reply_waiting",
+      deadlineAt: finalized.deadlineAt,
+      closedBySender: false,
+    });
   });
 
   it("終了で確定したときも、終了の表示へ収束する指示が残る", () => {
     const row = seed("yes");
     const draft = confessions.createReplyDraft(row.id, "staff-1", "対応しました", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "close");
-    confessions.finalizeStaffReply({
-      draftId: draft.id,
-      intent: "close",
-      staffId: "staff-1",
+    confessions.finalizeStaffReply({ draftId: draft.id, generation: confessions.getReplyDraft(draft.id)!.generation, intent: "close", actorId: "staff-1",
       retentionDays: 90,
       renderTarget: { channelId: "dm-1", messageId: "msg-2" },
     });
-    expect(confessions.listPendingRenders()[0]!.render_kind).toBe("reply_closed");
+    expect(confessions.listPendingRenders()).toHaveLength(1);
+    expect(confessions.desiredRender(row.id)).toEqual({
+      kind: "reply_closed",
+      deadlineAt: null,
+      closedBySender: false,
+    });
   });
 
   // R22
@@ -1270,27 +1327,23 @@ describe("投稿者に見える最終形は、再起動しても収束する", (
     const draft = confessions.createReplyDraft(row.id, "staff-1", "行き違い", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "wait");
     confessions.senderCloseAtomic(row.id, "sender-1", 90);
-    const finalized = confessions.finalizeStaffReply({
-      draftId: draft.id,
-      intent: "wait",
-      staffId: "staff-1",
+    const finalized = confessions.finalizeStaffReply({ draftId: draft.id, generation: confessions.getReplyDraft(draft.id)!.generation, intent: "wait", actorId: "staff-1",
       renderTarget: { channelId: "dm-1", messageId: "msg-3" },
     });
     expect(finalized.transition).toBe("lost");
-    const render = confessions.listPendingRenders()[0]!;
-    expect(render.render_kind).toBe("reply_after_close");
-    expect(render.closed_by_sender).toBe(1);
-    expect(render.deadline_at).toBeNull();
+    expect(confessions.listPendingRenders()).toHaveLength(1);
+    expect(confessions.desiredRender(row.id)).toEqual({
+      kind: "reply_after_close",
+      deadlineAt: null,
+      closedBySender: true,
+    });
   });
 
   it("収束の所有権は1つだけ。書き換えられなければ担当者から見える形で残る", () => {
     const row = seed("yes");
     const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
     confessions.claimReplyDraft(draft.id, "staff-1", "wait");
-    confessions.finalizeStaffReply({
-      draftId: draft.id,
-      intent: "wait",
-      staffId: "staff-1",
+    confessions.finalizeStaffReply({ draftId: draft.id, generation: confessions.getReplyDraft(draft.id)!.generation, intent: "wait", actorId: "staff-1",
       renderTarget: { channelId: "dm-1", messageId: "msg-4" },
     });
     const render = confessions.listPendingRenders()[0]!;

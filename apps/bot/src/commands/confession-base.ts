@@ -956,14 +956,16 @@ export async function convergePendingRenders(
   for (const item of pending) {
     const claimed = services.confessions.claimRender(item.id);
     if (!claimed) continue;
-    const draft = claimed.draft_id === null ? undefined : services.confessions.getReplyDraft(claimed.draft_id);
-    // 本文は既に消えている（届いた時点で NULL 化）ので、最終形は状態だけで描く。
+    // **収束先は「いまの案件」から導く。** queue した時点の希望を信じると、
+    // 編集に失敗しているあいだに投稿者が終了した／期限が来た場合に、
+    // 終わった会話へ「7日後に終了します」と開いているような操作を復活させてしまう。
+    const desired = services.confessions.desiredRender(claimed.confession_id);
     const notice: SenderNotice =
-      claimed.render_kind === "reply_waiting"
-        ? { kind: "reply", body: "", waiting: true, deadlineAt: claimed.deadline_at }
-        : claimed.render_kind === "reply_closed"
+      desired.kind === "reply_waiting"
+        ? { kind: "reply", body: "", waiting: true, deadlineAt: desired.deadlineAt }
+        : desired.kind === "reply_closed"
           ? { kind: "closed_by_staff", body: "" }
-          : { kind: "reply_after_close", body: "", closedBySender: claimed.closed_by_sender === 1 };
+          : { kind: "reply_after_close", body: "", closedBySender: desired.closedBySender };
     // 本文は元のメッセージに残っている。ここでは「どの結末へ収束させるか」だけを渡し、
     // 本文は取り直した現物から拾う（本文をDBに持ち続けないための形）。
     const outcome = await editDmMessage(client, claimed.channel_id, claimed.message_id, claimed.confession_id, notice);
@@ -977,7 +979,6 @@ export async function convergePendingRenders(
         `⚠️ 投稿者へ届けた返信の表示を最終形へ書き換えられませんでした（本文は届いています）。会話の状態そのものは正しいままです。`,
       );
     }
-    void draft;
     await refreshPanel(client, services, claimed.confession_id);
   }
   return settled;
@@ -1313,7 +1314,7 @@ async function commitStaffReply(
   );
 
   if (outcome !== "delivered") {
-    services.confessions.finishReplyDraft(draftId, outcome);
+    services.confessions.finishReplyDraft({ draftId, generation: claim.draft.generation, outcome });
     // 届いたか分からないものを「返信した」ことにしない。状態は動かさず、担当者へ返す。
     await threadLog(
       interaction.client,
@@ -1337,8 +1338,9 @@ async function commitStaffReply(
   // 遷移に負けても「DM は届いた」という事実は失わない。
   const finalized = services.confessions.finalizeStaffReply({
     draftId,
+    generation: claim.draft.generation,
     intent,
-    staffId: interaction.user.id,
+    actorId: interaction.user.id,
     retentionDays: retentionDaysFor(services, claim.row),
     // **書き換えるべき姿をDBへ残してから編集する。** 編集の前に落ちても、
     // 起動時／刻時盤が同じメッセージを最終形へ収束できる（新しい DM は増やさない）。
@@ -1349,6 +1351,26 @@ async function commitStaffReply(
   // 確定した内容へ、届いた1通を書き換える。ここで初めて期限や操作を見せてよい。
   const settledRenders = await convergePendingRenders(interaction.client, services, id);
   const editOutcome: DeliveryOutcome = settledRenders > 0 ? "delivered" : "failed";
+
+  if (finalized.transition === "superseded") {
+    // **終わっていない会話へ「終了していました」と言わない。**
+    // この試行が現役でなくなっただけで、会話は動いていない。
+    await threadLog(
+      interaction.client,
+      services,
+      id,
+      `❓ <@${interaction.user.id}> の返信は届きましたが、この送信は既に別の試行へ置き換わっていました。会話の状態は変えていません。`,
+    );
+    await refreshPanel(interaction.client, services, id);
+    await interaction.editReply({
+      content: [
+        "❓ **返信は投稿者へ届きましたが、この送信は既に置き換わっていました。**",
+        "再起動時の回収か、別の送り直しが先に進んでいます。会話の状態はそちらのままです。",
+        "同じ内容が二重に届いている可能性があります。",
+      ].join("\n"),
+    });
+    return;
+  }
 
   if (finalized.transition === "lost") {
     await threadLog(
@@ -1511,7 +1533,13 @@ async function submitSenderFollowUp(
     return;
   }
   const outcome = await sendThreadMessage(interaction.client, row.thread_id, followUpRelayMessage(text));
-  services.confessions.settleFollowUpRelay(accepted.followUpId, outcome);
+  // 決着は**取った世代で**行う。世代が変わっていれば（回収や次の試行が割り込んだ）
+  // この結果は捨てられる。
+  services.confessions.settleFollowUpRelay({
+    followUpId: accepted.followUpId,
+    generation: claimed.generation,
+    outcome,
+  });
   await refreshPanel(interaction.client, services, id);
 
   if (outcome === "delivered") {
@@ -1675,7 +1703,8 @@ async function manualReplyRetry(
   draftId: number,
 ): Promise<void> {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral });
-  const claimed = services.confessions.claimReplyDraftManualRetry(id, draftId);
+  // 再送を実行するのは**押した人**。下書きを書いた人とは別でありうる。
+  const claimed = services.confessions.claimReplyDraftManualRetry(id, draftId, interaction.user.id);
   if (!claimed?.body) {
     await interaction.editReply({ content: "この返信は既に処理されています。" });
     return;
@@ -1691,7 +1720,7 @@ async function manualReplyRetry(
     senderDm(id, { kind: "reply_pending", body: claimed.body }),
   );
   if (outcome !== "delivered") {
-    services.confessions.finishReplyDraft(draftId, outcome);
+    services.confessions.finishReplyDraft({ draftId, generation: claimed.generation, outcome });
     await refreshPanel(interaction.client, services, id);
     await interaction.editReply({
       content:
@@ -1701,10 +1730,14 @@ async function manualReplyRetry(
     });
     return;
   }
+  // **本文を書いた人と、いま会話を動かした人は別。**
+  // 下書きの作者は `staff_id` として残り、この確定を成立させた actor は押した人。
+  // ここを取り違えると `closed_by` と監査記録が、実際には操作していない人を指す。
   const finalized = services.confessions.finalizeStaffReply({
     draftId,
+    generation: claimed.generation,
     intent: (claimed.intent as "wait" | "close") ?? "wait",
-    staffId: claimed.staff_id,
+    actorId: interaction.user.id,
     retentionDays: retentionDaysFor(services, row),
     renderTarget: sent ? { channelId: sent.channelId, messageId: sent.messageId } : null,
   });
@@ -1718,9 +1751,11 @@ async function manualReplyRetry(
   await refreshPanel(interaction.client, services, id);
   await interaction.editReply({
     content:
-      finalized.transition === "lost"
-        ? "💬 返信は届きましたが、このやり取りは既に終了していました。終了はそのまま維持しています。"
-        : "💬 返信を届けました。",
+      finalized.transition === "superseded"
+        ? "❓ 返信は届きましたが、この送信は既に別の試行へ置き換わっていました。会話の状態はそちらのままです。"
+        : finalized.transition === "lost"
+          ? "💬 返信は届きましたが、このやり取りは既に終了していました。終了はそのまま維持しています。"
+          : "💬 返信を届けました。",
   });
 }
 
@@ -1740,7 +1775,7 @@ async function manualFollowUpRetry(
   }
   const row = services.confessions.get(id);
   const outcome = await sendThreadMessage(interaction.client, row?.thread_id ?? null, followUpRelayMessage(claimed.body));
-  services.confessions.settleFollowUpRelay(followUpId, outcome, claimed.generation);
+  services.confessions.settleFollowUpRelay({ followUpId, generation: claimed.generation, outcome });
   await refreshPanel(interaction.client, services, id);
   await interaction.editReply({
     content:
@@ -1788,7 +1823,7 @@ export async function retryPendingFollowUps(client: Client, services: Services):
     if (!claimed?.body) continue;
     const row = services.confessions.get(claimed.confession_id);
     const outcome = await sendThreadMessage(client, row?.thread_id ?? null, followUpRelayMessage(claimed.body));
-    services.confessions.settleFollowUpRelay(claimed.id, outcome);
+    services.confessions.settleFollowUpRelay({ followUpId: claimed.id, generation: claimed.generation, outcome });
     if (outcome === "delivered") {
       relayed += 1;
       await refreshPanel(client, services, claimed.confession_id);

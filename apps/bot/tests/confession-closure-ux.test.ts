@@ -66,6 +66,8 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
   /** 送信の境界で止めるための deferred。時間待ちは使わない。 */
   let dmGate: Promise<void> | null = null;
   let dmGateEntered: (() => void) | null = null;
+  let threadGate: Promise<void> | null = null;
+  let threadGateEntered: (() => void) | null = null;
   const apiError = () => Object.assign(new Error("Cannot send messages to this user"), { code: 50007 });
   const netError = () => Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
 
@@ -82,6 +84,13 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
     isThread: () => true,
     archived: false,
     send: async (o: Sent) => {
+      // DM と同じく、**いま飛ぼうとしている1通だけ**を止める
+      const gate = threadGate;
+      threadGate = null;
+      if (gate) {
+        threadGateEntered?.();
+        await gate;
+      }
       if (threadMode === "api") throw apiError();
       if (threadMode === "net") throw netError();
       threadPosts.push(o);
@@ -225,6 +234,19 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
       const e = dmVersions[i]?.embeds?.[0];
       const json = e?.toJSON ? e.toJSON() : e;
       return [json?.description ?? "", ...(json?.fields ?? []).map((f: any) => f.value)].join("\n");
+    },
+    /** 運営スレッドへの中継を境界で止める（`holdDm` と同じ形） */
+    holdThread: () => {
+      let release!: () => void;
+      let signalEntered!: () => void;
+      const entered = new Promise<void>((resolve) => {
+        signalEntered = resolve;
+      });
+      threadGate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      threadGateEntered = signalEntered;
+      return { entered, release: () => release() };
     },
     /**
      * DM 送信を境界で止める。`entered` が解決した時点で「送信の途中」に確実に入っている
@@ -1436,10 +1458,18 @@ describe("別案件のIDを添えても、その内容へは届かない", () =>
       followUpId: number;
     };
     h.services.confessions.claimFollowUpRelay(f.followUpId);
-    h.services.confessions.settleFollowUpRelay(f.followUpId, "unknown");
+    h.services.confessions.settleFollowUpRelay({
+      followUpId: f.followUpId,
+      generation: h.services.confessions.getFollowUp(f.followUpId)!.generation,
+      outcome: "unknown",
+    });
     const draft = h.services.confessions.createReplyDraft(bId, "other-staff", "Bへの返信", 90);
     h.services.confessions.claimReplyDraft(draft.id, "other-staff", "wait");
-    h.services.confessions.finishReplyDraft(draft.id, "unknown");
+    h.services.confessions.finishReplyDraft({
+      draftId: draft.id,
+      generation: h.services.confessions.getReplyDraft(draft.id)!.generation,
+      outcome: "unknown",
+    });
     return { h, bId, followUpId: f.followUpId, draftId: draft.id };
   };
 
@@ -1672,5 +1702,321 @@ describe("終了しても、届いた内容は運営から見えなくならな�
     const h = harness("yes");
     await h.press(`mimi:senderclosego:${h.id}`, SENDER);
     expect(h.thread.setArchived).toHaveBeenCalled();
+  });
+});
+
+describe("試行の世代は、本番の経路でも効いている", () => {
+  /**
+   * **Core を直接正しく呼ぶだけでは、本番の配線漏れは見つからない。**
+   * ここは実際のハンドラ（投稿者の追記 / 刻時盤の再中継 / 担当者の返信）を通し、
+   * 置き換わった古い試行の結果が、新しい試行の結末を塗り替えないことを見る。
+   */
+  const followUpId = (h: ReturnType<typeof harness>) =>
+    h.db.prepare("SELECT id FROM confession_follow_ups ORDER BY id").pluck().get() as number;
+
+  // R28a: 投稿者の追記（本番の初回経路）
+  it("追記の中継中に回収が入っても、古い callback は新しい試行を壊さない", async () => {
+    const h = harness("yes");
+    const gate = h.holdThread();
+    const submitting = h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "世代の試験" });
+    await gate.entered; // 「中継の途中」に確実に入っている
+
+    const fid = followUpId(h);
+    const gen1 = h.services.confessions.getFollowUp(fid)!.generation;
+
+    // 所有者が落ちた前提の回収。この送信はもう誰も見届けない
+    expect(h.services.confessions.recoverOrphanedEffects("system:startup").followUps).toBe(1);
+    expect(h.services.confessions.getFollowUp(fid)!.outcome).toBe("unknown");
+
+    // 担当者が重複を承知で送り直す（世代2）
+    await h.press(`mimi:followupretry:${fid}`);
+    const afterRetry = h.services.confessions.getFollowUp(fid)!;
+    expect(afterRetry.generation).toBeGreaterThan(gen1);
+    expect(afterRetry.outcome).toBe("delivered");
+
+    // ここで世代1の callback が帰ってくる
+    gate.release();
+    await submitting;
+
+    const settled = h.services.confessions.getFollowUp(fid)!;
+    expect(settled.generation).toBe(afterRetry.generation);
+    expect(settled.outcome).toBe("delivered");
+    // 決着の時刻も試行回数も、古い試行では動かない
+    expect(settled.relayed_at).toBe(afterRetry.relayed_at);
+    expect(settled.attempts).toBe(afterRetry.attempts);
+  });
+
+  // R28b: 刻時盤の再中継経路
+  it("刻時盤の再中継でも、古い callback は新しい試行を壊さない", async () => {
+    const h = harness("yes");
+    h.setThreadFails(true);
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "刻時盤の試験" });
+    h.setThreadFails(false);
+    const fid = followUpId(h);
+    expect(h.services.confessions.getFollowUp(fid)!.outcome).toBe("failed");
+
+    const gate = h.holdThread();
+    const sweeping = retryPendingFollowUps(h.client as any, h.services);
+    await gate.entered;
+    const gen = h.services.confessions.getFollowUp(fid)!.generation;
+
+    expect(h.services.confessions.recoverOrphanedEffects("system:startup").followUps).toBe(1);
+    await h.press(`mimi:followupretry:${fid}`);
+    const afterRetry = h.services.confessions.getFollowUp(fid)!;
+    expect(afterRetry.generation).toBeGreaterThan(gen);
+    expect(afterRetry.outcome).toBe("delivered");
+
+    gate.release();
+    await sweeping;
+
+    const settled = h.services.confessions.getFollowUp(fid)!;
+    expect(settled.generation).toBe(afterRetry.generation);
+    expect(settled.relayed_at).toBe(afterRetry.relayed_at);
+    expect(settled.attempts).toBe(afterRetry.attempts);
+  });
+
+  // R29a: 返信の世代（本番の返信経路）
+  it("返信の送信中に回収が入っても、古い callback は会話を動かさない", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "世代のある返信" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+
+    const gate = h.holdDm();
+    const sending = h.press(`mimi:replywait:${draftId}`);
+    await gate.entered;
+    const gen1 = h.services.confessions.getReplyDraft(draftId)!.generation;
+
+    expect(h.services.confessions.recoverOrphanedEffects("system:startup").replyDrafts).toBe(1);
+    expect(h.services.confessions.getReplyDraft(draftId)!.outcome).toBe("unknown");
+
+    // 担当者が送り直す（世代2）。ここで会話が「返答待ち」になる
+    await h.press(`mimi:draftretry:${draftId}`);
+    const gen2 = h.services.confessions.getReplyDraft(draftId)!.generation;
+    expect(gen2).toBeGreaterThan(gen1);
+    const afterRetry = h.row();
+    expect(afterRetry.reply_deadline_at).not.toBeNull();
+
+    // 世代1の callback が「届いた」で帰ってくる
+    gate.release();
+    await sending;
+
+    // 会話は世代2の結果のまま。期限を引き直しもしない
+    const after = h.row();
+    expect(after.status).toBe(afterRetry.status);
+    expect(after.reply_deadline_at).toBe(afterRetry.reply_deadline_at);
+    expect(h.services.confessions.getReplyDraft(draftId)!.generation).toBe(gen2);
+  });
+
+  // R29b: 置き換わった試行を「終了していた」と言わない
+  it("置き換わった試行は、終わっていない会話を「終了していた」と言わない", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "本文" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    const gate = h.holdDm();
+    const sending = h.press(`mimi:replywait:${draftId}`);
+    await gate.entered;
+    h.services.confessions.recoverOrphanedEffects("system:startup");
+    await h.press(`mimi:draftretry:${draftId}`);
+    gate.release();
+    await sending;
+
+    const said = h.lastReply().content ?? "";
+    expect(said).toContain("置き換わって");
+    // 会話は終わっていない。終わったとは言わない
+    expect(h.row().status).not.toBe("closed");
+    expect(said).not.toContain("このやり取りは終了していました");
+    expect(h.threadPostTexts()).not.toContain("このやり取りが終了していました");
+  });
+
+  // R29c: 現役の世代だけが確定できる
+  it("古い世代の確定は、会話にも本文にも触れない", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "本文" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    const claim = h.services.confessions.claimReplyDraft(draftId, STAFF, "wait");
+    expect(claim.ok).toBe(true);
+    const gen = h.services.confessions.getReplyDraft(draftId)!.generation;
+
+    const stale = h.services.confessions.finalizeStaffReply({
+      draftId,
+      generation: gen - 1,
+      intent: "wait",
+      actorId: STAFF,
+    });
+    expect(stale.transition).toBe("superseded");
+    expect(h.row().reply_deadline_at).toBeNull();
+    expect(h.services.confessions.getReplyDraft(draftId)!.body).toBe("本文"); // 本文も消えていない
+
+    const live = h.services.confessions.finalizeStaffReply({
+      draftId,
+      generation: gen,
+      intent: "wait",
+      actorId: STAFF,
+    });
+    expect(live.transition).toBe("waiting");
+    expect(h.row().reply_deadline_at).not.toBeNull();
+  });
+});
+
+describe("収束の途中で落ちても、同じメッセージが最終形へ向かう", () => {
+  /** 編集だけが落ちた状態（収束の指示だけが残る）を作る */
+  const staged = async (h: ReturnType<typeof harness>, body = "本文だけ届く返信。") => {
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: body });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    h.setEditFails(true);
+    await h.press(`mimi:replywait:${draftId}`);
+    h.setEditFails(false);
+    return draftId;
+  };
+
+  // R30
+  it("収束中に落ちたものは、所有者の死を確かめてから再開できる", async () => {
+    const h = harness("yes");
+    await staged(h);
+
+    // 収束の所有権を取った直後に落ちた、という状況
+    const render = h.services.confessions.pendingRendersFor(h.id)[0]!;
+    expect(h.services.confessions.claimRender(render.id)).toBeTruthy();
+    expect(h.services.confessions.listStalledRenders()).toHaveLength(1);
+    // この状態では通常の掃きは拾わない（誰かが実行中かもしれない）
+    expect(await convergePendingRenders(h.client as any, h.services)).toBe(0);
+
+    // 所有者の死が確かめられたら再開できる
+    expect(h.services.confessions.recoverOrphanedEffects("system:startup").renders).toBe(1);
+
+    const before = h.dms.length;
+    expect(await convergePendingRenders(h.client as any, h.services)).toBe(1);
+    expect(h.dmText()).toContain("必要なら追記できます");
+    expect(h.dms).toHaveLength(before); // **新しい DM は増えない**
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(0);
+  });
+
+  it("まだ生きている所有者の収束は奪わない", async () => {
+    const h = harness("yes");
+    await staged(h);
+    const render = h.services.confessions.pendingRendersFor(h.id)[0]!;
+
+    // 別プロセスが収束を握り、鼓動を打ち続けている
+    const other = new Confessions(h.db, h.services.events, "other-live-instance");
+    expect(other.claimRender(render.id)).toBeTruthy();
+
+    expect(h.services.confessions.recoverOrphanedEffects("system:startup").renders).toBe(0);
+    expect(h.services.confessions.listStalledRenders()).toHaveLength(1);
+  });
+});
+
+describe("収束先は、凍結した希望ではなく、いまの案件から導く", () => {
+  const staged = async (h: ReturnType<typeof harness>) => {
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "もう少し教えてください。" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    h.setEditFails(true);
+    await h.press(`mimi:replywait:${draftId}`);
+    h.setEditFails(false);
+    return draftId;
+  };
+  /** 返信本文が入っている DM（収束後も本文は現物から拾われる） */
+  const replyDm = (h: ReturnType<typeof harness>) => {
+    const dm = h.dms.find((d) => {
+      const e = d.embeds?.[0];
+      const j = e?.toJSON ? e.toJSON() : e;
+      return (j?.description ?? "").includes("もう少し教えてください。");
+    })!;
+    const j = dm.embeds?.[0]?.toJSON ? dm.embeds[0].toJSON() : dm.embeds?.[0];
+    return { text: [j?.description ?? "", ...(j?.fields ?? []).map((f: any) => f.value)].join("\n"), dm };
+  };
+
+  // R31
+  it("待機で積まれたあと投稿者が終了したら、終了の表示へ収束する", async () => {
+    const h = harness("yes");
+    await staged(h);
+    // 収束が済む前に投稿者が終了する
+    await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+    expect(await convergePendingRenders(h.client as any, h.services)).toBe(1);
+
+    const { text, dm } = replyDm(h);
+    expect(text).toContain("この返信は届きましたが、このやり取りは既に終了しています");
+    expect(text).toContain("あなたが終了を選んだためです");
+    // 終わった会話へ「開いている」案内も期限も出さない
+    expect(text).not.toContain("必要なら追記できます");
+    expect(text).not.toContain("自動で終了します");
+    expect((dm.components ?? []).length).toBe(0);
+  });
+
+  // R32
+  it("待機で積まれたあと期限で終了したら、期限による終了の表示へ収束する", async () => {
+    const h = harness("yes");
+    await staged(h);
+    const deadline = h.row().reply_deadline_at!;
+    expect(await closeExpiredSenderWaits(h.client as any, h.services, deadline + 1)).toBe(1);
+    await convergePendingRenders(h.client as any, h.services);
+
+    const { text, dm } = replyDm(h);
+    expect(text).toContain("この返信は届きましたが、このやり取りは既に終了しています");
+    expect(text).toContain("返答の期限が過ぎたためです");
+    expect(text).not.toContain("自動で終了します");
+    expect((dm.components ?? []).length).toBe(0);
+  });
+
+  // R33
+  it("期限が解除されていたら、古い期限を描かない", async () => {
+    const h = harness("yes");
+    await staged(h);
+    const oldDeadline = h.row().reply_deadline_at!;
+
+    // 投稿者が追記し、番が運営へ戻る（期限は解除される）
+    await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "追記します" });
+    expect(h.row().reply_deadline_at).toBeNull();
+
+    await convergePendingRenders(h.client as any, h.services);
+    const { text } = replyDm(h);
+    // 追記・終了はできるが、**もう無い期限**は描かない
+    expect(text).toContain("必要なら追記できます");
+    expect(text).not.toContain("自動で終了します");
+    expect(text).not.toContain(`<t:${oldDeadline}:R>`);
+  });
+});
+
+describe("誰が操作したのかを、記録が取り違えない", () => {
+  const OTHER_STAFF = "staff-2";
+
+  // B5
+  it("別の担当者が未確定の返信を送り直したら、終わらせたのはその人になる", async () => {
+    const h = harness("yes");
+    // A（STAFF）が下書きを書き、届いたか分からないまま残る
+    h.setDmUnknown(true);
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "Aが書いた返信" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    await h.press(`mimi:replyend:${draftId}`);
+    h.setDmUnknown(false);
+    expect(h.services.confessions.getReplyDraft(draftId)!.staff_id).toBe(STAFF);
+    expect(h.row().status).not.toBe("closed");
+
+    // B が正規の担当として送り直す
+    h.services.confessions.addAssignee(h.id, OTHER_STAFF, STAFF);
+    await h.press(`mimi:draftretry:${draftId}`, OTHER_STAFF);
+
+    const draft = h.services.confessions.getReplyDraft(draftId)!;
+    expect(draft.staff_id).toBe(STAFF); // 本文を書いたのは A のまま
+    expect(draft.executed_by).toBe(OTHER_STAFF); // 実際に送ったのは B
+
+    // 会話を終わらせたのも B。監査記録もスレッドの記録も一致する
+    const row = h.row();
+    expect(row.status).toBe("closed");
+    expect(row.closed_by).toBe(OTHER_STAFF);
+    const closeEvent = h.db
+      .prepare("SELECT actor_id FROM events WHERE type='confession_close' ORDER BY id DESC LIMIT 1")
+      .get() as { actor_id: string };
+    expect(closeEvent.actor_id).toBe(OTHER_STAFF);
+    expect(h.threadPostTexts()).toContain(`<@${OTHER_STAFF}>`);
+    expect(h.threadPostTexts()).not.toContain(`<@${STAFF}> が未確定だった返信`);
+  });
+
+  it("最初に送った担当者が終わらせたなら、その人のまま", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "本文" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+    await h.press(`mimi:replyend:${draftId}`);
+    expect(h.row().closed_by).toBe(STAFF);
+    expect(h.services.confessions.getReplyDraft(draftId)!.executed_by).toBe(STAFF);
   });
 });

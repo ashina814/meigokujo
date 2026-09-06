@@ -219,7 +219,14 @@ export type ConditionalCloseResult =
  *  - `lost`    … 送っている間に会話が終わっていた。終了はそのまま維持する
  */
 export interface StaffReplyFinalizeResult {
-  readonly transition: "closed" | "waiting" | "lost";
+  /**
+   * - `closed` / `waiting` — この試行が会話を動かした
+   * - `lost` — 送信中に会話が終わっていた（終了を維持した）
+   * - `superseded` — **この試行はもう現役ではない**（回収されたか、次の試行が始まった）。
+   *   会話は終わっていない。`lost` と一緒くたにすると、終わっていない会話について
+   *   担当者へ「終了していました」と言ってしまう。
+   */
+  readonly transition: "closed" | "waiting" | "lost" | "superseded";
   readonly deadlineAt: number | null;
   readonly row: ConfessionRow | undefined;
 }
@@ -277,9 +284,10 @@ export interface PendingRenderRow {
   render_kind: string; // reply_waiting | reply_closed | reply_after_close
   deadline_at: number | null;
   closed_by_sender: number | null;
-  state: string; // pending | settled | failed
+  state: string; // pending | rendering | settled | failed
   created_at: number;
   settled_at: number | null;
+  owner_instance: string | null;
 }
 
 /**
@@ -316,6 +324,8 @@ export interface OrphanRecovery {
   readonly ackAttempts: number;
   readonly replyDrafts: number;
   readonly followUps: number;
+  /** 収束の途中で放置された表示（`rendering` のまま残ったもの） */
+  readonly renders: number;
 }
 
 /** 担当者の自由返信の下書き。Discord へ送る前に必ずここへ置き、行の消費で二重送信を防ぐ */
@@ -330,6 +340,10 @@ export interface ReplyDraftRow {
   outcome: string | null; // sending | delivered | failed | unknown | resolved_manually
   body_purge_at: number | null;
   owner_instance: string | null;
+  /** 試行の世代。claim のたびに増える。古い callback を弾く札 */
+  generation: number;
+  /** その送信を実際に行った人（下書きの作者 `staff_id` とは別） */
+  executed_by: string | null;
   resolved_at: number | null;
   resolved_by: string | null;
 }
@@ -527,6 +541,12 @@ export class Confessions {
     this.addColumnTo("confession_follow_ups", "resolved_by", "TEXT");
     this.addColumnTo("confession_reply_drafts", "resolved_at", "INTEGER");
     this.addColumnTo("confession_reply_drafts", "resolved_by", "TEXT");
+    // 返信にも試行の世代を持たせる。owner_instance だけでは
+    // 「同じプロセスで始まった前の試行」と「いまの試行」を区別できない。
+    this.addColumnTo("confession_reply_drafts", "generation", "INTEGER NOT NULL DEFAULT 0");
+    // その外部送信を実際に行った人（下書きを書いた人とは別でありうる）
+    this.addColumnTo("confession_reply_drafts", "executed_by", "TEXT");
+    this.addColumnTo("confession_pending_renders", "owner_instance", "TEXT");
     this.heartbeatInstance(this.instanceId);
     // 期限つきの投稿者待ちだけを走査するための索引（期限なしの既存行は入らない）
     this.db.exec(
@@ -872,9 +892,11 @@ export class Confessions {
     // 送信中を区別できない）。
     const info = this.db
       .prepare(
-        "UPDATE confession_reply_drafts SET consumed_at=?, intent=?, outcome='sending', owner_instance=? WHERE id=? AND consumed_at IS NULL",
+        `UPDATE confession_reply_drafts
+         SET consumed_at=?, intent=?, outcome='sending', owner_instance=?, generation=generation+1, executed_by=?
+         WHERE id=? AND consumed_at IS NULL`,
       )
-      .run(now(), intent, this.instanceId, draftId);
+      .run(now(), intent, this.instanceId, staffId, draftId);
     if (info.changes !== 1) return { ok: false, code: "already_consumed", row };
     return { ok: true, draft: this.getReplyDraft(draftId)!, row };
   }
@@ -886,16 +908,21 @@ export class Confessions {
    * （案件ID・担当者・意図・時刻・結末は監査のために残る）。届いていない／不明な本文は
    * 再試行のために残すが、これも案件と同じ保持期限の内側にある。
    */
-  finishReplyDraft(draftId: number, outcome: DeliveryOutcome): void {
-    // **送信中の行にだけ書ける。** 起動時回収が unknown へ倒したあと、
-    // 古い callback が delivered で帰ってきても上書きしない。
-    if (outcome === "delivered") {
+  finishReplyDraft(input: { draftId: number; generation: number; outcome: DeliveryOutcome }): void {
+    // **送信中の、しかも自分が取った世代にだけ書ける。**
+    // 起動時回収が unknown へ倒したあとや、手動再送の次の試行が始まったあとに
+    // 古い callback が帰ってきても上書きしない。
+    if (input.outcome === "delivered") {
       this.db
-        .prepare("UPDATE confession_reply_drafts SET outcome=?, body=NULL WHERE id=? AND outcome='sending'")
-        .run(outcome, draftId);
+        .prepare(
+          "UPDATE confession_reply_drafts SET outcome=?, body=NULL WHERE id=? AND outcome='sending' AND generation=?",
+        )
+        .run(input.outcome, input.draftId, input.generation);
       return;
     }
-    this.db.prepare("UPDATE confession_reply_drafts SET outcome=? WHERE id=? AND outcome='sending'").run(outcome, draftId);
+    this.db
+      .prepare("UPDATE confession_reply_drafts SET outcome=? WHERE id=? AND outcome='sending' AND generation=?")
+      .run(input.outcome, input.draftId, input.generation);
   }
 
   /** 下書きの所属案件はDBだけが決める（customId を権限の根拠にしない） */
@@ -930,13 +957,14 @@ export class Confessions {
    * 未確定の返信を、担当者が重複を承知で送り直すための所有権。
    * **案件との結び付きをDBで強制する**（別案件のIDを渡しても取れない）。
    */
-  claimReplyDraftManualRetry(confessionId: number, draftId: number): ReplyDraftRow | undefined {
+  claimReplyDraftManualRetry(confessionId: number, draftId: number, executorId: string): ReplyDraftRow | undefined {
     const info = this.db
       .prepare(
-        `UPDATE confession_reply_drafts SET outcome='sending', owner_instance=?
+        `UPDATE confession_reply_drafts
+         SET outcome='sending', owner_instance=?, generation=generation+1, executed_by=?
          WHERE id=? AND confession_id=? AND body IS NOT NULL AND outcome IN ('failed','unknown')`,
       )
-      .run(this.instanceId, draftId, confessionId);
+      .run(this.instanceId, executorId, draftId, confessionId);
     return info.changes === 1 ? this.getReplyDraft(draftId) : undefined;
   }
 
@@ -966,8 +994,15 @@ export class Confessions {
    */
   finalizeStaffReply(input: {
     draftId: number;
+    /** `claimReplyDraft` / `claimReplyDraftManualRetry` が返した世代。**省略できない** */
+    generation: number;
     intent: "wait" | "close";
-    staffId: string;
+    /**
+     * **この確定を成立させた人。** 下書きを書いた人（`draft.staff_id`）とは別でありうる。
+     * 未確定の返信を別の担当者が送り直したとき、会話を終えた／待つと決めたのはその人で、
+     * `closed_by` や監査記録もその人でなければ「誰がやったのか」が嘘になる。
+     */
+    actorId: string;
     retentionDays?: number;
     atTs?: number;
     /** 中立な1通の宛先。あとで**同じメッセージ**を最終形へ書き換えるために持つ */
@@ -976,21 +1011,22 @@ export class Confessions {
     const ts = input.atTs ?? now();
     const draft = this.getReplyDraft(input.draftId);
     if (!draft) return { transition: "lost", deadlineAt: null, row: undefined };
-    // **いま送っている本人の確定だけを通す。**
-    // 起動時回収で unknown になった下書きや、別の担当者・別の意図の確定は通さない
-    // ——古い callback が、あとから会話を勝手に終わらせたり待たせたりしないため。
-    if (draft.outcome !== "sending" || draft.staff_id !== input.staffId || draft.intent !== input.intent) {
-      return { transition: "lost", deadlineAt: null, row: this.get(draft.confession_id) };
-    }
     const id = draft.confession_id;
     const purgeAt = input.retentionDays && input.retentionDays > 0 ? ts + input.retentionDays * 86_400 : null;
     const deadline = input.intent === "wait" ? Confessions.senderReplyDeadlineFrom(ts) : null;
 
     const apply = this.db.transaction((): StaffReplyFinalizeResult["transition"] => {
-      // 届いた事実と本文の消去は無条件（会話の遷移に負けても失わない）
-      this.db
-        .prepare("UPDATE confession_reply_drafts SET outcome='delivered', body=NULL WHERE id=? AND outcome='sending'")
-        .run(input.draftId);
+      // **トランザクションの中で、いまこの試行が現役かを確かめる。**
+      // 事前に読んだ値だけを根拠にすると、読んでから書くまでのあいだに
+      // 起動時回収や次の手動再送が割り込んだ場合を取りこぼす。
+      // `changes=1` に勝った試行だけが、本文の消去と会話の遷移へ進む。
+      const won = this.db
+        .prepare(
+          `UPDATE confession_reply_drafts SET outcome='delivered', body=NULL
+           WHERE id=? AND outcome='sending' AND generation=? AND intent=?`,
+        )
+        .run(input.draftId, input.generation, input.intent).changes;
+      if (won !== 1) return "superseded";
       if (input.intent === "close") {
         const closed = this.db
           .prepare(
@@ -999,7 +1035,7 @@ export class Confessions {
                  reply_deadline_at=NULL, body_purge_at=COALESCE(body_purge_at, ?)
              WHERE id=? AND status<>'closed'`,
           )
-          .run(ts, input.staffId, purgeAt, id);
+          .run(ts, input.actorId, purgeAt, id);
         return closed.changes === 1 ? "closed" : "lost";
       }
       const waited = this.db
@@ -1012,26 +1048,27 @@ export class Confessions {
     // 編集の前に落ちても、収束すべき姿がDBに残っている。
     const applyWithRender = this.db.transaction((): StaffReplyFinalizeResult["transition"] => {
       const transition = apply();
-      const closedBySender = this.get(id)?.closed_side === "sender";
+      if (transition === "superseded") return "superseded";
       this.queueFinalRender({
         confessionId: id,
         draftId: input.draftId,
         target: input.renderTarget ?? null,
-        kind: transition === "waiting" ? "reply_waiting" : transition === "closed" ? "reply_closed" : "reply_after_close",
-        deadlineAt: transition === "waiting" ? deadline : null,
-        closedBySender,
         atTs: ts,
       });
       return transition;
     });
 
-    const transition = applyWithRender();
-    if (transition === "closed") {
-      this.events.log("confession_close", { actor: input.staffId, payload: { id, reason: "resolved", side: "staff" } });
-    } else if (transition === "waiting") {
-      this.events.log("confession_reply_wait", { actor: input.staffId, payload: { id, deadlineAt: deadline } });
+    const outcome = applyWithRender();
+    if (outcome === "superseded") {
+      // 現役でない試行の確定。会話も本文も触っていない。
+      return { transition: "superseded", deadlineAt: null, row: this.get(id) };
     }
-    return { transition, deadlineAt: transition === "waiting" ? deadline : null, row: this.get(id) };
+    if (outcome === "closed") {
+      this.events.log("confession_close", { actor: input.actorId, payload: { id, reason: "resolved", side: "staff" } });
+    } else if (outcome === "waiting") {
+      this.events.log("confession_reply_wait", { actor: input.actorId, payload: { id, deadlineAt: deadline } });
+    }
+    return { transition: outcome, deadlineAt: outcome === "waiting" ? deadline : null, row: this.get(id) };
   }
 
   /**
@@ -1142,26 +1179,33 @@ export class Confessions {
    * 追記の引き渡し結果を確定する。届いた本文だけ消す（retention を迂回しない）。
    * `attempts` は試行のたびに増え、明確な失敗だけが自動再試行の対象になる。
    */
-  settleFollowUpRelay(followUpId: number, outcome: DeliveryOutcome, generation?: number): FollowUpRow | undefined {
+  settleFollowUpRelay(input: {
+    followUpId: number;
+    /** `claimFollowUpRelay` が返した世代。**省略できない** */
+    generation: number;
+    outcome: DeliveryOutcome;
+  }): FollowUpRow | undefined {
     const ts = now();
     // **送信中の、しかも自分が取った世代にだけ書ける。**
     // 手動再送の2回目が始まったあとに1回目の callback が帰ってきても、
     // 世代が違うので新しい試行の結果を塗り替えない。
-    const gate = generation === undefined ? "" : " AND generation=?";
-    const args = generation === undefined ? [] : [generation];
-    if (outcome === "delivered") {
+    //
+    // 世代を任意引数にしていたときは、本番の経路（投稿者の追記・刻時盤の再中継）が
+    // どれも渡しておらず、門が実質存在していなかった。**必須にして型で漏れを止める。**
+    if (input.outcome === "delivered") {
       this.db
         .prepare(
-          `UPDATE confession_follow_ups SET outcome='delivered', relayed_at=?, body=NULL WHERE id=? AND outcome='sending'${gate}`,
+          `UPDATE confession_follow_ups SET outcome='delivered', relayed_at=?, body=NULL
+           WHERE id=? AND outcome='sending' AND generation=?`,
         )
-        .run(ts, followUpId, ...args);
+        .run(ts, input.followUpId, input.generation);
     } else {
       // 試行回数は所有権を取った時点で増えている。ここで二重に数えない。
       this.db
-        .prepare(`UPDATE confession_follow_ups SET outcome=? WHERE id=? AND outcome='sending'${gate}`)
-        .run(outcome, followUpId, ...args);
+        .prepare("UPDATE confession_follow_ups SET outcome=? WHERE id=? AND outcome='sending' AND generation=?")
+        .run(input.outcome, input.followUpId, input.generation);
     }
-    return this.getFollowUp(followUpId);
+    return this.getFollowUp(input.followUpId);
   }
 
   /**
@@ -1282,28 +1326,47 @@ export class Confessions {
     confessionId: number;
     draftId: number | null;
     target: { channelId: string; messageId: string } | null;
-    kind: "reply_waiting" | "reply_closed" | "reply_after_close";
-    deadlineAt: number | null;
-    closedBySender: boolean;
     atTs: number;
   }): void {
     if (!input.target) return;
+    // **凍結した見た目を持たない。** 行が持つのは「どのメッセージを」「どの案件の
+    // いまの状態へ」収束させるか、だけ。queue した時点の期限や種別を後生大事に
+    // 抱えていると、編集に失敗しているあいだに会話が終わった場合、あとから
+    // 「7日後に終了します」を終わった会話へ復活させてしまう。
     this.db
       .prepare(
         `INSERT INTO confession_pending_renders
-           (confession_id, draft_id, channel_id, message_id, render_kind, deadline_at, closed_by_sender, state, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)`,
+           (confession_id, draft_id, channel_id, message_id, render_kind, state, created_at)
+         VALUES (?, ?, ?, ?, 'current_state', 'pending', ?)`,
       )
-      .run(
-        input.confessionId,
-        input.draftId,
-        input.target.channelId,
-        input.target.messageId,
-        input.kind,
-        input.deadlineAt,
-        input.closedBySender ? 1 : 0,
-        input.atTs,
-      );
+      .run(input.confessionId, input.draftId, input.target.channelId, input.target.messageId, input.atTs);
+  }
+
+  /**
+   * その案件の**いまの姿**から、投稿者へ見せるべき最終形を導く。
+   *
+   * 収束は必ずここを通す。凍結した希望ではなく、現在の canonical state が正本。
+   */
+  desiredRender(confessionId: number): {
+    kind: "reply_waiting" | "reply_closed" | "reply_after_close";
+    deadlineAt: number | null;
+    closedBySender: boolean;
+  } {
+    const row = this.get(confessionId);
+    if (!row) return { kind: "reply_after_close", deadlineAt: null, closedBySender: false };
+    if (row.status === "closed") {
+      // 終わっている会話へ、開いているように見える案内も期限も描かない。
+      return {
+        kind: row.closed_side === "staff" ? "reply_closed" : "reply_after_close",
+        deadlineAt: null,
+        closedBySender: row.closed_side === "sender",
+      };
+    }
+    if (row.reply_deadline_at !== null) {
+      return { kind: "reply_waiting", deadlineAt: row.reply_deadline_at, closedBySender: false };
+    }
+    // 待ちでも終わりでもない（追記で運営の番へ戻った等）。期限は描かない。
+    return { kind: "reply_waiting", deadlineAt: null, closedBySender: false };
   }
 
   /** まだ最終形へ書き換えられていない指示（起動時・刻時盤が収束させる） */
@@ -1319,6 +1382,13 @@ export class Confessions {
       .all(confessionId) as PendingRenderRow[];
   }
 
+  /** 収束の途中で止まったまま（所有者が落ちた可能性がある）表示 */
+  listStalledRenders(): PendingRenderRow[] {
+    return this.db
+      .prepare("SELECT * FROM confession_pending_renders WHERE state='rendering' ORDER BY id")
+      .all() as PendingRenderRow[];
+  }
+
   /** 書き換えの結末。失敗は担当者から見える形で残す（勝手に諦めない） */
   settleRender(renderId: number, state: "settled" | "failed"): PendingRenderRow | undefined {
     this.db
@@ -1331,9 +1401,13 @@ export class Confessions {
 
   /** 収束の所有権。勝った1つだけが Discord を触る */
   claimRender(renderId: number): PendingRenderRow | undefined {
+    // 所有者を残すのは、途中で落ちたときに「誰の実行が止まったのか」を
+    // あとから判断できるようにするため（生きている相手の実行は奪わない）。
     const info = this.db
-      .prepare("UPDATE confession_pending_renders SET state='rendering' WHERE id=? AND state IN ('pending','failed')")
-      .run(renderId);
+      .prepare(
+        "UPDATE confession_pending_renders SET state='rendering', owner_instance=? WHERE id=? AND state IN ('pending','failed')",
+      )
+      .run(this.instanceId, renderId);
     return info.changes === 1
       ? (this.db.prepare("SELECT * FROM confession_pending_renders WHERE id=?").get(renderId) as PendingRenderRow)
       : undefined;
@@ -1399,10 +1473,16 @@ export class Confessions {
           `UPDATE confession_follow_ups SET outcome='unknown' WHERE outcome IN ('sending','retrying') AND relayed_at IS NULL${notLive}`,
         )
         .run(...live).changes;
-      return { ackAttempts, replyDrafts, followUps };
+      // 収束の途中で落ちたものは `rendering` のまま残り、誰も拾わなくなる。
+      // **同じメッセージへの編集は冪等**なので、所有者が死んでいると確かめられたら
+      // `pending` へ戻して収束を再開してよい（新しい DM は増えない）。
+      const renders = this.db
+        .prepare(`UPDATE confession_pending_renders SET state='pending' WHERE state='rendering'${notLive}`)
+        .run(...live).changes;
+      return { ackAttempts, replyDrafts, followUps, renders };
     });
     const result = run();
-    if (result.ackAttempts + result.replyDrafts + result.followUps > 0) {
+    if (result.ackAttempts + result.replyDrafts + result.followUps + result.renders > 0) {
       this.events.log("confession_orphan_recovered", { actor, payload: { ...result } });
     }
     return result;
