@@ -63,11 +63,16 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
   let dmMode: "ok" | "api" | "net" = "ok";
   let editMode: "ok" | "api" | "net" = "ok";
   let threadMode: "ok" | "api" | "net" = "ok";
-  /** 送信の境界で止めるための deferred。時間待ちは使わない。 */
-  let dmGate: Promise<void> | null = null;
-  let dmGateEntered: (() => void) | null = null;
-  let threadGate: Promise<void> | null = null;
-  let threadGateEntered: (() => void) | null = null;
+  /**
+   * 送信の境界で止めるための関門。時間待ちは使わない。
+   *
+   * **同時に複数の送信を止められる。** 「古い試行がまだ飛んでいるあいだに、
+   * 新しい試行も飛んでいる」という状態を作らないと、世代の門は
+   * `outcome='sending'` の条件に隠れてしまい、外しても誰も気づかない。
+   */
+  type Gate = { entered: () => void; wait: Promise<"ok" | "api" | "net"> };
+  const dmGates: Gate[] = [];
+  const threadGates: Gate[] = [];
   const apiError = () => Object.assign(new Error("Cannot send messages to this user"), { code: 50007 });
   const netError = () => Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
 
@@ -84,15 +89,15 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
     isThread: () => true,
     archived: false,
     send: async (o: Sent) => {
-      // DM と同じく、**いま飛ぼうとしている1通だけ**を止める
-      const gate = threadGate;
-      threadGate = null;
+      // 関門が積まれていれば、この1通はそこで止まる（結末も関門側が決める）
+      const gate = threadGates.shift();
+      let mode = threadMode;
       if (gate) {
-        threadGateEntered?.();
-        await gate;
+        gate.entered();
+        mode = await gate.wait;
       }
-      if (threadMode === "api") throw apiError();
-      if (threadMode === "net") throw netError();
+      if (mode === "api") throw apiError();
+      if (mode === "net") throw netError();
       threadPosts.push(o);
     },
     setArchived: vi.fn(async () => undefined),
@@ -127,16 +132,16 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
       fetch: async (uid: string) => ({
         id: uid,
         send: async (o: Sent) => {
-          // ゲートは**いま飛ぼうとしている1通だけ**を止める。後続（投稿者側の操作で
-          // 出る DM など）まで止めると、競合そのものを作れない。
-          const gate = dmGate;
-          dmGate = null;
+          // 関門は**積んだ数だけ**の送信を止める。後続（投稿者側の操作で出る DM など）
+          // まで無条件に止めると、競合そのものを作れない。
+          const gate = dmGates.shift();
+          let mode = dmMode;
           if (gate) {
-            dmGateEntered?.(); // 「本当に送信の途中まで来た」ことを呼び出し側へ知らせる
-            await gate;
+            gate.entered(); // 「本当に送信の途中まで来た」ことを呼び出し側へ知らせる
+            mode = await gate.wait;
           }
-          if (dmMode === "api") throw apiError();
-          if (dmMode === "net") throw netError();
+          if (mode === "api") throw apiError();
+          if (mode === "net") throw netError();
           // 実物と同じく、届いた1通は **DMチャンネル経由で取り直して** 編集できる。
           // `dms` は投稿者にいま見えている内容、`dmVersions` は届いた順の全版。
           const index = dms.push(o) - 1;
@@ -199,6 +204,20 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
     message: { components: [] },
   });
 
+  /** 次に飛ぶ1通を止める関門を積む。積んだ順に消費される */
+  const arm = (queue: Gate[]) => {
+    let release!: (mode: "ok" | "api" | "net") => void;
+    let signalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    const wait = new Promise<"ok" | "api" | "net">((resolve) => {
+      release = resolve;
+    });
+    queue.push({ entered: signalEntered, wait });
+    return { entered, release: (mode: "ok" | "api" | "net" = "ok") => release(mode) };
+  };
+
   const press = async (customId: string, userId = STAFF) => {
     await handleConfessionButton(makeInteraction(customId, userId) as any, services);
   };
@@ -236,34 +255,13 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
       return [json?.description ?? "", ...(json?.fields ?? []).map((f: any) => f.value)].join("\n");
     },
     /** 運営スレッドへの中継を境界で止める（`holdDm` と同じ形） */
-    holdThread: () => {
-      let release!: () => void;
-      let signalEntered!: () => void;
-      const entered = new Promise<void>((resolve) => {
-        signalEntered = resolve;
-      });
-      threadGate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      threadGateEntered = signalEntered;
-      return { entered, release: () => release() };
-    },
+    holdThread: () => arm(threadGates),
     /**
      * DM 送信を境界で止める。`entered` が解決した時点で「送信の途中」に確実に入っている
      * ので、そこから競合を起こせる（時間待ちに頼らない）。
+     * `release(mode)` で、その1通だけの結末（届いた / 拒否された / 不明）を決められる。
      */
-    holdDm: () => {
-      let release!: () => void;
-      let signalEntered!: () => void;
-      const entered = new Promise<void>((resolve) => {
-        signalEntered = resolve;
-      });
-      dmGate = new Promise<void>((resolve) => {
-        release = resolve;
-      });
-      dmGateEntered = signalEntered;
-      return { entered, release: () => release() };
-    },
+    holdDm: () => arm(dmGates),
     threadPostTexts: (): string =>
       threadPosts
         .map((p) => {
@@ -1714,12 +1712,20 @@ describe("試行の世代は、本番の経路でも効いている", () => {
   const followUpId = (h: ReturnType<typeof harness>) =>
     h.db.prepare("SELECT id FROM confession_follow_ups ORDER BY id").pluck().get() as number;
 
+  /**
+   * **古い試行と新しい試行が、同時に飛んでいる状態を作る。**
+   *
+   * 片方が終わってから帰ってくるだけなら `outcome='sending'` の条件が働くので、
+   * 世代の門を外しても誰も気づかない。門が本当に効いているかは、
+   * 「新しい試行がまだ送信中のうちに、古い callback が帰る」でしか見えない。
+   */
+
   // R28a: 投稿者の追記（本番の初回経路）
-  it("追記の中継中に回収が入っても、古い callback は新しい試行を壊さない", async () => {
+  it("追記の送り直しが飛んでいる最中に古い callback が帰っても、決着は新しい試行のもの", async () => {
     const h = harness("yes");
-    const gate = h.holdThread();
+    const first = h.holdThread();
     const submitting = h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "世代の試験" });
-    await gate.entered; // 「中継の途中」に確実に入っている
+    await first.entered; // 「中継の途中」に確実に入っている
 
     const fid = followUpId(h);
     const gen1 = h.services.confessions.getFollowUp(fid)!.generation;
@@ -1728,26 +1734,34 @@ describe("試行の世代は、本番の経路でも効いている", () => {
     expect(h.services.confessions.recoverOrphanedEffects("system:startup").followUps).toBe(1);
     expect(h.services.confessions.getFollowUp(fid)!.outcome).toBe("unknown");
 
-    // 担当者が重複を承知で送り直す（世代2）
-    await h.press(`mimi:followupretry:${fid}`);
-    const afterRetry = h.services.confessions.getFollowUp(fid)!;
-    expect(afterRetry.generation).toBeGreaterThan(gen1);
-    expect(afterRetry.outcome).toBe("delivered");
+    // 担当者が重複を承知で送り直す（世代2）。**こちらもまだ飛んでいる**
+    const second = h.holdThread();
+    const retrying = h.press(`mimi:followupretry:${fid}`);
+    await second.entered;
+    const gen2 = h.services.confessions.getFollowUp(fid)!.generation;
+    expect(gen2).toBeGreaterThan(gen1);
+    expect(h.services.confessions.getFollowUp(fid)!.outcome).toBe("sending");
 
-    // ここで世代1の callback が帰ってくる
-    gate.release();
+    // 世代1が「渡せたか分からない」で帰る。世代2はまだ送信中
+    first.release("net");
     await submitting;
+    // 世代2が渡せた
+    second.release("ok");
+    await retrying;
 
     const settled = h.services.confessions.getFollowUp(fid)!;
-    expect(settled.generation).toBe(afterRetry.generation);
+    // 古い試行の「不明」が、新しい試行の「渡せた」を塗り潰していない
+    expect(settled.generation).toBe(gen2);
     expect(settled.outcome).toBe("delivered");
-    // 決着の時刻も試行回数も、古い試行では動かない
-    expect(settled.relayed_at).toBe(afterRetry.relayed_at);
-    expect(settled.attempts).toBe(afterRetry.attempts);
+    expect(settled.relayed_at).not.toBeNull();
+    expect(settled.body).toBeNull();
+    // 渡し終えたものが、判断待ちとして残り続けない
+    expect(h.services.confessions.listFollowUpsNeedingDecision(h.id)).toEqual([]);
+    expect(h.services.confessions.obligations(h.id).followUps).toBe(0);
   });
 
   // R28b: 刻時盤の再中継経路
-  it("刻時盤の再中継でも、古い callback は新しい試行を壊さない", async () => {
+  it("刻時盤の再中継が飛んでいる最中に古い callback が帰っても、決着は新しい試行のもの", async () => {
     const h = harness("yes");
     h.setThreadFails(true);
     await h.submit(`mimi:replybody:${h.id}`, SENDER, { text: "刻時盤の試験" });
@@ -1755,24 +1769,32 @@ describe("試行の世代は、本番の経路でも効いている", () => {
     const fid = followUpId(h);
     expect(h.services.confessions.getFollowUp(fid)!.outcome).toBe("failed");
 
-    const gate = h.holdThread();
+    // 刻時盤が拾って再中継（世代2）。まだ飛んでいる
+    const sweep = h.holdThread();
     const sweeping = retryPendingFollowUps(h.client as any, h.services);
-    await gate.entered;
-    const gen = h.services.confessions.getFollowUp(fid)!.generation;
+    await sweep.entered;
+    const genSweep = h.services.confessions.getFollowUp(fid)!.generation;
 
     expect(h.services.confessions.recoverOrphanedEffects("system:startup").followUps).toBe(1);
-    await h.press(`mimi:followupretry:${fid}`);
-    const afterRetry = h.services.confessions.getFollowUp(fid)!;
-    expect(afterRetry.generation).toBeGreaterThan(gen);
-    expect(afterRetry.outcome).toBe("delivered");
 
-    gate.release();
+    // 担当者が送り直す（世代3）。**こちらもまだ飛んでいる**
+    const manual = h.holdThread();
+    const retrying = h.press(`mimi:followupretry:${fid}`);
+    await manual.entered;
+    const genManual = h.services.confessions.getFollowUp(fid)!.generation;
+    expect(genManual).toBeGreaterThan(genSweep);
+    expect(h.services.confessions.getFollowUp(fid)!.outcome).toBe("sending");
+
+    sweep.release("net");
     await sweeping;
+    manual.release("ok");
+    await retrying;
 
     const settled = h.services.confessions.getFollowUp(fid)!;
-    expect(settled.generation).toBe(afterRetry.generation);
-    expect(settled.relayed_at).toBe(afterRetry.relayed_at);
-    expect(settled.attempts).toBe(afterRetry.attempts);
+    expect(settled.generation).toBe(genManual);
+    expect(settled.outcome).toBe("delivered");
+    expect(settled.relayed_at).not.toBeNull();
+    expect(h.services.confessions.listFollowUpsNeedingDecision(h.id)).toEqual([]);
   });
 
   // R29a: 返信の世代（本番の返信経路）
