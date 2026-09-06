@@ -15,9 +15,13 @@ vi.mock("../src/church-roles.js", () => ({
   roleMention: () => ({ content: undefined, roleIds: [] }),
 }));
 
-const { armConfessionStartupRecovery, awaitConfessionReady, __setConfessionBarrierForTest } = await import(
-  "../src/confession-startup.js"
-);
+const {
+  armConfessionStartupRecovery,
+  awaitConfessionReady,
+  startConfessionHeartbeat,
+  stopConfessionHeartbeat,
+  __setConfessionBarrierForTest,
+} = await import("../src/confession-startup.js");
 const { retryPendingFollowUps } = await import("../src/commands/confession.js");
 
 /**
@@ -40,6 +44,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  stopConfessionHeartbeat();
   __setConfessionBarrierForTest(null);
   for (const h of handles.splice(0)) h.close();
   try {
@@ -168,5 +173,68 @@ describe("起動時の回収は、外部送信より先に走る", () => {
     expect(posted).toEqual([]);
     // 担当者の判断待ちとして残る
     expect(after.confessions.listFollowUpsNeedingDecision(row.id)).toHaveLength(1);
+  });
+});
+
+describe("生存の記録は、刻時盤の長い周回に巻き込まれない", () => {
+  /**
+   * **鼓動が止まると、生きているプロセスが「死んだ所有者」に見える。**
+   *
+   * 刻時盤は1周が長く、しかも前の周が終わるまで次が始まらない。鼓動をその列に混ぜると、
+   * 鼓動より前の無関係な処理が貸出期限より長く詰まっただけで、別インスタンスが
+   * 実行中の送信を奪えてしまう。だから鼓動は独立した間隔で打つ。
+   */
+  it("刻時盤の周回が終わらなくても、貸出は更新され続ける", () => {
+    const ctx = boot();
+    const id = ctx.confessions.instance;
+
+    // 刻時盤の周回が終わらない状況（この Promise は最後まで解決しない）
+    let tickSettled = false;
+    let releaseTick!: () => void;
+    const stalledTick = new Promise<void>((resolve) => {
+      releaseTick = resolve;
+    }).then(() => {
+      tickSettled = true;
+    });
+
+    vi.useFakeTimers();
+    try {
+      startConfessionHeartbeat(ctx.services);
+      // ここから先、誰も明示的には鼓動を打たない
+      ctx.db.prepare("UPDATE confession_instances SET heartbeat_at=0 WHERE instance_id=?").run(id);
+      expect(ctx.confessions.liveInstances()).not.toContain(id);
+
+      // 刻時盤は止まったまま。時間だけが進む
+      vi.advanceTimersByTime(30_000);
+      expect(tickSettled).toBe(false);
+      // それでも生きていると分かる＝この実行は奪われない
+      expect(ctx.confessions.liveInstances()).toContain(id);
+
+      // さらに周回しても打ち続ける
+      ctx.db.prepare("UPDATE confession_instances SET heartbeat_at=0 WHERE instance_id=?").run(id);
+      vi.advanceTimersByTime(30_000);
+      expect(ctx.confessions.liveInstances()).toContain(id);
+    } finally {
+      stopConfessionHeartbeat();
+      vi.useRealTimers();
+      releaseTick();
+      void stalledTick;
+    }
+  });
+
+  it("止めれば、貸出は期限どおり切れる（回収できなくならない）", () => {
+    const ctx = boot();
+    const id = ctx.confessions.instance;
+    vi.useFakeTimers();
+    try {
+      startConfessionHeartbeat(ctx.services);
+      stopConfessionHeartbeat();
+      ctx.db.prepare("UPDATE confession_instances SET heartbeat_at=0 WHERE instance_id=?").run(id);
+      vi.advanceTimersByTime(120_000);
+      // 打ち手がいない以上、更新されない
+      expect(ctx.confessions.liveInstances()).not.toContain(id);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -1148,6 +1148,32 @@ describe("古い実行の帰りが、新しい状態を壊さない", () => {
     expect(confessions.get(row.id)!.reply_deadline_at).not.toBeNull();
   });
 
+  it("人が畳んだ追記を、あとから帰ってきた中継結果が掘り返さない", () => {
+    // **決着していない試行にしか書けない。** ここを緩めると、遅れて帰ってきた結果が
+    // `resolved_manually` を `unknown` へ戻し、本文の無い「判断待ち」が永久に残る。
+    // 責務が消えないので、その案件のスレッドは二度と畳めなくなる。
+    const row = seed("yes");
+    const f = confessions.recordSenderFollowUp(row.id, "sender-1", "本文", 90) as { ok: true; followUpId: number };
+    const claimed = confessions.claimFollowUpRelay(f.followUpId)!;
+    confessions.recoverOrphanedEffects("system:startup", afterLease2());
+    confessions.resolveFollowUpManually(row.id, f.followUpId, "staff-1");
+    expect(confessions.getFollowUp(f.followUpId)!.outcome).toBe("resolved_manually");
+    expect(confessions.obligations(row.id).followUps).toBe(0);
+
+    // ここで、その中継の結果がようやく帰ってくる
+    confessions.settleFollowUpRelay({ followUpId: f.followUpId, generation: claimed.generation, outcome: "unknown" });
+
+    const after = confessions.getFollowUp(f.followUpId)!;
+    expect(after.outcome).toBe("resolved_manually");
+    expect(after.resolved_at).not.toBeNull();
+    expect(confessions.obligations(row.id).followUps).toBe(0);
+
+    // 「届いた」で帰ってきても同じ（人が畳んだ事実を配送で塗り替えない）
+    confessions.settleFollowUpRelay({ followUpId: f.followUpId, generation: claimed.generation, outcome: "delivered" });
+    expect(confessions.getFollowUp(f.followUpId)!.outcome).toBe("resolved_manually");
+    expect(confessions.getFollowUp(f.followUpId)!.relayed_at).toBeNull();
+  });
+
   it("回収後に帰ってきた追記の中継結果を受け付けない", () => {
     const row = seed("yes");
     const f = confessions.recordSenderFollowUp(row.id, "sender-1", "本文", 90) as { ok: true; followUpId: number };
