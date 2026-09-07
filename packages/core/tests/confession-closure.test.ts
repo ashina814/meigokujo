@@ -1578,6 +1578,32 @@ describe("再オープンは、終わっている会話にだけ成立する", (
     expect(reopenEvents()).toBe(before); // 嘘の再オープン記録が増えない
   });
 
+  it("投稿者待ちのまま終わった案件を開け直したら、運営の番に戻る", () => {
+    // **stage を温存しない。** `awaiting_poster` を引き継ぐと、期限は無いのに
+    // 「投稿者の番」を名乗る行になり、人が明示的に開け直した案件が
+    // `legacy_open`（由来の分からない古い行）として扱われてしまう。
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: confessions.getReplyDraft(draft.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+    });
+    const deadline = confessions.get(row.id)!.reply_deadline_at!;
+    expect(confessions.get(row.id)!.stage).toBe("awaiting_poster");
+    expect(confessions.autoCloseExpiredAtomic(row.id, deadline, 90).ok).toBe(true);
+
+    expect(confessions.reopen(row.id, "staff-1").ok).toBe(true);
+    const after = confessions.get(row.id)!;
+    expect(after.stage).toBe("active");
+    expect(after.reply_deadline_at).toBeNull();
+    // 誰の番かが読める（由来の分からない古い行にしない）
+    expect(confessionBall(after)).toBe("staff_attention");
+    expect(confessionBall(after)).not.toBe("legacy_open");
+  });
+
   it("二度押ししても、二度は成立しない", () => {
     const row = seed("yes");
     confessions.senderCloseAtomic(row.id, "sender-1", 90);
