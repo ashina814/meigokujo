@@ -231,6 +231,16 @@ export interface StaffReplyFinalizeResult {
   readonly row: ConfessionRow | undefined;
 }
 
+/**
+ * 人が「これ以上追わない」と決めた結果。**勝った1回だけが `won`。**
+ * 既に誰かが決着させていた／retention が終端化していた場合は `won=false` で、
+ * 呼び出し側は「閉じました」と言ってはならない。
+ */
+export interface ManualResolution<T> {
+  readonly won: boolean;
+  readonly row: T | undefined;
+}
+
 /** 再オープンの結果。終了していない案件には成立しない */
 export type ReopenResult =
   | { ok: true; row: ConfessionRow }
@@ -792,11 +802,20 @@ export class Confessions {
     if (row.status === "closed") return { ok: false, code: "already_closed", row };
     if (row.acknowledged_at !== null) return { ok: false, code: "already_delivered", row };
     try {
+      // **事前の read を権威にしない。**
+      // 読んでから書くまでのあいだに投稿者が終了しうる。終了が成立したあとに
+      // 新しい外向き送信の所有権を取れてしまうと、投稿者から見れば終えたはずの
+      // やり取りに DM が届く。所有権の取得と同じ DB 境界で closed を見る。
       const info = this.db
         .prepare(
-          "INSERT INTO confession_ack_attempts (confession_id, staff_id, started_at, owner_instance) VALUES (?, ?, ?, ?)",
+          `INSERT INTO confession_ack_attempts (confession_id, staff_id, started_at, owner_instance)
+           SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM confession_tickets t WHERE t.id=? AND t.status<>'closed')`,
         )
-        .run(id, staffId, now(), this.instanceId);
+        .run(id, staffId, now(), this.instanceId, id);
+      if (info.changes !== 1) {
+        // 送っていない。試行の行も作らない
+        return { ok: false, code: "already_closed", row: this.get(id) ?? row };
+      }
       return { ok: true, attemptId: Number(info.lastInsertRowid), row };
     } catch (error) {
       // **「送信中だった」と言ってよいのは、部分ユニーク索引に負けたときだけ。**
@@ -916,14 +935,23 @@ export class Confessions {
     // `sending` を立てるのは、落ちたときに「外へ触った可能性がある行」を
     // 起動時に見つけられるようにするため（consumed_at だけでは、決着済みと
     // 送信中を区別できない）。
+    // 上の `row.status === "closed"` は事前の read で、**権威ではない**。
+    // 読んでから書くまでのあいだに投稿者が終了しうるので、所有権の取得と同じ
+    // 境界でもう一度見る（勝てなければ外部送信は始まらない）。
     const info = this.db
       .prepare(
         `UPDATE confession_reply_drafts
          SET consumed_at=?, intent=?, outcome='sending', owner_instance=?, generation=generation+1, executed_by=?
-         WHERE id=? AND consumed_at IS NULL`,
+         WHERE id=? AND consumed_at IS NULL
+           AND EXISTS (SELECT 1 FROM confession_tickets t WHERE t.id=? AND t.status<>'closed')`,
       )
-      .run(now(), intent, this.instanceId, staffId, draftId);
-    if (info.changes !== 1) return { ok: false, code: "already_consumed", row };
+      .run(now(), intent, this.instanceId, staffId, draftId, draft.confession_id);
+    if (info.changes !== 1) {
+      const fresh = this.get(draft.confession_id);
+      // 負けた理由を取り違えない（終わっていたのか、二度押しだったのか）
+      if (fresh?.status === "closed") return { ok: false, code: "case_closed", row: fresh };
+      return { ok: false, code: "already_consumed", row: fresh ?? row };
+    }
     return { ok: true, draft: this.getReplyDraft(draftId)!, row };
   }
 
@@ -1007,17 +1035,21 @@ export class Confessions {
    * これ以上送らないと決める出口。**届いたことにはしない。**
    * 配送の事実（outcome=delivered）と、人が畳んだ事実（resolved_manually）は別。
    */
-  resolveReplyDraftManually(confessionId: number, draftId: number, staffId: string): ReplyDraftRow | undefined {
-    const info = this.db
-      .prepare(
-        `UPDATE confession_reply_drafts SET outcome='resolved_manually', body=NULL, resolved_at=?, resolved_by=?
-         WHERE id=? AND confession_id=? AND outcome IN ('failed','unknown')`,
-      )
-      .run(now(), staffId, draftId, confessionId);
-    if (info.changes === 1) {
+  resolveReplyDraftManually(confessionId: number, draftId: number, staffId: string): ManualResolution<ReplyDraftRow> {
+    // **勝った1回だけが「閉じた」と言える。**
+    // 既に別の担当者が畳んだあと・retention が終端化したあとに古いボタンを押しても、
+    // 何も変えないし、変えたことにもしない（嘘の記録を残さない）。
+    const won =
+      this.db
+        .prepare(
+          `UPDATE confession_reply_drafts SET outcome='resolved_manually', body=NULL, resolved_at=?, resolved_by=?
+           WHERE id=? AND confession_id=? AND outcome IN ('failed','unknown')`,
+        )
+        .run(now(), staffId, draftId, confessionId).changes === 1;
+    if (won) {
       this.events.log("confession_reply_resolved", { actor: staffId, payload: { id: confessionId, draftId } });
     }
-    return this.getReplyDraft(draftId);
+    return { won, row: this.getReplyDraft(draftId) };
   }
 
   /**
@@ -1351,20 +1383,22 @@ export class Confessions {
    * 担当者が「もう渡さなくてよい」と判断して閉じる出口。
    * 本文は消し、届いたことにはしない——`resolved_manually` として残す。
    */
-  resolveFollowUpManually(confessionId: number, followUpId: number, staffId: string): FollowUpRow | undefined {
+  resolveFollowUpManually(confessionId: number, followUpId: number, staffId: string): ManualResolution<FollowUpRow> {
     // **`relayed_at` は「運営スレッドへ実際に渡せた時刻」だけを意味する。**
     // 人が「もう追わない」と決めたことを配送の時刻で表すと、あとから
     // 「渡した記録がある」と読まれてしまう。決着は別の欄で持つ。
-    const info = this.db
-      .prepare(
-        `UPDATE confession_follow_ups SET outcome='resolved_manually', body=NULL, resolved_at=?, resolved_by=?
-         WHERE id=? AND confession_id=? AND relayed_at IS NULL AND outcome IN ('failed','unknown')`,
-      )
-      .run(now(), staffId, followUpId, confessionId);
-    if (info.changes === 1) {
+    // 勝った1回だけが「閉じた」と言える（返信の手動決着と同じ）。
+    const won =
+      this.db
+        .prepare(
+          `UPDATE confession_follow_ups SET outcome='resolved_manually', body=NULL, resolved_at=?, resolved_by=?
+           WHERE id=? AND confession_id=? AND relayed_at IS NULL AND outcome IN ('failed','unknown')`,
+        )
+        .run(now(), staffId, followUpId, confessionId).changes === 1;
+    if (won) {
       this.events.log("confession_followup_resolved", { actor: staffId, payload: { id: confessionId, followUpId } });
     }
-    return this.getFollowUp(followUpId);
+    return { won, row: this.getFollowUp(followUpId) };
   }
 
   /**
@@ -1536,12 +1570,25 @@ export class Confessions {
    */
   recoverOrphanedEffects(actor = "system:startup", atTs: number = now()): OrphanRecovery {
     const ts = atTs;
-    // **まだ鼓動を打っている所有者の実行は奪わない。**
+    // **まだ鼓動を打っている所有者の実行は奪わない。自分自身も含めて。**
+    //
     // 「起動したのだから前のプロセスは死んでいる」は、単一インスタンス運用を
-    // 前提にした暗黙の仮定でしかない。一瞬でも重なれば、生きている実行を
-    // unknown へ落とし、あとから帰ってくる callback と新しい実行が競合する。
-    // だから死を DB 上の事実（鼓動の途絶）で確かめてから回収する。
-    const live = this.liveInstances(ts).filter((i) => i !== this.instanceId);
+    // 前提にした暗黙の仮定でしかない。だから死を DB 上の事実（鼓動の途絶）で
+    // 確かめてから回収する。
+    //
+    // 以前はここで自分自身を live から除いていた。「起動直後の自分は何も持って
+    // いない」という前提なら害は無いが、その前提のせいで**この関数は起動時に
+    // 一度しか呼べない**ものになっていた。
+    //
+    // それでは足りない: 前プロセス A が落ちた直後（貸出の残り時間内）に B が
+    // 起動すると、A はまだ live と判定されて回収対象から外れる——そして二度と
+    // 見に来る者がいない。受領確認の部分ユニーク索引は塞がったまま、消費済みの
+    // 下書きは送信中のまま、追記は中継中のまま、表示は収束中のまま固まる。
+    //
+    // 自分自身も live に含めれば、この関数は**定期的に呼べる**ものになる。
+    // 自分がいま飛ばしている実行は自分の鼓動が守り、貸出の切れた所有者の
+    // 置き土産だけが、遅れてでも必ず回収される。起動時も定期掃きも同じ関数。
+    const live = this.liveInstances(ts);
     const placeholders = live.map(() => "?").join(",");
     const notLive = live.length > 0 ? ` AND (owner_instance IS NULL OR owner_instance NOT IN (${placeholders}))` : "";
     const run = this.db.transaction((): OrphanRecovery => {
@@ -1610,11 +1657,25 @@ export class Confessions {
     // 本文の破棄と終端化は同じトランザクションで行う。分かれていると、あいだで
     // 落ちたときに「本文は無いのに未処理」がそのまま残る。
     const run = this.db.transaction((): RetentionPurgeResult => {
+      // **いま飛んでいる試行の本文は消さない。**
+      // 送信中の行から本文を抜くと、Discord から結末が帰ってきたときに書き戻す
+      // ものが無くなり、実際に届いた配送の事実まで失う（`delivered` を書けても
+      // 本文はもう無く、失敗していれば送り直す手立ても消えている）。
+      // 決着してから、次の掃きで終端化すればよい——保持期限は1日単位で、
+      // 外部送信の試行は数秒で決着する。
       const drafts = this.db
-        .prepare("UPDATE confession_reply_drafts SET body=NULL WHERE body IS NOT NULL AND body_purge_at IS NOT NULL AND body_purge_at <= ?")
+        .prepare(
+          `UPDATE confession_reply_drafts SET body=NULL
+           WHERE body IS NOT NULL AND body_purge_at IS NOT NULL AND body_purge_at <= ?
+             AND COALESCE(outcome,'') NOT IN ('sending','retrying')`,
+        )
         .run(atTs).changes;
       const followUps = this.db
-        .prepare("UPDATE confession_follow_ups SET body=NULL WHERE body IS NOT NULL AND body_purge_at IS NOT NULL AND body_purge_at <= ?")
+        .prepare(
+          `UPDATE confession_follow_ups SET body=NULL
+           WHERE body IS NOT NULL AND body_purge_at IS NOT NULL AND body_purge_at <= ?
+             AND COALESCE(outcome,'') NOT IN ('sending','retrying')`,
+        )
         .run(atTs).changes;
       // 本文を失ったまま「未処理」として残っている行を終端へ落とす。
       // ここは条件を `body IS NULL` で書く——この purge 経路以外（案件本体の purge 等）で
@@ -1624,11 +1685,11 @@ export class Confessions {
           `UPDATE confession_follow_ups
            SET outcome='expired_retention', resolved_at=?, resolved_by='system:retention'
            WHERE body IS NULL AND relayed_at IS NULL
-             AND COALESCE(outcome,'') NOT IN ('resolved_manually','expired_retention')`,
+             AND COALESCE(outcome,'') NOT IN ('resolved_manually','expired_retention','sending','retrying')`,
         )
         .run(atTs).changes;
       // 返信の下書きも同じ。**送信中（sending）は触らない**——まだ誰かが飛ばしている
-      // 最中で、決着は世代の門が持つ。落ちていれば起動時回収が unknown へ倒し、
+      // 最中で、決着は世代の門が持つ。落ちていれば貸出切れの回収が unknown へ倒し、
       // 次の purge がここで終端化する。
       const terminalDrafts = this.db
         .prepare(

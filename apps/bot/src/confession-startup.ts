@@ -60,6 +60,30 @@ export function recoverConfessionOrphans(services: Services): void {
   }
 }
 
+/**
+ * 貸出の切れた所有者の置き土産を回収する。**刻時盤から定期的に呼ぶ。**
+ *
+ * 起動時の1回だけでは、前のプロセスが落ちた直後に新しいプロセスが起動した場合を
+ * 拾えない（貸出がまだ生きているので回収対象から外れ、その後誰も見に来ない）。
+ * 回収の判定は「鼓動が途絶えた所有者か」だけなので、定期的に呼んでも
+ * 自分自身の実行や、生きている別インスタンスの実行は奪わない。
+ *
+ * 失敗しても刻時盤は止めない（回収できなかった行は DB に残り、次の周で拾う）。
+ */
+export function sweepDeadOwnerEffects(services: Services): void {
+  try {
+    const recovered = services.confessions.recoverOrphanedEffects("system:sweep");
+    const total = recovered.ackAttempts + recovered.replyDrafts + recovered.followUps + recovered.renders;
+    if (total > 0) {
+      console.log(
+        `[トート] 貸出の切れた所有者の未決着を回収しました 受領確認=${recovered.ackAttempts} 返信=${recovered.replyDrafts} 追記=${recovered.followUps} 表示=${recovered.renders}`,
+      );
+    }
+  } catch (error) {
+    console.error("[トート] 未決着の回収に失敗（次の周で再試行します）:", error);
+  }
+}
+
 /** 起動時に一度だけ呼ぶ配線。 */
 export function armConfessionStartupRecovery(services: Services): void {
   beginConfessionStartup(() => {

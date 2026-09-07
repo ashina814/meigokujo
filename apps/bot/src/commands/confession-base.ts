@@ -1848,7 +1848,17 @@ async function resolveFollowUp(
   id: number,
   followUpId: number,
 ): Promise<void> {
-  services.confessions.resolveFollowUpManually(id, followUpId, interaction.user.id);
+  // **勝った人だけが「閉じた」と言える。** 既に別の担当者が畳んだあと・保持期限で
+  // 終端化されたあとに古いボタンを押しても、記録の上で二度目の決着を作らない。
+  const resolved = services.confessions.resolveFollowUpManually(id, followUpId, interaction.user.id);
+  if (!resolved.won) {
+    await refreshPanel(interaction.client, services, id);
+    await interaction.reply({
+      content: "この追記は既に処理済みです。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   await threadLog(
     interaction.client,
     services,
@@ -2152,7 +2162,12 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
         await interaction.reply({ content: "担当者または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
         return;
       }
-      services.confessions.resolveReplyDraftManually(owner, draftId, interaction.user.id);
+      const resolvedDraft = services.confessions.resolveReplyDraftManually(owner, draftId, interaction.user.id);
+      if (!resolvedDraft.won) {
+        await refreshPanel(interaction.client, services, owner);
+        await interaction.reply({ content: "この返信は既に処理済みです。", flags: MessageFlags.Ephemeral });
+        return;
+      }
       await threadLog(
         interaction.client,
         services,

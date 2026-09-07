@@ -28,6 +28,7 @@ import {
 } from "./scheduler-utils.js";
 import { cancelUnpaidSubAccounts, syncSubAccountRanks } from "./sub-account-jobs.js";
 import { closeExpiredSenderWaits, convergePendingRenders, retryPendingFollowUps } from "./commands/confession.js";
+import { sweepDeadOwnerEffects } from "./confession-startup.js";
 import { reconcileTimedAccessForClient } from "./timed-access.js";
 import {
   convergePendingNicknameChanges,
@@ -241,6 +242,14 @@ export function startScheduler(client: Client, services: Services, intervalMs = 
         ).catch((e) => console.error("[評価] 実績更新失敗:", e));
       }
     }
+
+    // ── トート: 貸出の切れた所有者が残した「送信中」を回収する ──
+    // 起動時の1回だけでは足りない。前のプロセスが落ちた直後（貸出の残り時間内）に
+    // 新しいプロセスが起動すると、前の所有者はまだ live と判定されて回収対象から
+    // 外れる——そして二度と見に来る者がいない。ここで遅れてでも必ず拾う。
+    // **自分がいま飛ばしている実行は、自分の鼓動が守る**（回収対象は貸出の切れた
+    // 所有者だけで、自分自身も live に含まれる）。
+    sweepDeadOwnerEffects(services);
 
     // ── トートの耳: 返答期限の切れたやり取りを終了する ──
     // 対象は「運営が返答を待つと明示した」案件だけ（reply_deadline_at が入っているもの）。
