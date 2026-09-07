@@ -43,6 +43,7 @@ import {
   type AckState,
   type DeliveryOutcome,
   type FollowUpTriage,
+  type PendingRenderRow,
   type ConfessionRow,
   type ConfessionStage,
   type ConfessionType,
@@ -505,6 +506,7 @@ export function managementControls(
   ackState: AckState = row.acknowledged_at ? "delivered" : "none",
   followUps?: FollowUpTriage,
   unresolvedDrafts = 0,
+  stalledRenders = 0,
 ): ActionRowBuilder<ButtonBuilder>[] {
   if (row.status === "closed") {
     // クローズ済み案件: 再オープン中心。本文が残っていれば管理者用の保持延長・削除を並置。
@@ -535,6 +537,15 @@ export function managementControls(
           .setCustomId(`mimi:draftdecide:${id}`)
           .setLabel(`未確定の返信 ${unresolvedDrafts}件`)
           .setEmoji("❓")
+          .setStyle(ButtonStyle.Danger),
+      );
+    }
+    if (stalledRenders > 0) {
+      btns.push(
+        new ButtonBuilder()
+          .setCustomId(`mimi:renderdecide:${id}`)
+          .setLabel(`表示の修正 ${stalledRenders}件`)
+          .setEmoji("🖼️")
           .setStyle(ButtonStyle.Danger),
       );
     }
@@ -610,6 +621,16 @@ export function managementControls(
         .setStyle(ButtonStyle.Danger),
     );
   }
+  // 自動では直せなかった表示。**毎分叩き続ける代わりに、人が決める**
+  if (stalledRenders > 0) {
+    row3.addComponents(
+      new ButtonBuilder()
+        .setCustomId(`mimi:renderdecide:${id}`)
+        .setLabel(`表示の修正 ${stalledRenders}件`)
+        .setEmoji("🖼️")
+        .setStyle(ButtonStyle.Danger),
+    );
+  }
   return [row1, row2, row3];
 }
 
@@ -632,7 +653,14 @@ async function refreshPanel(client: Client, services: Services, id: number): Pro
           unresolvedDrafts: services.confessions.listUnresolvedReplyDrafts(id).length,
         }),
       ],
-      components: managementControls(id, row, ackState, services.confessions.followUpTriage(id), services.confessions.listReplyDraftsNeedingDecision(id).length),
+      components: managementControls(
+        id,
+        row,
+        ackState,
+        services.confessions.followUpTriage(id),
+        services.confessions.listReplyDraftsNeedingDecision(id).length,
+        services.confessions.listRendersNeedingDecision(id).length,
+      ),
     })
     .catch(() => undefined);
 }
@@ -966,11 +994,58 @@ export async function convergePendingRenders(
   const pending =
     confessionId === undefined
       ? services.confessions.listPendingRenders()
-      : services.confessions.pendingRendersFor(confessionId).filter((r) => r.state !== "settled");
+      : services.confessions.pendingRendersFor(confessionId).filter((r) => r.state === "pending" || r.state === "failed");
   let settled = 0;
   for (const item of pending) {
-    const claimed = services.confessions.claimRender(item.id);
-    if (!claimed) continue;
+    if ((await convergeOneRender(client, services, item.id)) === "settled") settled += 1;
+  }
+  return settled;
+}
+
+/**
+ * **1件の収束の結末を、その1件について返す。**
+ *
+ * 「この案件でいくつ直せたか」を根拠にすると、別の（古い）表示が直った件数で
+ * いま送った1通の失敗を隠してしまう。担当者へ「表示も直しました」と言えるのは、
+ * **その返信が積んだ収束が settled になったとき**だけ。
+ */
+export async function convergeRender(
+  client: Client,
+  services: Services,
+  renderId: number,
+): Promise<"settled" | "failed" | "exhausted" | "skipped"> {
+  await awaitConfessionReady();
+  return convergeOneRender(client, services, renderId);
+}
+
+async function convergeOneRender(
+  client: Client,
+  services: Services,
+  renderId: number,
+): Promise<"settled" | "failed" | "exhausted" | "skipped"> {
+  const claimed = services.confessions.claimRender(renderId);
+  if (!claimed) return "skipped";
+  return renderClaimed(client, services, claimed);
+}
+
+/**
+ * 所有権を取り終えた1件を、実際に直しに行く。
+ * 自動の掃きも、担当者の手動の直しも、**同じここ**を通る（結末の書き方をズラさない）。
+ */
+async function renderClaimed(
+  client: Client,
+  services: Services,
+  claimed: PendingRenderRow,
+  /**
+   * 打ち切りをスレッドへ残すか。
+   *
+   * **自動の掃きは誰も見ていない**ので、直せないと確定したことを一度だけ残す。
+   * 担当者が自分で押した再試行は、その場の応答で結果が返るので積まない
+   * ——押すたびに同じ警告が増えるのは、まさに避けたかった churn そのもの。
+   */
+  announceExhaustion = true,
+): Promise<"settled" | "failed" | "exhausted" | "skipped"> {
+  {
     // **収束先は「いまの案件」から導く。** queue した時点の希望を信じると、
     // 編集に失敗しているあいだに投稿者が終了した／期限が来た場合に、
     // 終わった会話へ「7日後に終了します」と開いているような操作を復活させてしまう。
@@ -999,19 +1074,22 @@ export async function convergePendingRenders(
       generation: claimed.generation,
       state: outcome === "delivered" ? "settled" : "failed",
     });
-    if (!settleResult.won) continue; // 既に別の所有者のもの。何も言わない
-    if (outcome === "delivered") settled += 1;
-    else {
+    if (!settleResult.won) return "skipped"; // 既に別の所有者のもの。何も言わない
+    // **同じ失敗を毎分スレッドへ積まない。** 自動で直せないと確定した1度だけ残す。
+    if (settleResult.state === "exhausted" && announceExhaustion) {
       await threadLog(
         client,
         services,
         claimed.confession_id,
-        `⚠️ 投稿者へ届けた返信の表示を最終形へ書き換えられませんでした（本文は届いています）。会話の状態そのものは正しいままです。`,
+        [
+          `⚠️ 投稿者へ届けた返信の表示を、自動では最終形へ書き換えられませんでした（**本文は届いています**）。`,
+          `会話の状態そのものは正しいままです。パネルの 🖼️ 表示の修正 から、もう一度直すか、諦めるかを選べます。`,
+        ].join("\n"),
       );
     }
     await refreshPanel(client, services, claimed.confession_id);
+    return settleResult.state === "settled" ? "settled" : settleResult.state === "exhausted" ? "exhausted" : "failed";
   }
-  return settled;
 }
 
 /**
@@ -1381,8 +1459,12 @@ async function commitStaffReply(
   const after = finalized.row;
 
   // 確定した内容へ、届いた1通を書き換える。ここで初めて期限や操作を見せてよい。
-  const settledRenders = await convergePendingRenders(interaction.client, services, id);
-  const editOutcome: DeliveryOutcome = settledRenders > 0 ? "delivered" : "failed";
+  // **今回積んだ収束の結果だけを見る。** 案件単位の件数を根拠にすると、
+  // 別の（古い）表示が直ったことで、いま送った1通の失敗を隠してしまう。
+  const editOutcome: DeliveryOutcome =
+    finalized.renderId !== null && (await convergeRender(interaction.client, services, finalized.renderId)) === "settled"
+      ? "delivered"
+      : "failed";
 
   if (finalized.transition === "superseded") {
     // **終わっていない会話へ「終了していました」と言わない。**
@@ -1739,6 +1821,87 @@ function replyActionMsg(draftId: number, unknownOutcome: boolean, caseClosed: bo
 }
 
 /**
+ * 自動では直せなかった表示の一覧。
+ *
+ * **本文はここに出さない。** 出すのは「どのメッセージがまだ最終形になっていないか」だけ。
+ */
+function renderDecisionMsg(id: number, services: Services) {
+  const items = services.confessions.listRendersNeedingDecision(id);
+  if (items.length === 0) return { content: "🖼️ 判断が必要な表示はありません。", components: [] };
+  const menu = new StringSelectMenuBuilder()
+    .setCustomId(`mimi:rendersel:${id}`)
+    .setPlaceholder("どの表示をどうするか選ぶ")
+    .addOptions(
+      items
+        .slice(0, 25)
+        .map((r) =>
+          new StringSelectMenuOptionBuilder()
+            .setValue(String(r.id))
+            .setLabel(`#${r.id} 投稿者へ届いた1通（${r.attempts}回試行）`.slice(0, 100))
+            .setEmoji("🖼️"),
+        ),
+    );
+  return {
+    content: [
+      "🖼️ **自動では直せなかった表示**",
+      "",
+      "**本文は投稿者へ届いています。** 直せていないのは、そのメッセージに期限や操作を",
+      "書き足す部分だけです。会話の状態そのものは正しいままです。",
+      "",
+      "・**もう一度直す** … 同じメッセージを編集し直します（新しい DM は送りません）",
+      "・**この修正は諦める** … 追跡を終えます（**直せたことにはしません**）",
+    ].join("\n"),
+    components: [new ActionRowBuilder<StringSelectMenuBuilder>().addComponents(menu)],
+  };
+}
+
+function renderActionMsg(renderId: number) {
+  return {
+    content: [
+      `🖼️ **表示 #${renderId}**`,
+      "投稿者へ届いた本文はそのままです。もう一度直すか、この修正を諦めるかを選べます。",
+    ].join("\n"),
+    components: [
+      new ActionRowBuilder<ButtonBuilder>().addComponents(
+        new ButtonBuilder()
+          .setCustomId(`mimi:renderretry:${renderId}`)
+          .setLabel("もう一度直す")
+          .setEmoji("🖼️")
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(`mimi:renderdone:${renderId}`)
+          .setLabel("この修正は諦める")
+          .setEmoji("✔️")
+          .setStyle(ButtonStyle.Secondary),
+      ),
+    ],
+  };
+}
+
+/** 担当者の判断で、打ち切った表示をもう一度直す。**新しい DM は送らない** */
+async function manualRenderRetry(
+  interaction: ButtonInteraction,
+  services: Services,
+  id: number,
+  renderId: number,
+): Promise<void> {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral });
+  const claimed = services.confessions.claimRenderManualRetry(id, renderId);
+  if (!claimed) {
+    await interaction.editReply({ content: "この表示は既に処理済みです。" });
+    return;
+  }
+  const outcome = await renderClaimed(interaction.client, services, claimed, false);
+  await refreshPanel(interaction.client, services, id);
+  await interaction.editReply({
+    content:
+      outcome === "settled"
+        ? "🖼️ 投稿者側の表示を最終形へ直しました（新しい DM は送っていません）。"
+        : "⚠️ まだ直せませんでした。本文は届いたままです。諦める場合は「この修正は諦める」を選んでください。",
+  });
+}
+
+/**
  * 未確定の返信を、担当者が重複を承知したうえで送り直す。
  *
  * 通常の 💬 返信する と違い、**同じ本文をもう一度投げる**ので、
@@ -1795,7 +1958,7 @@ async function manualReplyRetry(
     retentionDays: retentionDaysFor(services, row),
     renderTarget: sent ? { channelId: sent.channelId, messageId: sent.messageId } : null,
   });
-  await convergePendingRenders(interaction.client, services, id);
+  if (finalized.renderId !== null) await convergeRender(interaction.client, services, finalized.renderId);
   await threadLog(
     interaction.client,
     services,
@@ -2145,6 +2308,47 @@ export async function handleConfessionButton(interaction: ButtonInteraction, ser
     case "draftdecide":
       await opGuarded(() => interaction.reply({ ...replyDecisionMsg(id, services), flags: MessageFlags.Ephemeral }));
       return;
+    // ── 自動では直せなかった表示の出口 ──
+    case "renderdecide":
+      await opGuarded(() => interaction.reply({ ...renderDecisionMsg(id, services), flags: MessageFlags.Ephemeral }));
+      return;
+    case "renderretry": {
+      const renderId = Number(interaction.customId.split(":")[2]);
+      const owner = services.confessions.renderCase(renderId);
+      if (owner === undefined || !canOperate(interaction, services, owner)) {
+        await interaction.reply({ content: "担当者または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await manualRenderRetry(interaction, services, owner, renderId);
+      return;
+    }
+    case "renderdone": {
+      const renderId = Number(interaction.customId.split(":")[2]);
+      const owner = services.confessions.renderCase(renderId);
+      if (owner === undefined || !canOperate(interaction, services, owner)) {
+        await interaction.reply({ content: "担当者または管理者のみ操作できます。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      // **直せたことにはしない。** 追跡を終えるだけで、投稿者の手元は本文のまま。
+      const resolvedRender = services.confessions.resolveRenderManually(owner, renderId, interaction.user.id);
+      if (!resolvedRender.won) {
+        await refreshPanel(interaction.client, services, owner);
+        await interaction.reply({ content: "この表示は既に処理済みです。", flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await threadLog(
+        interaction.client,
+        services,
+        owner,
+        `✔️ <@${interaction.user.id}> が表示 #${renderId} の修正を諦めました（**直せたことにはしていません**。本文は届いています）。`,
+      );
+      await refreshPanel(interaction.client, services, owner);
+      await interaction.reply({
+        content: "✔️ この表示の修正を終えました（直せたことにはしていません）。",
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
     case "draftretry": {
       const draftId = Number(interaction.customId.split(":")[2]);
       const owner = services.confessions.replyDraftCase(draftId);
@@ -2398,6 +2602,17 @@ export async function handleConfessionStringSelect(
     }
     const target = services.confessions.getFollowUp(followUpId);
     await interaction.update(followUpActionMsg(followUpId, target?.outcome === "unknown"));
+    return;
+  }
+
+  if (action === "rendersel") {
+    const renderId = Number(interaction.values[0]);
+    const owner = services.confessions.renderCase(renderId);
+    if (owner === undefined || owner !== id || !canOperate(interaction, services, owner)) {
+      await interaction.update({ content: "担当者または管理者のみ操作できます。", components: [] });
+      return;
+    }
+    await interaction.update(renderActionMsg(renderId));
     return;
   }
 
@@ -2738,7 +2953,14 @@ async function claimConfession(interaction: ButtonInteraction, services: Service
         unresolvedDrafts: services.confessions.listUnresolvedReplyDrafts(id).length,
       }),
     ],
-    components: managementControls(id, claimed, services.confessions.ackState(id), services.confessions.followUpTriage(id), services.confessions.listReplyDraftsNeedingDecision(id).length),
+    components: managementControls(
+      id,
+      claimed,
+      services.confessions.ackState(id),
+      services.confessions.followUpTriage(id),
+      services.confessions.listReplyDraftsNeedingDecision(id).length,
+      services.confessions.listRendersNeedingDecision(id).length,
+    ),
   });
   services.confessions.setPanelMsg(id, panel.id);
 
@@ -2774,7 +2996,14 @@ async function postRecoveryPanel(
         unresolvedDrafts: ob.replyDrafts,
       }),
     ],
-    components: managementControls(id, row, services.confessions.ackState(id), services.confessions.followUpTriage(id), ob.replyDrafts),
+    components: managementControls(
+      id,
+      row,
+      services.confessions.ackState(id),
+      services.confessions.followUpTriage(id),
+      ob.replyDrafts,
+      services.confessions.listRendersNeedingDecision(id).length,
+    ),
     allowedMentions: { parse: [] },
   });
   services.confessions.setPanelMsg(id, panel.id);

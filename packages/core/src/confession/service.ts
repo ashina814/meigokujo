@@ -220,6 +220,14 @@ export type ConditionalCloseResult =
  */
 export interface StaffReplyFinalizeResult {
   /**
+   * **この確定が積んだ収束の identity。**
+   *
+   * 「この案件でいくつ収束できたか」ではなく「いま送ったこの1通を直せたか」を
+   * 追えるようにするための値。案件単位の集計を根拠にすると、別の（古い）表示の
+   * 成功で、いまの失敗を隠してしまう。宛先が分からなかった場合は `null`。
+   */
+  readonly renderId: number | null;
+  /**
    * - `closed` / `waiting` — この試行が会話を動かした
    * - `lost` — 送信中に会話が終わっていた（終了を維持した）
    * - `superseded` — **この試行はもう現役ではない**（回収されたか、次の試行が始まった）。
@@ -254,6 +262,16 @@ export type StaffWaitResult =
 
 /** 明確な失敗だけを自動で再試行する。unknown は人が判断する。 */
 export const CONFESSION_FOLLOW_UP_MAX_ATTEMPTS = 5;
+
+/**
+ * 表示の収束を自動で試す上限。
+ *
+ * 同じメッセージへの編集は冪等なので、一時的な失敗を数回試すのは正しい。
+ * だが「消された」「チャンネルへ触れない」のような**恒久的に直せない**相手を
+ * 毎分叩き続けると、API を焼き、スレッドに同じ警告を積み、案件を永久に
+ * archive できなくする。有限で打ち切り、人の判断へ渡す。
+ */
+export const CONFESSION_RENDER_MAX_ATTEMPTS = 5;
 
 /**
  * 実行中インスタンスの生存を認めるまでの猶予（秒）。
@@ -305,12 +323,21 @@ export interface PendingRenderRow {
   render_kind: string;
   deadline_at: number | null;
   closed_by_sender: number | null;
-  state: string; // pending | rendering | settled | failed
+  /**
+   * `pending` / `rendering` / `settled` / `failed` に加えて:
+   * - `exhausted` … 自動では直せなかった（担当者の判断待ち）
+   * - `resolved_manually` … 担当者が「この修正は諦める」と決めた（**直せたことにはしない**）
+   */
+  state: string;
   created_at: number;
   settled_at: number | null;
   owner_instance: string | null;
   /** 収束の試行の世代。古い renderer の callback を無効化する札 */
   generation: number;
+  /** 自動で試した回数。上限で打ち切る */
+  attempts: number;
+  resolved_at: number | null;
+  resolved_by: string | null;
 }
 
 /**
@@ -583,6 +610,10 @@ export class Confessions {
     // 収束にも試行の世代。所有者を書くだけでは、古い renderer の callback が
     // 新しい所有者の実行を settled/failed へ書き換えられる。
     this.addColumnTo("confession_pending_renders", "generation", "INTEGER NOT NULL DEFAULT 0");
+    // 収束の試行回数。**恒久的に直せない表示を、毎分叩き続けないため**
+    this.addColumnTo("confession_pending_renders", "attempts", "INTEGER NOT NULL DEFAULT 0");
+    this.addColumnTo("confession_pending_renders", "resolved_at", "INTEGER");
+    this.addColumnTo("confession_pending_renders", "resolved_by", "TEXT");
     this.heartbeatInstance(this.instanceId);
     // 期限つきの投稿者待ちだけを走査するための索引（期限なしの既存行は入らない）
     this.db.exec(
@@ -806,15 +837,28 @@ export class Confessions {
       // 読んでから書くまでのあいだに投稿者が終了しうる。終了が成立したあとに
       // 新しい外向き送信の所有権を取れてしまうと、投稿者から見れば終えたはずの
       // やり取りに DM が届く。所有権の取得と同じ DB 境界で closed を見る。
+      // **「終了していないこと」だけでなく「まだ届いていないこと」も同じ境界で見る。**
+      // 部分ユニーク索引が排他するのは `outcome IS NULL` の試行だけなので、
+      // 一度 delivered が確定してしまうと索引はもう何も守らない。事前 read が
+      // `acknowledged_at IS NULL` を見たあとに別プロセスが確定させれば、
+      // 届いている投稿者へもう一通送れてしまう。
       const info = this.db
         .prepare(
           `INSERT INTO confession_ack_attempts (confession_id, staff_id, started_at, owner_instance)
-           SELECT ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM confession_tickets t WHERE t.id=? AND t.status<>'closed')`,
+           SELECT ?, ?, ?, ?
+           WHERE EXISTS (
+             SELECT 1 FROM confession_tickets t
+             WHERE t.id=? AND t.status<>'closed' AND t.acknowledged_at IS NULL
+           )`,
         )
         .run(id, staffId, now(), this.instanceId, id);
       if (info.changes !== 1) {
-        // 送っていない。試行の行も作らない
-        return { ok: false, code: "already_closed", row: this.get(id) ?? row };
+        // 送っていない。試行の行も作らない。**負けた理由は、いまの行から読む**
+        const fresh = this.get(id);
+        if (!fresh) return { ok: false, code: "not_found" };
+        if (fresh.status === "closed") return { ok: false, code: "already_closed", row: fresh };
+        if (fresh.acknowledged_at !== null) return { ok: false, code: "already_delivered", row: fresh };
+        return { ok: false, code: "attempt_in_flight", row: fresh };
       }
       return { ok: true, attemptId: Number(info.lastInsertRowid), row };
     } catch (error) {
@@ -1081,7 +1125,7 @@ export class Confessions {
   }): StaffReplyFinalizeResult {
     const ts = input.atTs ?? now();
     const draft = this.getReplyDraft(input.draftId);
-    if (!draft) return { transition: "lost", deadlineAt: null, row: undefined };
+    if (!draft) return { transition: "lost", deadlineAt: null, row: undefined, renderId: null };
     const id = draft.confession_id;
     const purgeAt = input.retentionDays && input.retentionDays > 0 ? ts + input.retentionDays * 86_400 : null;
     const deadline = input.intent === "wait" ? Confessions.senderReplyDeadlineFrom(ts) : null;
@@ -1117,6 +1161,7 @@ export class Confessions {
 
     // 遷移の確定と、最終形へ書き換える指示を**同じトランザクション**で置く。
     // 編集の前に落ちても、収束すべき姿がDBに残っている。
+    let queuedRenderId: number | null = null;
     const applyWithRender = this.db.transaction((): StaffReplyFinalizeResult["transition"] => {
       const transition = apply();
       if (transition === "superseded") {
@@ -1124,7 +1169,7 @@ export class Confessions {
         // ——true unknown ではない。何もしないと、投稿者の手元には本文だけの中立な
         // メッセージが永久に残る（期限も操作も無い、宙ぶらりんの1通）。
         // だから収束の義務だけは durable に残す。新しい DM は送らない。
-        this.queueFinalRender({
+        queuedRenderId = this.queueFinalRender({
           confessionId: id,
           draftId: input.draftId,
           target: input.renderTarget ?? null,
@@ -1133,7 +1178,7 @@ export class Confessions {
         });
         return "superseded";
       }
-      this.queueFinalRender({
+      queuedRenderId = this.queueFinalRender({
         confessionId: id,
         draftId: input.draftId,
         target: input.renderTarget ?? null,
@@ -1145,14 +1190,19 @@ export class Confessions {
     const outcome = applyWithRender();
     if (outcome === "superseded") {
       // 現役でない試行の確定。会話も本文も触っていない。
-      return { transition: "superseded", deadlineAt: null, row: this.get(id) };
+      return { transition: "superseded", deadlineAt: null, row: this.get(id), renderId: queuedRenderId };
     }
     if (outcome === "closed") {
       this.events.log("confession_close", { actor: input.actorId, payload: { id, reason: "resolved", side: "staff" } });
     } else if (outcome === "waiting") {
       this.events.log("confession_reply_wait", { actor: input.actorId, payload: { id, deadlineAt: deadline } });
     }
-    return { transition: outcome, deadlineAt: outcome === "waiting" ? deadline : null, row: this.get(id) };
+    return {
+      transition: outcome,
+      deadlineAt: outcome === "waiting" ? deadline : null,
+      row: this.get(id),
+      renderId: queuedRenderId,
+    };
   }
 
   /**
@@ -1419,13 +1469,13 @@ export class Confessions {
      *   会話の状態は他の試行が持っているので、ここから open/closed/期限を推測しない。
      */
     kind?: "current_state" | "superseded";
-  }): void {
-    if (!input.target) return;
+  }): number | null {
+    if (!input.target) return null;
     // **凍結した見た目を持たない。** 行が持つのは「どのメッセージを」「どの案件の
     // いまの状態へ」収束させるか、だけ。queue した時点の期限や種別を後生大事に
     // 抱えていると、編集に失敗しているあいだに会話が終わった場合、あとから
     // 「7日後に終了します」を終わった会話へ復活させてしまう。
-    this.db
+    const info = this.db
       .prepare(
         `INSERT INTO confession_pending_renders
            (confession_id, draft_id, channel_id, message_id, render_kind, state, created_at)
@@ -1439,6 +1489,7 @@ export class Confessions {
         input.kind ?? "current_state",
         input.atTs,
       );
+    return Number(info.lastInsertRowid);
   }
 
   /**
@@ -1468,17 +1519,80 @@ export class Confessions {
     return { kind: "reply_waiting", deadlineAt: null, closedBySender: false };
   }
 
-  /** まだ最終形へ書き換えられていない指示（起動時・刻時盤が収束させる） */
+  /**
+   * 自動で収束させてよい指示（起動時・刻時盤が拾う）。
+   *
+   * **打ち切ったもの（`exhausted`）と、人が畳んだもの（`resolved_manually`）は入らない。**
+   * 恒久的に直せない相手を毎分叩き続けないための線引きで、担当者の手動操作は別経路。
+   */
   listPendingRenders(limit = 20): PendingRenderRow[] {
     return this.db
       .prepare("SELECT * FROM confession_pending_renders WHERE state IN ('pending','failed') ORDER BY id LIMIT ?")
       .all(limit) as PendingRenderRow[];
   }
 
+  /** まだ片付いていない収束（人が畳んだものは含まない） */
   pendingRendersFor(confessionId: number): PendingRenderRow[] {
     return this.db
-      .prepare("SELECT * FROM confession_pending_renders WHERE confession_id=? AND state<>'settled' ORDER BY id")
+      .prepare(
+        "SELECT * FROM confession_pending_renders WHERE confession_id=? AND state NOT IN ('settled','resolved_manually') ORDER BY id",
+      )
       .all(confessionId) as PendingRenderRow[];
+  }
+
+  /** 自動では直せなかった表示（担当者の判断が要る） */
+  listRendersNeedingDecision(confessionId: number): PendingRenderRow[] {
+    return this.db
+      .prepare("SELECT * FROM confession_pending_renders WHERE confession_id=? AND state='exhausted' ORDER BY id")
+      .all(confessionId) as PendingRenderRow[];
+  }
+
+  /** 収束の所属案件も DB が決める（customId を権限の根拠にしない） */
+  renderCase(renderId: number): number | undefined {
+    return this.db.prepare("SELECT confession_id FROM confession_pending_renders WHERE id=?").pluck().get(renderId) as
+      | number
+      | undefined;
+  }
+
+  /**
+   * 担当者が「もう一度直す」と決めたときだけ、打ち切った表示を自動対象へ戻す。
+   * **回数はここで0に戻さない**——次も直せなければ、また同じ回数で打ち切る。
+   */
+  claimRenderManualRetry(confessionId: number, renderId: number): PendingRenderRow | undefined {
+    const info = this.db
+      .prepare(
+        `UPDATE confession_pending_renders
+         SET state='rendering', owner_instance=?, generation=generation+1
+         WHERE id=? AND confession_id=? AND state='exhausted'`,
+      )
+      .run(this.instanceId, renderId, confessionId);
+    return info.changes === 1
+      ? (this.db.prepare("SELECT * FROM confession_pending_renders WHERE id=?").get(renderId) as PendingRenderRow)
+      : undefined;
+  }
+
+  /**
+   * 「この表示の修正は諦める」出口。**直せた／届いたことにはしない。**
+   * 投稿者の手元には本文だけの1通が残るが、それは事実であって、
+   * `settled` と書けば嘘になる。
+   */
+  resolveRenderManually(confessionId: number, renderId: number, staffId: string): ManualResolution<PendingRenderRow> {
+    const won =
+      this.db
+        .prepare(
+          `UPDATE confession_pending_renders SET state='resolved_manually', resolved_at=?, resolved_by=?
+           WHERE id=? AND confession_id=? AND state IN ('exhausted','failed')`,
+        )
+        .run(now(), staffId, renderId, confessionId).changes === 1;
+    if (won) {
+      this.events.log("confession_render_resolved", { actor: staffId, payload: { id: confessionId, renderId } });
+    }
+    return {
+      won,
+      row: this.db.prepare("SELECT * FROM confession_pending_renders WHERE id=?").get(renderId) as
+        | PendingRenderRow
+        | undefined,
+    };
   }
 
   /** 収束の途中で止まったまま（所有者が落ちた可能性がある）表示 */
@@ -1499,18 +1613,25 @@ export class Confessions {
     renderId: number;
     generation: number;
     state: "settled" | "failed";
-  }): { won: boolean; row: PendingRenderRow | undefined } {
+  }): { won: boolean; state: string | undefined; row: PendingRenderRow | undefined } {
+    // 直せなかったとき、**上限に達していればそこで自動を打ち切る**（`exhausted`）。
+    // 打ち切ったものは刻時盤が拾わなくなり、担当者の判断待ちとして見える。
+    const current = this.db.prepare("SELECT attempts FROM confession_pending_renders WHERE id=?").get(input.renderId) as
+      | { attempts: number }
+      | undefined;
+    const nextState =
+      input.state === "failed" && (current?.attempts ?? 0) >= CONFESSION_RENDER_MAX_ATTEMPTS ? "exhausted" : input.state;
     const won =
       this.db
         .prepare(
           `UPDATE confession_pending_renders SET state=?, settled_at=?
            WHERE id=? AND state='rendering' AND generation=? AND owner_instance=?`,
         )
-        .run(input.state, now(), input.renderId, input.generation, this.instanceId).changes === 1;
+        .run(nextState, now(), input.renderId, input.generation, this.instanceId).changes === 1;
     const row = this.db.prepare("SELECT * FROM confession_pending_renders WHERE id=?").get(input.renderId) as
       | PendingRenderRow
       | undefined;
-    return { won, row };
+    return { won, state: won ? nextState : row?.state, row };
   }
 
   /** 収束の所有権。勝った1つだけが Discord を触る */
@@ -1521,7 +1642,7 @@ export class Confessions {
     const info = this.db
       .prepare(
         `UPDATE confession_pending_renders
-         SET state='rendering', owner_instance=?, generation=generation+1
+         SET state='rendering', owner_instance=?, generation=generation+1, attempts=attempts+1
          WHERE id=? AND state IN ('pending','failed')`,
       )
       .run(this.instanceId, renderId);

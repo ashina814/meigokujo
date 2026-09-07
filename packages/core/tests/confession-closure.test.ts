@@ -8,6 +8,7 @@ import { EventLog } from "../src/events/service.js";
 import {
   CONFESSION_FOLLOW_UP_MAX_ATTEMPTS,
   CONFESSION_INSTANCE_LEASE_SECONDS,
+  CONFESSION_RENDER_MAX_ATTEMPTS,
   CONFESSION_SENDER_REPLY_DEADLINE_DAYS,
   CONFESSION_SENDER_REPLY_DEADLINE_SECONDS,
   Confessions,
@@ -2205,5 +2206,235 @@ describe("手動の決着は、勝った1回だけが「閉じた」と言える
     expect(confessions.resolveReplyDraftManually(row.id, draft.id, "staff-B").won).toBe(false);
     expect(confessions.getReplyDraft(draft.id)!.resolved_by).toBe("system:retention");
     expect(eventsOf("confession_reply_resolved")).toBe(0);
+  });
+});
+
+describe("受領確認は、届いたあとにもう一通作らせない", () => {
+  /**
+   * **部分ユニーク索引が守るのは `outcome IS NULL` の試行だけ。**
+   * 一度 delivered が確定すると索引はもう何も守らないので、事前 read が
+   * 「まだ届いていない」と答えたあとに別プロセスが確定させれば、届いている
+   * 投稿者へもう一通送れてしまう。書き込み境界で `acknowledged_at IS NULL` を見る。
+   */
+  const withStaleUnackedRead = (fn: () => void) => {
+    const real = confessions.get.bind(confessions);
+    let served = false;
+    (confessions as unknown as { get: (id: number) => ConfessionRow | undefined }).get = (id: number) => {
+      const row = real(id);
+      if (!served && row) {
+        served = true;
+        return { ...row, acknowledged_at: null, acknowledged_by: null };
+      }
+      return row;
+    };
+    try {
+      fn();
+    } finally {
+      (confessions as unknown as { get: unknown }).get = real;
+    }
+  };
+
+  // R43
+  it("事前 read が「まだ届いていない」と答えても、確定済みなら試行を作れない", () => {
+    const row = seed("yes");
+    // ── instance B が送り切る ──
+    const b = new Confessions(db, new EventLog(db), "instance-B");
+    const begun = b.beginAcknowledgement(row.id, "staff-B") as { ok: true; attemptId: number };
+    b.settleAcknowledgement(begun.attemptId, "delivered", "staff-B");
+    const delivered = confessions.get(row.id)!;
+    expect(delivered.acknowledged_at).not.toBeNull();
+    expect(delivered.acknowledged_by).toBe("staff-B");
+    const attemptsBefore = (
+      db.prepare("SELECT COUNT(*) n FROM confession_ack_attempts WHERE confession_id=?").get(row.id) as { n: number }
+    ).n;
+
+    // ── instance A は、古い read を根拠に所有権を取ろうとする ──
+    withStaleUnackedRead(() => {
+      const again = confessions.beginAcknowledgement(row.id, "staff-A");
+      expect(again.ok).toBe(false);
+      expect(again.ok === false && again.code).toBe("already_delivered");
+    });
+
+    // 試行の行そのものが増えない＝外へ送る資格を得ていない
+    expect(
+      (db.prepare("SELECT COUNT(*) n FROM confession_ack_attempts WHERE confession_id=?").get(row.id) as { n: number })
+        .n,
+    ).toBe(attemptsBefore);
+    const after = confessions.get(row.id)!;
+    expect(after.acknowledged_at).toBe(delivered.acknowledged_at);
+    expect(after.acknowledged_by).toBe("staff-B");
+    expect(eventsOf("confession_acknowledge")).toBe(1);
+    expect(confessions.ackState(row.id)).toBe("delivered");
+  });
+
+  it("負けた理由は、いまの行から正しく読む", () => {
+    const closed = seed("yes");
+    confessions.senderCloseAtomic(closed.id, "sender-1", 90);
+    withStaleUnackedRead(() => {
+      const begun = confessions.beginAcknowledgement(closed.id, "staff-1");
+      expect(begun.ok === false && begun.code).toBe("already_closed");
+    });
+  });
+});
+
+describe("自動で直せない表示を、いつまでも叩き続けない", () => {
+  const queueRender = (rowId: number, messageId = "msg-1") => {
+    const draft = confessions.createReplyDraft(rowId, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const finalized = confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: confessions.getReplyDraft(draft.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: "dm-1", messageId },
+    });
+    return finalized.renderId!;
+  };
+  /** 「直せなかった」を1回ぶん進める */
+  const failOnce = (renderId: number) => {
+    const claimed = confessions.claimRender(renderId);
+    if (!claimed) return undefined;
+    return confessions.settleRender({ renderId, generation: claimed.generation, state: "failed" });
+  };
+
+  // R45（core 側の打ち切り）
+  it("有限回で打ち切り、以後は自動の対象に入らない", () => {
+    const row = seed("yes");
+    const renderId = queueRender(row.id);
+
+    for (let i = 1; i <= CONFESSION_RENDER_MAX_ATTEMPTS; i += 1) {
+      const result = failOnce(renderId)!;
+      expect(result.won).toBe(true);
+      expect(result.state).toBe(i >= CONFESSION_RENDER_MAX_ATTEMPTS ? "exhausted" : "failed");
+    }
+    expect(confessions.listPendingRenders()).toEqual([]);
+    // 何周しても、試行回数は増えない
+    const attempts = confessions.listRendersNeedingDecision(row.id)[0]!.attempts;
+    for (let i = 0; i < 10; i += 1) {
+      expect(confessions.listPendingRenders()).toEqual([]);
+      expect(confessions.claimRender(renderId)).toBeUndefined();
+    }
+    expect(confessions.listRendersNeedingDecision(row.id)[0]!.attempts).toBe(attempts);
+    // 人の判断待ちとして残る（勝手に片付いたことにしない）
+    expect(confessions.obligations(row.id).pendingRenders).toBe(1);
+  });
+
+  // R46
+  it("担当者がもう一度直すと決めれば、同じメッセージへ収束できる", () => {
+    const row = seed("yes");
+    const renderId = queueRender(row.id);
+    for (let i = 0; i < CONFESSION_RENDER_MAX_ATTEMPTS; i += 1) failOnce(renderId);
+    expect(confessions.listRendersNeedingDecision(row.id)).toHaveLength(1);
+
+    const claimed = confessions.claimRenderManualRetry(row.id, renderId)!;
+    expect(claimed.state).toBe("rendering");
+    expect(claimed.message_id).toBe("msg-1"); // **同じメッセージ**
+    const settled = confessions.settleRender({ renderId, generation: claimed.generation, state: "settled" });
+    expect(settled.won).toBe(true);
+    expect(settled.state).toBe("settled");
+    expect(confessions.obligations(row.id).pendingRenders).toBe(0);
+    expect(confessions.listRendersNeedingDecision(row.id)).toEqual([]);
+  });
+
+  it("もう一度直しても駄目なら、また打ち切る（無限には試さない）", () => {
+    const row = seed("yes");
+    const renderId = queueRender(row.id);
+    for (let i = 0; i < CONFESSION_RENDER_MAX_ATTEMPTS; i += 1) failOnce(renderId);
+    const claimed = confessions.claimRenderManualRetry(row.id, renderId)!;
+    const settled = confessions.settleRender({ renderId, generation: claimed.generation, state: "failed" });
+    expect(settled.state).toBe("exhausted");
+    expect(confessions.listPendingRenders()).toEqual([]);
+  });
+
+  // R47
+  it("諦めても「直せた」ことにはせず、アーカイブは塞がない", () => {
+    const row = seed("yes");
+    const renderId = queueRender(row.id);
+    for (let i = 0; i < CONFESSION_RENDER_MAX_ATTEMPTS; i += 1) failOnce(renderId);
+
+    const resolved = confessions.resolveRenderManually(row.id, renderId, "staff-1");
+    expect(resolved.won).toBe(true);
+    expect(resolved.row!.state).toBe("resolved_manually");
+    // **「直せた」とは書かない。** 状態がその区別を持つ
+    expect(resolved.row!.state).not.toBe("settled");
+    expect(resolved.row!.resolved_by).toBe("staff-1");
+    expect(resolved.row!.resolved_at).not.toBeNull();
+    // 責務としては消える（人が判断し終えたので）
+    expect(confessions.obligations(row.id).pendingRenders).toBe(0);
+    expect(confessions.obligations(row.id).total).toBe(0);
+    // 自動でも拾わない
+    expect(confessions.listPendingRenders()).toEqual([]);
+    expect(confessions.listRendersNeedingDecision(row.id)).toEqual([]);
+  });
+
+  it("諦めるのも、勝った1回だけ", () => {
+    const row = seed("yes");
+    const renderId = queueRender(row.id);
+    for (let i = 0; i < CONFESSION_RENDER_MAX_ATTEMPTS; i += 1) failOnce(renderId);
+    expect(confessions.resolveRenderManually(row.id, renderId, "staff-A").won).toBe(true);
+    expect(confessions.resolveRenderManually(row.id, renderId, "staff-B").won).toBe(false);
+    expect(confessions.resolveRenderManually(row.id, renderId, "staff-B").row!.resolved_by).toBe("staff-A");
+    expect(eventsOf("confession_render_resolved")).toBe(1);
+  });
+
+  it("別案件のIDでは、表示にも触れない", () => {
+    const a = seed("yes");
+    const b = confessions.create("sender-2", { type: "soudan", replyWish: "yes", body: "B の本文" });
+    confessions.claim(b.id, "thread-b", "other-staff");
+    const renderId = queueRender(b.id, "msg-b");
+    for (let i = 0; i < CONFESSION_RENDER_MAX_ATTEMPTS; i += 1) failOnce(renderId);
+
+    expect(confessions.claimRenderManualRetry(a.id, renderId)).toBeUndefined();
+    expect(confessions.resolveRenderManually(a.id, renderId, "staff-1").won).toBe(false);
+    expect(confessions.listRendersNeedingDecision(b.id)).toHaveLength(1);
+    // 所属は DB が答える
+    expect(confessions.renderCase(renderId)).toBe(b.id);
+  });
+});
+
+describe("収束の結果は、その1件について返る", () => {
+  // R44（core 側の identity）
+  it("確定は、いま積んだ収束の identity を返す", () => {
+    const row = seed("yes");
+    const first = confessions.createReplyDraft(row.id, "staff-1", "1通目", 90);
+    confessions.claimReplyDraft(first.id, "staff-1", "wait");
+    const a = confessions.finalizeStaffReply({
+      draftId: first.id,
+      generation: confessions.getReplyDraft(first.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: "dm-1", messageId: "msg-A" },
+    });
+    const second = confessions.createReplyDraft(row.id, "staff-1", "2通目", 90);
+    confessions.claimReplyDraft(second.id, "staff-1", "wait");
+    const b = confessions.finalizeStaffReply({
+      draftId: second.id,
+      generation: confessions.getReplyDraft(second.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: "dm-1", messageId: "msg-B" },
+    });
+
+    expect(a.renderId).not.toBeNull();
+    expect(b.renderId).not.toBeNull();
+    expect(a.renderId).not.toBe(b.renderId);
+    const rows = confessions.pendingRendersFor(row.id);
+    expect(rows.find((r) => r.id === a.renderId)!.message_id).toBe("msg-A");
+    expect(rows.find((r) => r.id === b.renderId)!.message_id).toBe("msg-B");
+  });
+
+  it("宛先が分からなければ identity も無い（true unknown）", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const result = confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: confessions.getReplyDraft(draft.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: null,
+    });
+    expect(result.transition).toBe("waiting");
+    expect(result.renderId).toBeNull();
   });
 });

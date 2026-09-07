@@ -147,6 +147,7 @@ async function syncCasePanel(client: Client, services: Services, id: number): Pr
           services.confessions.ackState(id),
           services.confessions.followUpTriage(id),
           services.confessions.listReplyDraftsNeedingDecision(id).length,
+          services.confessions.listRendersNeedingDecision(id).length,
         ),
       })
       .catch(() => undefined);

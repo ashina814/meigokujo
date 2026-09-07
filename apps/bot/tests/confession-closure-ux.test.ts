@@ -62,6 +62,8 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
    */
   let dmMode: "ok" | "api" | "net" = "ok";
   let editMode: "ok" | "api" | "net" = "ok";
+  /** この message id の編集だけを失敗させる（null なら editMode に従う） */
+  let editFailFor: string | null = null;
   let threadMode: "ok" | "api" | "net" = "ok";
   /**
    * 送信の境界で止めるための関門。時間待ちは使わない。
@@ -152,6 +154,7 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
               return (dms[index]?.embeds ?? []) as any[];
             },
             edit: async (next: Sent) => {
+              if (editFailFor !== null && editFailFor === messageId) throw apiError();
               if (editMode === "api") throw apiError();
               if (editMode === "net") throw netError();
               dms[index] = next;
@@ -246,6 +249,14 @@ function harness(wish: "yes" | "either" | "no" | null = "yes") {
     },
     setEditFails: (v: boolean) => {
       editMode = v ? "api" : "ok";
+    },
+    /**
+     * **1通ごとに編集の可否を分ける。** 「この案件でいくつ直せたか」ではなく
+     * 「いま送ったこの1通を直せたか」を見るには、同じ案件に成功する表示と
+     * 失敗する表示を同時に持たせるしかない。
+     */
+    setEditFailsFor: (messageId: string | null) => {
+      editFailFor = messageId;
     },
     dmVersions,
     /** 届いた n 番目の DM の、指定した版のテキスト */
@@ -1676,7 +1687,10 @@ describe("投稿者に見えている表示は、再起動しても最終形へ�
     expect(h.dmText()).not.toContain("7日後");
     // 担当者からは未収束として見える
     expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(1);
-    expect(h.threadPostTexts()).toContain("最終形へ書き換えられませんでした");
+    // **その場で操作した本人には、すぐ伝える**（今回の1通の結果として）
+    expect(h.lastReply().content).toContain("書き足せませんでした");
+    // ただし、まだ自動で直せる余地がある段階でスレッドへ警告は積まない
+    expect(h.threadPostTexts()).not.toContain("自動では最終形へ書き換えられませんでした");
   });
 });
 
@@ -2418,5 +2432,201 @@ describe("貸出の切れた所有者は、刻時盤の掃きで拾われる", (
 
     gate.release("net");
     await submitting;
+  });
+});
+
+describe("「直せた」と言えるのは、いま送ったその1通について", () => {
+  /** 返信を1通送り、その DM の message id と render id を返す */
+  const sendReply = async (h: ReturnType<typeof harness>, text: string) => {
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    await h.press(`mimi:replywait:${draftId}`);
+    const render = h.db
+      .prepare("SELECT id, message_id, state FROM confession_pending_renders ORDER BY id DESC")
+      .get() as { id: number; message_id: string; state: string };
+    return render;
+  };
+
+  // R44
+  it("古い表示が直っても、今回の失敗を隠さない", async () => {
+    const h = harness("yes");
+    // A: 1通目。ここではまだ直せない（あとで直る）
+    h.setEditFails(true);
+    const a = await sendReply(h, "1通目");
+    h.setEditFails(false);
+    expect(h.db.prepare("SELECT state FROM confession_pending_renders WHERE id=?").pluck().get(a.id)).toBe("failed");
+
+    // B: 2通目（今回の返信）。**この1通だけ**編集に失敗する
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "2通目" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    // いま送る DM は次の index。その1通だけ落とす
+    h.setEditFailsFor(`dm-msg-${h.dms.length}`);
+    await h.press(`mimi:replywait:${draftId}`);
+    h.setEditFailsFor(null);
+
+    const b = h.db
+      .prepare("SELECT id, state FROM confession_pending_renders ORDER BY id DESC")
+      .get() as { id: number; state: string };
+    expect(b.id).not.toBe(a.id);
+    expect(b.state).toBe("failed");
+    // **今回の1通は直せていない。** 古い A が直った件数を根拠にしない
+    const said = h.lastReply().content ?? "";
+    expect(said).toContain("書き足せませんでした");
+    expect(h.services.confessions.pendingRendersFor(h.id).some((r) => r.id === b.id)).toBe(true);
+  });
+
+  it("今回の1通が直れば、今回について成功と言える", async () => {
+    const h = harness("yes");
+    // A: 古い表示は直せないまま残す
+    h.setEditFails(true);
+    const a = await sendReply(h, "1通目");
+    h.setEditFails(false);
+
+    // B: 今回の返信は直せる
+    const b = await sendReply(h, "2通目");
+    expect(h.db.prepare("SELECT state FROM confession_pending_renders WHERE id=?").pluck().get(b.id)).toBe("settled");
+    expect(h.db.prepare("SELECT state FROM confession_pending_renders WHERE id=?").pluck().get(a.id)).toBe("failed");
+    const said = h.lastReply().content ?? "";
+    expect(said).not.toContain("書き足せませんでした");
+    expect(said).toContain("返信を届けました");
+  });
+});
+
+describe("直せない表示を、毎分叩き続けない", () => {
+  const stalled = async (h: ReturnType<typeof harness>) => {
+    h.setEditFails(true);
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "直せない表示の本文" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    await h.press(`mimi:replywait:${draftId}`);
+    return h.db.prepare("SELECT id FROM confession_pending_renders ORDER BY id DESC").pluck().get() as number;
+  };
+  const warnings = (h: ReturnType<typeof harness>) =>
+    h.threadPostTexts().split("\n").filter((l) => l.includes("自動では最終形へ書き換えられませんでした")).length;
+
+  // R45
+  it("有限回で打ち切り、以後は刻時盤が触らない", async () => {
+    const h = harness("yes");
+    const renderId = await stalled(h);
+
+    // 刻時盤が回る。上限までは試し、そこで打ち切る
+    for (let i = 0; i < 10; i += 1) await convergePendingRenders(h.client as any, h.services);
+
+    const row = h.db
+      .prepare("SELECT state, attempts FROM confession_pending_renders WHERE id=?")
+      .get(renderId) as { state: string; attempts: number };
+    expect(row.state).toBe("exhausted");
+    expect(row.attempts).toBe(5);
+    // **警告はスレッドに1度だけ**（毎分積まない）
+    expect(warnings(h)).toBe(1);
+
+    // さらに10周しても、試行も警告も増えない
+    for (let i = 0; i < 10; i += 1) await convergePendingRenders(h.client as any, h.services);
+    const after = h.db
+      .prepare("SELECT state, attempts FROM confession_pending_renders WHERE id=?")
+      .get(renderId) as { state: string; attempts: number };
+    expect(after.attempts).toBe(row.attempts);
+    expect(after.state).toBe("exhausted");
+    expect(warnings(h)).toBe(1);
+
+    // 担当者からは出口として見える
+    expect(h.panelButtons()).toContain(`mimi:renderdecide:${h.id}`);
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(1);
+  });
+
+  // R46
+  it("担当者がもう一度直すと決めれば、同じメッセージが直る", async () => {
+    const h = harness("yes");
+    const renderId = await stalled(h);
+    for (let i = 0; i < 10; i += 1) await convergePendingRenders(h.client as any, h.services);
+    const before = h.dms.length;
+
+    // 一覧 → 選ぶ → もう一度直す
+    await h.press(`mimi:renderdecide:${h.id}`);
+    expect(h.lastReply().content).toContain("自動では直せなかった表示");
+    await handleConfessionStringSelect(
+      { ...h.interactionFor(`mimi:rendersel:${h.id}`, STAFF), values: [String(renderId)] } as any,
+      h.services,
+    );
+    const buttons = (h.lastReply().components ?? []).flatMap((r: any) =>
+      (r.toJSON ? r.toJSON() : r).components.map((c: any) => c.custom_id),
+    );
+    expect(buttons).toEqual([`mimi:renderretry:${renderId}`, `mimi:renderdone:${renderId}`]);
+
+    h.setEditFails(false);
+    await h.press(`mimi:renderretry:${renderId}`);
+
+    expect(h.dms).toHaveLength(before); // **新しい DM は増えない**
+    expect(h.dmText()).toContain("必要なら追記できます");
+    expect(h.dmText()).toContain("直せない表示の本文");
+    expect(h.db.prepare("SELECT state FROM confession_pending_renders WHERE id=?").pluck().get(renderId)).toBe(
+      "settled",
+    );
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(0);
+    expect(h.lastReply().content).toContain("最終形へ直しました");
+  });
+
+  it("もう一度直しても駄目なら、また打ち切って伝える", async () => {
+    const h = harness("yes");
+    const renderId = await stalled(h);
+    for (let i = 0; i < 10; i += 1) await convergePendingRenders(h.client as any, h.services);
+    await h.press(`mimi:renderretry:${renderId}`); // 失敗したまま
+    expect(h.db.prepare("SELECT state FROM confession_pending_renders WHERE id=?").pluck().get(renderId)).toBe(
+      "exhausted",
+    );
+    expect(h.lastReply().content).toContain("まだ直せませんでした");
+    // 打ち切りの警告は積み増さない
+    expect(warnings(h)).toBe(1);
+  });
+
+  // R47
+  it("諦めれば、届いたことにはせずアーカイブが通る", async () => {
+    const h = harness("yes");
+    const renderId = await stalled(h);
+    for (let i = 0; i < 10; i += 1) await convergePendingRenders(h.client as any, h.services);
+    const before = h.dms.length;
+
+    await h.press(`mimi:renderdone:${renderId}`);
+
+    expect(h.dms).toHaveLength(before);
+    const state = h.db.prepare("SELECT state FROM confession_pending_renders WHERE id=?").pluck().get(renderId);
+    expect(state).toBe("resolved_manually");
+    expect(state).not.toBe("settled");
+    expect(h.threadPostTexts()).toContain("直せたことにはしていません");
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(0);
+    expect(h.services.confessions.obligations(h.id).total).toBe(0);
+    expect(h.panelButtons()).not.toContain(`mimi:renderdecide:${h.id}`);
+
+    // アーカイブが通る（未処理を抱えたままにならない）
+    await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+    expect(h.thread.setArchived).toHaveBeenCalled();
+  });
+
+  it("二人目が「諦めた」と記録しない", async () => {
+    const h = harness("yes");
+    const renderId = await stalled(h);
+    for (let i = 0; i < 10; i += 1) await convergePendingRenders(h.client as any, h.services);
+    h.services.confessions.addAssignee(h.id, "staff-2", STAFF);
+
+    await h.press(`mimi:renderdone:${renderId}`, STAFF);
+    const logs = () => h.threadPostTexts().split("\n").filter((l) => l.includes("の修正を諦めました")).length;
+    expect(logs()).toBe(1);
+
+    await h.press(`mimi:renderdone:${renderId}`, "staff-2");
+    expect(logs()).toBe(1);
+    expect(h.lastReply().content).toContain("既に処理済み");
+    expect(
+      (h.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_render_resolved'").get() as { n: number }).n,
+    ).toBe(1);
+  });
+
+  it("別案件のIDでは、表示にも触れない", async () => {
+    const h = harness("yes");
+    const renderId = await stalled(h);
+    for (let i = 0; i < 10; i += 1) await convergePendingRenders(h.client as any, h.services);
+    await h.press(`mimi:renderdone:${renderId}`, "stranger");
+    expect(h.db.prepare("SELECT state FROM confession_pending_renders WHERE id=?").pluck().get(renderId)).toBe(
+      "exhausted",
+    );
+    expect(h.lastReply().content).toContain("担当者または管理者のみ");
   });
 });
