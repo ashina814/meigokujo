@@ -962,8 +962,13 @@ describe("会話本文を retention の外へ持ち出さない", () => {
     const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
     await h.press(`mimi:replywait:${draftId}`);
 
-    const purgeAt = (h.db.prepare("SELECT MAX(body_purge_at) v FROM confession_follow_ups").get() as any).v as number;
-    expect(purgeAt).not.toBeNull();
+    // **両方の行の期限を跨いだ時刻で見る。** 追記と下書きは別の秒に作られうるので、
+    // 片方の期限だけを使うと、境界を跨いだときにもう片方が残って偽の失敗になる。
+    const purgeAt = Math.max(
+      (h.db.prepare("SELECT MAX(body_purge_at) v FROM confession_follow_ups").get() as any).v as number,
+      (h.db.prepare("SELECT MAX(body_purge_at) v FROM confession_reply_drafts").get() as any).v as number,
+    );
+    expect(purgeAt).toBeGreaterThan(0);
     const result = h.services.confessions.purgeExpiredConversationBodies(purgeAt);
     expect(result.followUps).toBe(1);
     expect(result.drafts).toBe(1);
