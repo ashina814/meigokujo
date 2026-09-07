@@ -1074,7 +1074,23 @@ async function renderClaimed(
       generation: claimed.generation,
       state: outcome === "delivered" ? "settled" : "failed",
     });
-    if (!settleResult.won) return "skipped"; // 既に別の所有者のもの。何も言わない
+    if (!settleResult.won) {
+      // **決着には負けた。だが外は既に触っているかもしれない。**
+      // DB の門は settle を守るが、Discord への編集はその前に起きている。
+      // 新しい所有者が書いた最終形の上へ、この古い編集が後から着地すると、
+      // 投稿者の画面だけが古い姿へ戻る。`failed`（Discord が明確に拒否＝
+      // 外は変わっていない）以外は、同じメッセージをいまの案件へ収束させ直す
+      // 義務を durable に残す。新しい DM は送らない。
+      if (outcome !== "failed") {
+        services.confessions.queueRenderRepair({
+          confessionId: claimed.confession_id,
+          channelId: claimed.channel_id,
+          messageId: claimed.message_id,
+        });
+        await refreshPanel(client, services, claimed.confession_id);
+      }
+      return "skipped";
+    }
     // **同じ失敗を毎分スレッドへ積まない。** 自動で直せないと確定した1度だけ残す。
     if (settleResult.state === "exhausted" && announceExhaustion) {
       await threadLog(

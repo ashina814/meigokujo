@@ -246,35 +246,90 @@ describe("生存の記録は、刻時盤の長い周回に巻き込まれない"
  * ここでは実ファイルDBを開き直し、instance A が収束を握ったまま消え、貸出が切れ、
  * instance B が引き取って**同じメッセージ**を直すまでを通す。
  */
-describe("収束は、プロセスをまたいでも同じ1通へ向かう", () => {
-  const DM_CH = "dm-channel";
-  const MSG = "dm-msg-0";
+/**
+ * 投稿者へ届いた1通を編集できるだけの、最小の Discord（プロセスをまたぐ収束の検証で共有する）。
+ */
+const DM_CH = "dm-channel";
+const MSG = "dm-msg-0";
 
-  /** 投稿者へ届いた1通を編集できるだけの、最小の Discord。何通送られたかも数える */
-  function dmWorld() {
-    const message = {
-      embeds: [{ toJSON: () => ({ description: "届いている本文" }) }] as unknown[],
-      edited: [] as unknown[],
-      edit: async (o: unknown) => {
-        message.edited.push(o);
-        return o;
-      },
-    };
-    const newDms: unknown[] = [];
-    const client = {
-      channels: {
-        fetch: async (cid: string) =>
-          cid === DM_CH
-            ? { id: DM_CH, isTextBased: () => true, messages: { fetch: async () => message } }
-            : { isThread: () => true, archived: false, send: async () => undefined,
-                messages: { fetch: async () => null }, setArchived: async () => undefined },
-      },
-      users: {
-        fetch: async () => ({ send: async (o: unknown) => void newDms.push(o) }),
-      },
-    };
-    return { client, message, newDms };
-  }
+/**
+ * 投稿者へ届いた1通を編集できるだけの、最小の Discord。
+ *
+ * **編集を境界で止められる。** DB の門は決着を守るが、Discord への編集は門より前に
+ * 起きる——その順序を実際に作らないと、古い実行が最後に着地する競合は再現できない。
+ * 何通「新しく」送られたかも数える（修復は編集であって、新しい DM ではない）。
+ */
+function dmWorld() {
+  type Gate = { entered: () => void; wait: Promise<void> };
+  const editGates: Gate[] = [];
+  /** いま投稿者に見えている内容（最後の編集） */
+  let current: any = { embeds: [{ toJSON: () => ({ description: "届いている本文" }) }] };
+  const message = {
+    get embeds() {
+      return (current.embeds ?? []) as unknown[];
+    },
+    edited: [] as any[],
+    edit: async (o: any) => {
+      const gate = editGates.shift();
+      if (gate) {
+        gate.entered();
+        await gate.wait;
+      }
+      // 結末は**関門を抜けたあと**に決める（止めている間に呼び出し側が決められる）
+      const fail = pendingFailure;
+      pendingFailure = null;
+      if (fail === "api") throw Object.assign(new Error("Unknown Message"), { code: 10008 });
+      if (fail === "net") throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+      message.edited.push(o);
+      current = o;
+      return o;
+    },
+  };
+  /**
+   * 次の1回の編集の結末を決める。
+   * `api` = Discord の確定拒否（外は変わっていない）、`net` = 応答が得られなかった。
+   */
+  let pendingFailure: "api" | "net" | null = null;
+  const failNext = (mode: "api" | "net") => {
+    pendingFailure = mode;
+  };
+  /** 次の1回の編集を止める */
+  const holdEdit = () => {
+    let release!: () => void;
+    let signalEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      signalEntered = resolve;
+    });
+    const wait = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    editGates.push({ entered: signalEntered, wait });
+    return { entered, release: () => release() };
+  };
+  /** いま投稿者に見えている文面（本文＋添えられた案内） */
+  const visibleText = (): string => {
+    const e = current.embeds?.[0];
+    const j = e?.toJSON ? e.toJSON() : e;
+    return [j?.description ?? "", ...(j?.fields ?? []).map((f: any) => f.value)].join("\n");
+  };
+  const visibleButtons = (): unknown[] => current.components ?? [];
+  const newDms: unknown[] = [];
+  const client = {
+    channels: {
+      fetch: async (cid: string) =>
+        cid === DM_CH
+          ? { id: DM_CH, isTextBased: () => true, messages: { fetch: async () => message } }
+          : { isThread: () => true, archived: false, send: async () => undefined,
+              messages: { fetch: async () => null }, setArchived: async () => undefined },
+    },
+    users: {
+      fetch: async () => ({ send: async (o: unknown) => void newDms.push(o) }),
+    },
+  };
+  return { client, message, newDms, holdEdit, failNext, visibleText, visibleButtons };
+}
+
+describe("収束は、プロセスをまたいでも同じ1通へ向かう", () => {
 
   /**
    * 置き換わった試行（superseded）が残した収束義務を作る。
@@ -408,5 +463,194 @@ describe("収束は、プロセスをまたいでも同じ1通へ向かう", () 
     expect(b.confessions.recoverOrphanedEffects("system:startup").renders).toBe(0);
     expect(b.confessions.claimRender(render.id)).toBeUndefined();
     expect(b.confessions.obligations(confessionId).pendingRenders).toBe(1);
+  });
+});
+
+/**
+ * **DB の門は、Discord への書き込みまでは守れない。**
+ *
+ * 収束は「所有権を取る → Discord を編集する → 決着を書く」の順で進む。世代と所有者の門は
+ * 最後の決着を守るが、**編集はその前に起きている**。貸出の切れた古い実行の編集が、
+ * 新しい所有者の編集より後に着地すると、DB は正しく closed / settled なのに、
+ * 投稿者の画面だけが古い姿へ戻る。
+ *
+ * ここでは、その順序を実際に作って戻ることを確かめ、そのうえで同じメッセージが
+ * いまの案件へ収束し直すことを見る。
+ */
+describe("古い実行が外を書き換えても、投稿者の画面はいまの姿へ戻る", () => {
+
+  /** 「返答待ち」で確定し、収束はまだ、という状態を作る */
+  function seedWaiting(ctx: ReturnType<typeof boot>) {
+    const row = ctx.confessions.create("sender-1", { type: "soudan", replyWish: "yes", body: "本文" });
+    ctx.confessions.claim(row.id, "thread-1", "staff-1");
+    const draft = ctx.confessions.createReplyDraft(row.id, "staff-1", "届いている本文", 90);
+    ctx.confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const finalized = ctx.confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: ctx.confessions.getReplyDraft(draft.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: DM_CH, messageId: MSG },
+    });
+    return { confessionId: row.id, renderId: finalized.renderId! };
+  }
+
+  /**
+   * A が編集の途中で止まり、貸出が切れ、B が引き取って closed 表示まで書き終える。
+   * そこへ A の古い編集が `mode` の結末で着地する。
+   */
+  async function staleLandsLast(mode: "ok" | "net" | "api") {
+    const a = boot("instance-A");
+    const { confessionId } = seedWaiting(a);
+    const world = dmWorld();
+
+    // ── A: 収束を始め、Discord への編集の直前で止まる ──
+    const gate = world.holdEdit();
+    const aConverging = convergePendingRenders(world.client as never, a.services);
+    await gate.entered;
+
+    // ── A の貸出が切れ、B が引き取る ──
+    const b = boot("instance-B");
+    killPreviousInstances(b.db, "instance-B");
+    expect(b.confessions.recoverOrphanedEffects("system:sweep").renders).toBe(1);
+
+    // ── その間に投稿者が終了する ──
+    b.confessions.senderCloseAtomic(confessionId, "sender-1", 90);
+
+    // ── B が同じメッセージを「終了」の姿へ書き換え、決着させる ──
+    expect(await convergePendingRenders(world.client as never, b.services)).toBe(1);
+    expect(world.visibleText()).toContain("既に終了しています");
+    expect(world.visibleText()).not.toContain("自動で終了します");
+
+    // ── ここで A の古い編集がようやく着地する ──
+    if (mode === "net") world.failNext("net");
+    if (mode === "api") world.failNext("api");
+    gate.release();
+    await aConverging;
+
+    return { a, b, confessionId, world };
+  }
+
+  // R48: 古い編集が成功して着地する
+  it("古い編集が後から成功しても、修復が同じメッセージを終了の姿へ戻す", async () => {
+    const { b, confessionId, world } = await staleLandsLast("ok");
+
+    // **まずは実際に古い姿へ戻ってしまっていることを確かめる**（ここが今回の穴）
+    expect(world.visibleText()).toContain("必要なら追記できます");
+    expect(world.visibleText()).toContain("自動で終了します");
+    // DB は正しいまま。古い試行は何も動かしていない
+    expect(b.confessions.get(confessionId)!.status).toBe("closed");
+    expect(b.confessions.get(confessionId)!.closed_side).toBe("sender");
+
+    // 修復の義務が durable に残っている
+    const repairs = b.confessions.pendingRendersFor(confessionId);
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]!.message_id).toBe(MSG);
+    expect(repairs[0]!.render_kind).toBe("current_state"); // 凍結した姿を持たない
+    expect(repairs[0]!.deadline_at).toBeNull();
+
+    // ── 刻時盤（あるいは再起動後）の収束 ──
+    const before = world.newDms.length;
+    expect(await convergePendingRenders(world.client as never, b.services)).toBe(1);
+
+    const text = world.visibleText();
+    expect(text).toContain("この返信は届きましたが、このやり取りは既に終了しています");
+    expect(text).toContain("あなたが終了を選んだためです");
+    expect(text).not.toContain("自動で終了します"); // 「7日後」を出さない
+    expect(text).not.toContain("必要なら追記できます");
+    expect(world.visibleButtons()).toEqual([]); // 追記／もう大丈夫 の操作を残さない
+    expect(world.newDms).toHaveLength(before); // **新しい DM は 0**
+
+    // 会話は一度も開き直っていない
+    expect(b.confessions.get(confessionId)!.status).toBe("closed");
+    expect(b.confessions.get(confessionId)!.reply_deadline_at).toBeNull();
+    expect(
+      (b.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_reopen'").get() as { n: number }).n,
+    ).toBe(0);
+    // 責務は片付いた
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+  });
+
+  // R49: 古い編集の結末が分からない
+  it("古い編集の結末が分からない場合も、修復して収束し直す", async () => {
+    const { b, confessionId, world } = await staleLandsLast("net");
+
+    // 触ったかどうか分からない以上、「触っていない」ことにはしない
+    const repairs = b.confessions.pendingRendersFor(confessionId);
+    expect(repairs).toHaveLength(1);
+    expect(repairs[0]!.message_id).toBe(MSG);
+
+    const before = world.newDms.length;
+    await convergePendingRenders(world.client as never, b.services);
+    expect(world.visibleText()).toContain("既に終了しています");
+    expect(world.visibleText()).not.toContain("自動で終了します");
+    expect(world.newDms).toHaveLength(before);
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+  });
+
+  // R50: 古い編集が明確に拒否された
+  it("古い編集が明確に拒否されたなら、要らない修復を作らない", async () => {
+    const { b, confessionId, world } = await staleLandsLast("api");
+
+    // 外は変わっていないと確定している。B が書いた終了の姿のまま
+    expect(world.visibleText()).toContain("既に終了しています");
+    expect(world.visibleText()).not.toContain("自動で終了します");
+    expect(b.confessions.pendingRendersFor(confessionId)).toEqual([]);
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+    expect(
+      (b.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_render_repair'").get() as { n: number }).n,
+    ).toBe(0);
+  });
+
+  it("修復は無限に増えない（まだ実行していない指示があれば積まない）", async () => {
+    const { b, confessionId, world } = await staleLandsLast("ok");
+    expect(b.confessions.pendingRendersFor(confessionId)).toHaveLength(1);
+
+    // 同じメッセージについて、もう一度修復を積もうとしても増えない
+    for (let i = 0; i < 5; i += 1) {
+      expect(
+        b.confessions.queueRenderRepair({ confessionId, channelId: DM_CH, messageId: MSG }),
+      ).toBeNull();
+    }
+    expect(b.confessions.pendingRendersFor(confessionId)).toHaveLength(1);
+
+    await convergePendingRenders(world.client as never, b.services);
+    expect(b.confessions.pendingRendersFor(confessionId)).toEqual([]);
+  });
+
+  it("修復は、いま実行中の別の所有者を奪わない", async () => {
+    const a = boot("instance-A");
+    const { confessionId, renderId } = seedWaiting(a);
+    // 別インスタンスが収束を握っている（まだ編集を終えていない）
+    const other = boot("instance-C");
+    expect(other.confessions.claimRender(renderId)).toBeTruthy();
+
+    // 修復は別の行として積まれ、実行中の行には触らない
+    const repairId = a.confessions.queueRenderRepair({
+      confessionId,
+      channelId: DM_CH,
+      messageId: MSG,
+    });
+    expect(repairId).not.toBeNull();
+    expect(repairId).not.toBe(renderId);
+    expect(a.confessions.pendingRendersFor(confessionId).find((r) => r.id === renderId)!.state).toBe("rendering");
+    expect(a.confessions.pendingRendersFor(confessionId).find((r) => r.id === repairId)!.state).toBe("pending");
+  });
+
+  it("修復の義務は、プロセスが落ちても残る", async () => {
+    const { b, confessionId } = await staleLandsLast("ok");
+    const repairId = b.confessions.pendingRendersFor(confessionId)[0]!.id;
+
+    // ── 再起動 ──
+    const c = boot("instance-C");
+    killPreviousInstances(c.db, "instance-C");
+    c.confessions.recoverOrphanedEffects("system:startup");
+    expect(c.confessions.pendingRendersFor(confessionId).map((r) => r.id)).toContain(repairId);
+
+    const world = dmWorld();
+    expect(await convergePendingRenders(world.client as never, c.services)).toBe(1);
+    expect(world.visibleText()).toContain("既に終了しています");
+    expect(world.newDms).toEqual([]);
+    expect(c.confessions.obligations(confessionId).pendingRenders).toBe(0);
   });
 });

@@ -1547,6 +1547,56 @@ export class Confessions {
       .all(confessionId) as PendingRenderRow[];
   }
 
+  /**
+   * **古い実行が、外の1通を書き換えてしまったかもしれないときの修復。**
+   *
+   * DB の門（世代・所有者）は決着を守るが、**Discord への編集は門より前に起きている。**
+   * 貸出の切れた古い renderer の編集が、新しい所有者の編集より後に着地すると、
+   * DB は正しく closed / settled なのに、投稿者の画面だけが古い姿へ戻る。
+   *
+   * だから「決着には負けたが、外は触ったかもしれない」callback は、**同じメッセージを
+   * いまの案件へもう一度収束させる義務**を durable に残す。新しい DM は送らない。
+   * 描く内容は凍結しない——実行時の canonical state から導く（`current_state`）。
+   *
+   * 二重に積まない条件は「**まだ実行していない指示（`pending` / `failed`）が
+   * 同じメッセージに残っているか**」。それがあるなら、その指示がこれから正しい姿を
+   * 書くので修復は要らない。`rendering` は既に編集を済ませている可能性があるので、
+   * 待たずに修復を置く（そこが今回の穴だった）。
+   */
+  queueRenderRepair(input: {
+    confessionId: number;
+    channelId: string;
+    messageId: string;
+    atTs?: number;
+  }): number | null {
+    const ts = input.atTs ?? now();
+    const info = this.db
+      .prepare(
+        `INSERT INTO confession_pending_renders
+           (confession_id, draft_id, channel_id, message_id, render_kind, state, created_at)
+         SELECT ?, NULL, ?, ?, 'current_state', 'pending', ?
+         WHERE NOT EXISTS (
+           SELECT 1 FROM confession_pending_renders r
+           WHERE r.confession_id=? AND r.channel_id=? AND r.message_id=? AND r.state IN ('pending','failed')
+         )`,
+      )
+      .run(
+        input.confessionId,
+        input.channelId,
+        input.messageId,
+        ts,
+        input.confessionId,
+        input.channelId,
+        input.messageId,
+      );
+    if (info.changes !== 1) return null;
+    this.events.log("confession_render_repair", {
+      actor: "system:render",
+      payload: { id: input.confessionId, renderId: Number(info.lastInsertRowid) },
+    });
+    return Number(info.lastInsertRowid);
+  }
+
   /** 収束の所属案件も DB が決める（customId を権限の根拠にしない） */
   renderCase(renderId: number): number | undefined {
     return this.db.prepare("SELECT confession_id FROM confession_pending_renders WHERE id=?").pluck().get(renderId) as
