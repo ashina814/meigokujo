@@ -602,6 +602,44 @@ describe("古い実行が外を書き換えても、投稿者の画面はいま�
     ).toBe(0);
   });
 
+  it("修復は、積んだ時点ではなく実行時の案件から描く", async () => {
+    // **積んだ時点の姿を凍結しない。** 修復が queue されたあとに会話が終われば、
+    // 直った表示は「終了しています」でなければならない——凍結すると、終わった会話へ
+    // 「7日後に終了します」と追記の操作を復活させてしまう。
+    const a = boot("instance-A");
+    const { confessionId } = seedWaiting(a);
+    const world = dmWorld();
+
+    const gate = world.holdEdit();
+    const aConverging = convergePendingRenders(world.client as never, a.services);
+    await gate.entered;
+
+    const b = boot("instance-B");
+    killPreviousInstances(b.db, "instance-B");
+    b.confessions.recoverOrphanedEffects("system:sweep");
+    // **会話はまだ「返答待ち」のまま**（ここが凍結の分かれ目）
+    expect(b.confessions.get(confessionId)!.reply_deadline_at).not.toBeNull();
+    expect(await convergePendingRenders(world.client as never, b.services)).toBe(1);
+
+    // 古い編集が着地し、修復が積まれる
+    gate.release();
+    await aConverging;
+    const repairs = b.confessions.pendingRendersFor(confessionId);
+    expect(repairs).toHaveLength(1);
+
+    // ── そのあとで投稿者が終了する ──
+    b.confessions.senderCloseAtomic(confessionId, "sender-1", 90);
+
+    const before = world.newDms.length;
+    expect(await convergePendingRenders(world.client as never, b.services)).toBe(1);
+    const text = world.visibleText();
+    expect(text).toContain("既に終了しています");
+    expect(text).not.toContain("自動で終了します");
+    expect(text).not.toContain("必要なら追記できます");
+    expect(world.visibleButtons()).toEqual([]);
+    expect(world.newDms).toHaveLength(before);
+  });
+
   it("修復は無限に増えない（まだ実行していない指示があれば積まない）", async () => {
     const { b, confessionId, world } = await staleLandsLast("ok");
     expect(b.confessions.pendingRendersFor(confessionId)).toHaveLength(1);
