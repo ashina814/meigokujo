@@ -774,6 +774,7 @@ type SenderNotice =
   | { kind: "reply"; body: string; waiting: boolean; deadlineAt: number | null }
   | { kind: "closed_by_staff"; body: string }
   | { kind: "reply_after_close"; body: string; closedBySender: boolean }
+  | { kind: "reply_superseded"; body: string }
   | { kind: "closed_by_sender" }
   | { kind: "closed_by_timeout" };
 
@@ -854,6 +855,20 @@ function senderDm(id: number, notice: SenderNotice): MessageCreateOptions {
             ? "あなたが終了を選んだためです。"
             : "返答の期限が過ぎたためです。",
           "続きがある場合は、新しくトートへ送れます。",
+        ].join("\n"),
+      });
+      break;
+    case "reply_superseded":
+      // **この1通の送信処理が、別の試行と行き違った場合。**
+      // 会話がいまどうなっているかは他の試行が持っている。ここから open / closed や
+      // 期限を推測して書くと、二重に食い違った案内を出すことになる。だから
+      // 「届いたこと」と「最新はこちらではない」ことだけを、静かに言う。
+      embed.setDescription(notice.body.slice(0, 3500));
+      embed.addFields({
+        name: "​",
+        value: [
+          "**この返信は届きましたが、送信処理が別の試行と行き違いました。**",
+          "このやり取りの現在の状態は、トートからの最新のメッセージをご確認ください。",
         ].join("\n"),
       });
       break;
@@ -959,17 +974,32 @@ export async function convergePendingRenders(
     // **収束先は「いまの案件」から導く。** queue した時点の希望を信じると、
     // 編集に失敗しているあいだに投稿者が終了した／期限が来た場合に、
     // 終わった会話へ「7日後に終了します」と開いているような操作を復活させてしまう。
-    const desired = services.confessions.desiredRender(claimed.confession_id);
+    // `superseded` は**会話の見た目の凍結ではない**——その1通の試行そのものについての
+    // 事実で、案件の状態（open/closed/期限）を何も含まない。だから案件から導かず、
+    // 行が持つ種別をそのまま使う。それ以外は必ずいまの案件から導く。
+    const desired =
+      claimed.render_kind === "superseded"
+        ? ({ kind: "superseded" } as const)
+        : services.confessions.desiredRender(claimed.confession_id);
     const notice: SenderNotice =
-      desired.kind === "reply_waiting"
-        ? { kind: "reply", body: "", waiting: true, deadlineAt: desired.deadlineAt }
-        : desired.kind === "reply_closed"
-          ? { kind: "closed_by_staff", body: "" }
-          : { kind: "reply_after_close", body: "", closedBySender: desired.closedBySender };
+      desired.kind === "superseded"
+        ? { kind: "reply_superseded", body: "" }
+        : desired.kind === "reply_waiting"
+          ? { kind: "reply", body: "", waiting: true, deadlineAt: desired.deadlineAt }
+          : desired.kind === "reply_closed"
+            ? { kind: "closed_by_staff", body: "" }
+            : { kind: "reply_after_close", body: "", closedBySender: desired.closedBySender };
     // 本文は元のメッセージに残っている。ここでは「どの結末へ収束させるか」だけを渡し、
     // 本文は取り直した現物から拾う（本文をDBに持ち続けないための形）。
     const outcome = await editDmMessage(client, claimed.channel_id, claimed.message_id, claimed.confession_id, notice);
-    services.confessions.settleRender(claimed.id, outcome === "delivered" ? "settled" : "failed");
+    // 決着は**取った世代**で。貸出が切れて別インスタンスが引き取ったあとに
+    // この callback が帰ってきても、進行中の実行を書き換えない。
+    const settleResult = services.confessions.settleRender({
+      renderId: claimed.id,
+      generation: claimed.generation,
+      state: outcome === "delivered" ? "settled" : "failed",
+    });
+    if (!settleResult.won) continue; // 既に別の所有者のもの。何も言わない
     if (outcome === "delivered") settled += 1;
     else {
       await threadLog(
@@ -1006,8 +1036,10 @@ async function editDmMessage(
     const withBody: SenderNotice =
       notice.kind === "reply"
         ? { ...notice, body }
-        : notice.kind === "closed_by_staff"
+        : notice.kind === "reply_superseded"
           ? { ...notice, body }
+          : notice.kind === "closed_by_staff"
+            ? { ...notice, body }
           : notice.kind === "reply_after_close"
             ? { ...notice, body }
             : notice;
@@ -1661,7 +1693,27 @@ function replyDecisionMsg(id: number, services: Services) {
   };
 }
 
-function replyActionMsg(draftId: number, unknownOutcome: boolean) {
+function replyActionMsg(draftId: number, unknownOutcome: boolean, caseClosed: boolean) {
+  const done = new ButtonBuilder()
+    .setCustomId(`mimi:draftdone:${draftId}`)
+    .setLabel("これ以上送らない")
+    .setEmoji("✔️")
+    .setStyle(ButtonStyle.Secondary);
+  if (caseClosed) {
+    // **終了した会話から、新しい送信を始めない。**
+    // 追跡を終える出口は残す（未確定のまま埋もれさせない）。送り直したいなら再オープン。
+    return {
+      content: [
+        unknownOutcome
+          ? `❓ **返信 #${draftId} は、投稿者へ届いたか確認できていません。**`
+          : `⚠️ **返信 #${draftId} は投稿者へ届けられませんでした。**`,
+        "",
+        "このやり取りは既に終了しているため、ここから送り直すことはできません。",
+        "もう一度届けたい場合は、先に 🔓 **再オープン** してください。",
+      ].join("\n"),
+      components: [new ActionRowBuilder<ButtonBuilder>().addComponents(done)],
+    };
+  }
   return {
     content: unknownOutcome
       ? [
@@ -1680,11 +1732,7 @@ function replyActionMsg(draftId: number, unknownOutcome: boolean) {
           .setLabel(unknownOutcome ? "重複を承知でもう一度送る" : "もう一度送る")
           .setEmoji("💬")
           .setStyle(ButtonStyle.Danger),
-        new ButtonBuilder()
-          .setCustomId(`mimi:draftdone:${draftId}`)
-          .setLabel("これ以上送らない")
-          .setEmoji("✔️")
-          .setStyle(ButtonStyle.Secondary),
+        done,
       ),
     ],
   };
@@ -1706,7 +1754,13 @@ async function manualReplyRetry(
   // 再送を実行するのは**押した人**。下書きを書いた人とは別でありうる。
   const claimed = services.confessions.claimReplyDraftManualRetry(id, draftId, interaction.user.id);
   if (!claimed?.body) {
-    await interaction.editReply({ content: "この返信は既に処理されています。" });
+    // 権威は core 側の条件付き UPDATE。ここは「なぜ通らなかったか」を伝えるだけ。
+    await interaction.editReply({
+      content:
+        services.confessions.get(id)?.status === "closed"
+          ? "このやり取りは既に終了しているため、ここから送り直すことはできません。もう一度届けたい場合は 🔓 再オープン を使ってください。"
+          : "この返信は既に処理されています。",
+    });
     return;
   }
   const row = services.confessions.get(id);
@@ -2340,7 +2394,9 @@ export async function handleConfessionStringSelect(
       return;
     }
     const target = services.confessions.getReplyDraft(draftId);
-    await interaction.update(replyActionMsg(draftId, target?.outcome === "unknown"));
+    await interaction.update(
+      replyActionMsg(draftId, target?.outcome === "unknown", services.confessions.get(owner)?.status === "closed"),
+    );
     return;
   }
 
@@ -2772,7 +2828,20 @@ async function reopenConfession(interaction: ButtonInteraction, services: Servic
     await interaction.reply({ content: "この件が見つかりません。", flags: MessageFlags.Ephemeral });
     return;
   }
-  services.confessions.reopen(id, interaction.user.id);
+  const reopened = services.confessions.reopen(id, interaction.user.id);
+  if (!reopened.ok) {
+    // **開いている会話を「開き直す」ことはできない。** 二度押しや、古い画面に
+    // 残ったボタンで、進行中の期限や状態を消させない。
+    await refreshPanel(interaction.client, services, id);
+    await interaction.reply({
+      content:
+        reopened.code === "not_closed"
+          ? "このやり取りは終了していません（既に開いています）。再オープンは不要です。"
+          : "この件が見つかりません。",
+      flags: MessageFlags.Ephemeral,
+    });
+    return;
+  }
   const thread = row.thread_id ? await interaction.client.channels.fetch(row.thread_id).catch(() => null) : null;
   if (thread?.isThread() && thread.archived) await thread.setArchived(false).catch(() => undefined);
   await threadLog(interaction.client, services, id, `🔓 <@${interaction.user.id}> がこの案件を再オープンしました。`);

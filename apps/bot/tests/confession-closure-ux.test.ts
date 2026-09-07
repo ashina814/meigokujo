@@ -1891,8 +1891,16 @@ describe("収束の途中で落ちても、同じメッセージが最終形へ�
     return draftId;
   };
 
-  // R30
-  it("収束中に落ちたものは、所有者の死を確かめてから再開できる", async () => {
+  /**
+   * ここは**同じ service が自分の行を回収する**形なので、「所有者が死んだ」ことの
+   * 証拠にはならない（自分の行は live から除かれるので必ず取れる）。見ているのは
+   * 「`rendering` は通常の掃きに拾われない」「回収後は同じメッセージへ収束する」の2点。
+   *
+   * 別インスタンスの死・貸出切れ・引き取りは
+   * `confession-startup-recovery.test.ts` で、実ファイルDBを開き直して確かめる。
+   */
+  // R30（プロセス内の部分）
+  it("収束中のものは通常の掃きに拾われず、回収後は同じメッセージへ収束する", async () => {
     const h = harness("yes");
     await staged(h);
 
@@ -1920,10 +1928,16 @@ describe("収束の途中で落ちても、同じメッセージが最終形へ�
 
     // 別プロセスが収束を握り、鼓動を打ち続けている
     const other = new Confessions(h.db, h.services.events, "other-live-instance");
-    expect(other.claimRender(render.id)).toBeTruthy();
+    const claimed = other.claimRender(render.id)!;
+    expect(claimed).toBeTruthy();
 
     expect(h.services.confessions.recoverOrphanedEffects("system:startup").renders).toBe(0);
     expect(h.services.confessions.listStalledRenders()).toHaveLength(1);
+    // 決着も奪えない（世代が合っていても所有者が違う）
+    expect(
+      h.services.confessions.settleRender({ renderId: render.id, generation: claimed.generation, state: "settled" }).won,
+    ).toBe(false);
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(1);
   });
 });
 
@@ -2040,5 +2054,198 @@ describe("誰が操作したのかを、記録が取り違えない", () => {
     await h.press(`mimi:replyend:${draftId}`);
     expect(h.row().closed_by).toBe(STAFF);
     expect(h.services.confessions.getReplyDraft(draftId)!.executed_by).toBe(STAFF);
+  });
+});
+
+describe("終わった会話から、担当者が新しい送信を始められない", () => {
+  /** 届いたか分からない／届かなかった返信を1つ残す */
+  const stuck = async (h: ReturnType<typeof harness>, mode: "unknown" | "failed") => {
+    if (mode === "unknown") h.setDmUnknown(true);
+    else h.setDmFails(true);
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "未確定の返信" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    await h.press(`mimi:replywait:${draftId}`);
+    h.setDmUnknown(false);
+    h.setDmFails(false);
+    return draftId;
+  };
+
+  // R36a / R36b
+  for (const mode of ["failed", "unknown"] as const) {
+    it(`${mode} の返信は、投稿者が終了したあと送り直せない`, async () => {
+      const h = harness("yes");
+      const draftId = await stuck(h, mode);
+      await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+      const dmsAfterClose = h.dms.length;
+      const before = h.services.confessions.getReplyDraft(draftId)!;
+
+      await h.press(`mimi:draftretry:${draftId}`);
+
+      // **新しい DM は1通も出ない**
+      expect(h.dms).toHaveLength(dmsAfterClose);
+      const after = h.services.confessions.getReplyDraft(draftId)!;
+      expect(after.outcome).toBe(before.outcome);
+      expect(after.generation).toBe(before.generation);
+      expect(after.body).toBe("未確定の返信");
+      // 会話も終わったまま
+      expect(h.row().status).toBe("closed");
+      expect(h.row().closed_side).toBe("sender");
+      // 担当者には理由と出口が示される
+      const said = h.lastReply().content ?? "";
+      expect(said).toContain("既に終了している");
+      expect(said).toContain("再オープン");
+    });
+  }
+
+  it("終了済みの画面には「もう一度送る」を出さない（出口は残す）", async () => {
+    const h = harness("yes");
+    const draftId = await stuck(h, "unknown");
+    await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+
+    // 未確定の返信の出口そのものは消えない
+    expect(h.panelButtons()).toContain(`mimi:draftdecide:${h.id}`);
+    await h.press(`mimi:draftdecide:${h.id}`);
+    await handleConfessionStringSelect(
+      { ...h.interactionFor(`mimi:draftsel:${h.id}`, STAFF), values: [String(draftId)] } as any,
+      h.services,
+    );
+    const buttons = (h.lastReply().components ?? []).flatMap((r: any) =>
+      (r.toJSON ? r.toJSON() : r).components.map((c: any) => c.custom_id),
+    );
+    expect(buttons).toEqual([`mimi:draftdone:${draftId}`]);
+    expect(h.lastReply().content).toContain("再オープン");
+
+    // 「これ以上送らない」は通り、届いたことにはしない
+    const before = h.dms.length;
+    await h.press(`mimi:draftdone:${draftId}`);
+    expect(h.services.confessions.getReplyDraft(draftId)!.outcome).toBe("resolved_manually");
+    expect(h.services.confessions.getReplyDraft(draftId)!.outcome).not.toBe("delivered");
+    expect(h.dms).toHaveLength(before); // 何も送らない
+    expect(h.services.confessions.obligations(h.id).replyDrafts).toBe(0);
+  });
+
+  // R36c
+  it("再オープンすれば送り直せる", async () => {
+    const h = harness("yes");
+    const draftId = await stuck(h, "unknown");
+    await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+    await h.press(`mimi:draftretry:${draftId}`);
+    const blocked = h.dms.length;
+
+    await h.press(`mimi:reopen:${h.id}`);
+    expect(h.row().status).toBe("claimed");
+    expect(h.row().stage).toBe("active");
+
+    await h.press(`mimi:draftretry:${draftId}`);
+    expect(h.dms.length).toBe(blocked + 1);
+    expect(h.dmText()).toContain("未確定の返信");
+    expect(h.row().reply_deadline_at).not.toBeNull();
+  });
+});
+
+describe("再オープンは、開いている会話を壊さない", () => {
+  // R35（実ハンドラ経由）
+  it("進行中の会話で再オープンを押しても、期限も番も動かない", async () => {
+    const h = harness("yes");
+    await h.press(`mimi:senderclosego:${h.id}`, SENDER);
+    await h.press(`mimi:reopen:${h.id}`);
+    expect(h.row().status).toBe("claimed");
+
+    // 新しい返信が成立し、新しい期限ができる
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "続きです" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts ORDER BY id DESC").pluck().get() as number;
+    await h.press(`mimi:replywait:${draftId}`);
+    const fresh = h.row();
+    expect(fresh.reply_deadline_at).not.toBeNull();
+    const reopenEvents = () =>
+      (h.db.prepare("SELECT COUNT(*) n FROM events WHERE type='confession_reopen'").get() as { n: number }).n;
+    const before = reopenEvents();
+
+    // 古い画面に残っていた再オープンが押される
+    await h.press(`mimi:reopen:${h.id}`);
+
+    const after = h.row();
+    expect(after.reply_deadline_at).toBe(fresh.reply_deadline_at);
+    expect(after.stage).toBe("awaiting_poster");
+    expect(reopenEvents()).toBe(before);
+    expect(h.lastReply().content).toContain("終了していません");
+    expect(h.threadPostTexts()).not.toContain("再オープンしました。\n");
+  });
+});
+
+describe("行き違った返信も、投稿者の手元で宙ぶらりんにしない", () => {
+  // R37
+  it("置き換わった試行の1通は、専用の案内へ収束する（新しい DM は増えない）", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "行き違った返信" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+
+    // 試行1の DM を境界で止める
+    const first = h.holdDm();
+    const sending = h.press(`mimi:replywait:${draftId}`);
+    await first.entered;
+    // 回収 → 試行2が始まる（こちらも送信中のまま）
+    h.services.confessions.recoverOrphanedEffects("system:startup");
+    const second = h.holdDm();
+    const retrying = h.press(`mimi:draftretry:${draftId}`);
+    await second.entered;
+
+    // 試行1が「届いた」で帰る（＝置き換わっているが、確かに届いている）
+    first.release("ok");
+    await sending;
+    second.release("ok");
+    await retrying;
+
+    // 会話を動かしたのは試行2だけ
+    expect(h.row().reply_deadline_at).not.toBeNull();
+
+    const supersededDm = h.dms.find((d) => {
+      const j = d.embeds?.[0]?.toJSON ? d.embeds[0].toJSON() : d.embeds?.[0];
+      return [j?.description ?? "", ...(j?.fields ?? []).map((f: any) => f.value)]
+        .join("\n")
+        .includes("送信処理が別の試行と行き違いました");
+    });
+    expect(supersededDm).toBeDefined();
+    const j = supersededDm!.embeds?.[0]?.toJSON ? supersededDm!.embeds[0].toJSON() : supersededDm!.embeds?.[0];
+    const text = [j?.description ?? "", ...(j?.fields ?? []).map((f: any) => f.value)].join("\n");
+    // 本文は消えていない
+    expect(text).toContain("行き違った返信");
+    // open/closed も期限も推測しない
+    expect(text).not.toContain("自動で終了します");
+    expect(text).not.toContain("このやり取りはここで終了しました");
+    expect((supersededDm!.components ?? []).length).toBe(0);
+    // 責務は残っていない（収束済み）
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(0);
+  });
+
+  it("収束の前に落ちても、同じメッセージが行き違いの案内へ収束する", async () => {
+    const h = harness("yes");
+    await h.submit(`mimi:staffreplybody:${h.id}`, STAFF, { text: "行き違った返信" });
+    const draftId = h.db.prepare("SELECT id FROM confession_reply_drafts").pluck().get() as number;
+
+    h.setEditFails(true); // 収束（編集）だけが落ちる
+    const first = h.holdDm();
+    const sending = h.press(`mimi:replywait:${draftId}`);
+    await first.entered;
+    h.services.confessions.recoverOrphanedEffects("system:startup");
+    const second = h.holdDm();
+    const retrying = h.press(`mimi:draftretry:${draftId}`);
+    await second.entered;
+    first.release("ok");
+    await sending;
+    second.release("ok");
+    await retrying;
+
+    // 直せていないので、義務として残る（本文だけの1通のまま）
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBeGreaterThan(0);
+    const before = h.dms.length;
+
+    // 起動時／刻時盤の収束
+    h.setEditFails(false);
+    await convergePendingRenders(h.client as any, h.services);
+
+    expect(h.dms).toHaveLength(before); // **新しい DM は増えない**
+    expect(JSON.stringify(h.dms)).toContain("送信処理が別の試行と行き違いました");
+    expect(h.services.confessions.obligations(h.id).pendingRenders).toBe(0);
   });
 });

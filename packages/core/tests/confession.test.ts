@@ -104,8 +104,9 @@ describe("Confessions", () => {
     expect(closed?.closed_by).toBe("user:staff");
     expect(closed?.body_purge_at).toBeGreaterThan(closed!.closed_at!);
     const re = ctx.confessions.reopen(row.id, "user:staff");
-    expect(re?.status).toBe("claimed");
-    expect(re?.close_reason).toBeNull();
+    expect(re.ok).toBe(true);
+    expect(ctx.confessions.get(row.id)?.status).toBe("claimed");
+    expect(ctx.confessions.get(row.id)?.close_reason).toBeNull();
   });
 
   it("本文purge: 本文だけNULL化しメタは残る。listPurgeable/extendRetention", () => {

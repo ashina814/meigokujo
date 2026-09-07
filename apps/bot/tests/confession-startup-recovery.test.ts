@@ -22,7 +22,7 @@ const {
   stopConfessionHeartbeat,
   __setConfessionBarrierForTest,
 } = await import("../src/confession-startup.js");
-const { retryPendingFollowUps } = await import("../src/commands/confession.js");
+const { retryPendingFollowUps, convergePendingRenders } = await import("../src/commands/confession.js");
 
 /**
  * **前のプロセスが残した「送信中」を、新しいプロセスが追い越さない。**
@@ -236,5 +236,128 @@ describe("生存の記録は、刻時盤の長い周回に巻き込まれない"
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+/**
+ * **投稿者に見えている1通の収束を、プロセスをまたいで確かめる。**
+ *
+ * 同じ service が自分の行を回収するだけでは「所有者が死んだ」ことの証拠にならない。
+ * ここでは実ファイルDBを開き直し、instance A が収束を握ったまま消え、貸出が切れ、
+ * instance B が引き取って**同じメッセージ**を直すまでを通す。
+ */
+describe("収束は、プロセスをまたいでも同じ1通へ向かう", () => {
+  const DM_CH = "dm-channel";
+  const MSG = "dm-msg-0";
+
+  /** 投稿者へ届いた1通を編集できるだけの、最小の Discord。何通送られたかも数える */
+  function dmWorld() {
+    const message = {
+      embeds: [{ toJSON: () => ({ description: "届いている本文" }) }] as unknown[],
+      edited: [] as unknown[],
+      edit: async (o: unknown) => {
+        message.edited.push(o);
+        return o;
+      },
+    };
+    const newDms: unknown[] = [];
+    const client = {
+      channels: {
+        fetch: async (cid: string) =>
+          cid === DM_CH
+            ? { id: DM_CH, isTextBased: () => true, messages: { fetch: async () => message } }
+            : { isThread: () => true, archived: false, send: async () => undefined,
+                messages: { fetch: async () => null }, setArchived: async () => undefined },
+      },
+      users: {
+        fetch: async () => ({ send: async (o: unknown) => void newDms.push(o) }),
+      },
+    };
+    return { client, message, newDms };
+  }
+
+  /** 返信が届いて「返答待ち」で確定した直後の状態（収束はまだ）を作る */
+  function seedPendingRender(ctx: ReturnType<typeof boot>) {
+    const row = ctx.confessions.create("sender-1", { type: "soudan", replyWish: "yes", body: "本文" });
+    ctx.confessions.claim(row.id, "thread-1", "staff-1");
+    const draft = ctx.confessions.createReplyDraft(row.id, "staff-1", "届いている本文", 90);
+    ctx.confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    ctx.confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: ctx.confessions.getReplyDraft(draft.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: DM_CH, messageId: MSG },
+    });
+    return { confessionId: row.id, render: ctx.confessions.listPendingRenders()[0]! };
+  }
+
+  it("A が収束を握ったまま消えても、B が同じメッセージを直しきる", async () => {
+    // ── instance A ──
+    const a = boot("instance-A");
+    const { confessionId, render } = seedPendingRender(a);
+    const claimedByA = a.confessions.claimRender(render.id)!;
+    expect(claimedByA.owner_instance).toBe("instance-A");
+    expect(a.confessions.listStalledRenders()).toHaveLength(1);
+
+    // ── A が消える。貸出が切れるまでは、誰も奪わない ──
+    const b = boot("instance-B");
+    expect(b.confessions.recoverOrphanedEffects("system:startup").renders).toBe(0);
+    expect(b.confessions.listStalledRenders()).toHaveLength(1);
+
+    killPreviousInstances(b.db, "instance-B");
+    expect(b.confessions.recoverOrphanedEffects("system:startup").renders).toBe(1);
+
+    // ── B が引き取って収束させる ──
+    const world = dmWorld();
+    expect(await convergePendingRenders(world.client as never, b.services)).toBe(1);
+    expect(world.newDms).toEqual([]); // **新しい DM は1通も出ない**
+    expect(world.message.edited).toHaveLength(1);
+    expect(JSON.stringify(world.message.edited)).toContain("必要なら追記できます");
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+  });
+
+  // R38
+  it("A の古い callback は、B が引き取った実行を書き換えない", async () => {
+    const a = boot("instance-A");
+    const { confessionId, render } = seedPendingRender(a);
+    const claimedByA = a.confessions.claimRender(render.id)!;
+
+    const b = boot("instance-B");
+    killPreviousInstances(b.db, "instance-B");
+    b.confessions.recoverOrphanedEffects("system:startup");
+    const claimedByB = b.confessions.claimRender(render.id)!;
+    expect(claimedByB.generation).toBeGreaterThan(claimedByA.generation);
+
+    // ここで A の renderer がようやく帰ってくる
+    const stale = a.confessions.settleRender({
+      renderId: render.id,
+      generation: claimedByA.generation,
+      state: "settled",
+    });
+    expect(stale.won).toBe(false);
+    expect(b.confessions.pendingRendersFor(confessionId)[0]!.state).toBe("rendering");
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(1);
+
+    // 現役の B だけが決着できる
+    const live = b.confessions.settleRender({
+      renderId: render.id,
+      generation: claimedByB.generation,
+      state: "settled",
+    });
+    expect(live.won).toBe(true);
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+  });
+
+  it("A が生きているうちは、B は収束を奪わない", () => {
+    const a = boot("instance-A");
+    const { confessionId, render } = seedPendingRender(a);
+    a.confessions.claimRender(render.id);
+
+    const b = boot("instance-B");
+    a.confessions.heartbeatInstance("instance-A"); // A はまだ鼓動を打っている
+    expect(b.confessions.recoverOrphanedEffects("system:startup").renders).toBe(0);
+    expect(b.confessions.claimRender(render.id)).toBeUndefined();
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(1);
   });
 });

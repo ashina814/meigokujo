@@ -259,7 +259,14 @@ describe("自由返信は、待つのか終えるのかを明示してはじめ�
     expect(confessions.purgeExpiredConversationBodies(purgeAt - 1).drafts).toBe(0);
     expect(confessions.purgeExpiredConversationBodies(purgeAt).drafts).toBe(1);
     expect(confessions.getReplyDraft(draft.id)!.body).toBeNull();
-    expect(confessions.getReplyDraft(draft.id)!.outcome).toBe("unknown");
+    // **本文を捨てた以上、もう送れない。** `unknown`（＝人の判断待ち）のまま残すと、
+    // 本文の無い判断待ちが永久に居座る。届いたことにもしない。
+    const purged = confessions.getReplyDraft(draft.id)!;
+    expect(purged.outcome).toBe("expired_retention");
+    expect(purged.outcome).not.toBe("delivered");
+    expect(purged.resolved_by).toBe("system:retention");
+    expect(confessions.listReplyDraftsNeedingDecision(row.id)).toEqual([]);
+    expect(confessions.obligations(row.id).replyDrafts).toBe(0);
   });
 
   it("下書きを書いた本人以外は送信できない", () => {
@@ -918,7 +925,9 @@ describe("投稿者が終わらせた会話を、あとからの対応開始が�
   it("再オープンだけが、終わった会話を開き直せる", () => {
     const row = confessions.create("sender-1", { type: "soudan", replyWish: "yes", body: "本文" });
     confessions.senderCloseAtomic(row.id, "sender-1", 90);
-    const reopened = confessions.reopen(row.id, "staff-1")!;
+    const result = confessions.reopen(row.id, "staff-1");
+    expect(result.ok).toBe(true);
+    const reopened = confessions.get(row.id)!;
     expect(reopened.status).toBe("claimed");
     // **終了の印は全部落ちる**（status=claimed なのに closed_side=sender を残さない）
     expect(reopened.closed_side).toBeNull();
@@ -1377,14 +1386,409 @@ describe("投稿者に見える最終形は、再起動しても収束する", (
     expect(confessions.claimRender(render.id)).toBeUndefined(); // 二重には取れない
 
     // R23: 明確に書き換えられなかった場合
-    confessions.settleRender(render.id, "failed");
+    const claimedRender = confessions.pendingRendersFor(row.id)[0]!;
+    expect(confessions.settleRender({ renderId: render.id, generation: claimedRender.generation, state: "failed" }).won).toBe(true);
     expect(confessions.pendingRendersFor(row.id)).toHaveLength(1);
     expect(confessions.obligations(row.id).pendingRenders).toBe(1);
     // 会話そのものの真実は動かない
     expect(confessions.get(row.id)!.reply_deadline_at).not.toBeNull();
 
-    confessions.settleRender(render.id, "settled");
+    const again = confessions.claimRender(render.id)!;
+    confessions.settleRender({ renderId: render.id, generation: again.generation, state: "settled" });
     expect(confessions.pendingRendersFor(row.id)).toEqual([]);
     expect(confessions.obligations(row.id).pendingRenders).toBe(0);
+  });
+});
+
+/** 貸出が切れたあとの時刻（前の所有者は死んだと確かめられる） */
+const afterLeaseR5 = () => Math.floor(Date.now() / 1000) + CONFESSION_INSTANCE_LEASE_SECONDS + 1;
+
+describe("本文を捨てたら、実行できない責務も残さない", () => {
+  /**
+   * **retention は「もう追えない」を作る。** 追えないものを「まだ渡していない」として
+   * 数え続けると、担当者にはどうにもできない責務が永久に残り、その案件のスレッドは
+   * 二度と畳めなくなる。かといって届いてもいないものを `delivered` にはできない。
+   * だから第三の終端（`expired_retention`）へ落とす。
+   */
+  const purge = (confessionId: number, followUpId: number) => {
+    const at = confessions.getFollowUp(followUpId)!.body_purge_at!;
+    return confessions.purgeExpiredConversationBodies(at);
+  };
+  const assertTerminal = (rowId: number, followUpId: number) => {
+    const f = confessions.getFollowUp(followUpId)!;
+    expect(f.body).toBeNull();
+    // 届いたことにはしない
+    expect(f.outcome).not.toBe("delivered");
+    expect(f.relayed_at).toBeNull();
+    expect(f.outcome).toBe("expired_retention");
+    expect(f.resolved_by).toBe("system:retention");
+    // 実行できる責務としては残らない
+    expect(confessions.listUnrelayedFollowUps(rowId)).toEqual([]);
+    expect(confessions.listRelayableFollowUps()).toEqual([]);
+    expect(confessions.listFollowUpsNeedingDecision(rowId)).toEqual([]);
+    expect(confessions.obligations(rowId).followUps).toBe(0);
+    expect(confessions.obligations(rowId).total).toBe(0);
+    // 手動でも触れない（本文がもう無い）
+    expect(confessions.claimFollowUpManualRetry(rowId, followUpId)).toBeUndefined();
+  };
+
+  // T1: まだ一度も渡していない追記
+  it("未引き渡しの追記は、保持期限を過ぎたら終端になりアーカイブを塞がない", () => {
+    const row = seed("yes");
+    const f = confessions.recordSenderFollowUp(row.id, "sender-1", "本文", 90) as { ok: true; followUpId: number };
+    expect(confessions.obligations(row.id).followUps).toBe(1);
+    expect(purge(row.id, f.followUpId).terminalFollowUps).toBe(1);
+    assertTerminal(row.id, f.followUpId);
+  });
+
+  // T2: 明確に失敗した追記
+  it("渡せなかった追記も同じ", () => {
+    const row = seed("yes");
+    const f = confessions.recordSenderFollowUp(row.id, "sender-1", "本文", 90) as { ok: true; followUpId: number };
+    const claimed = confessions.claimFollowUpRelay(f.followUpId)!;
+    confessions.settleFollowUpRelay({ followUpId: f.followUpId, generation: claimed.generation, outcome: "failed" });
+    expect(confessions.obligations(row.id).followUps).toBe(1);
+    expect(purge(row.id, f.followUpId).terminalFollowUps).toBe(1);
+    assertTerminal(row.id, f.followUpId);
+  });
+
+  // T3: 渡せたか分からない追記
+  it("渡せたか分からない追記も同じ", () => {
+    const row = seed("yes");
+    const f = confessions.recordSenderFollowUp(row.id, "sender-1", "本文", 90) as { ok: true; followUpId: number };
+    const claimed = confessions.claimFollowUpRelay(f.followUpId)!;
+    confessions.settleFollowUpRelay({ followUpId: f.followUpId, generation: claimed.generation, outcome: "unknown" });
+    expect(confessions.listFollowUpsNeedingDecision(row.id)).toHaveLength(1);
+    expect(purge(row.id, f.followUpId).terminalFollowUps).toBe(1);
+    assertTerminal(row.id, f.followUpId);
+  });
+
+  // T4: 未確定の返信
+  it("未確定の返信も、本文が消えたら「本文無しの判断待ち」として残らない", () => {
+    const row = seed("yes");
+    const draftIds: number[] = [];
+    for (const outcome of ["failed", "unknown"] as const) {
+      const draft = confessions.createReplyDraft(row.id, "staff-1", `本文-${outcome}`, 90);
+      confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+      confessions.finishReplyDraft({
+        draftId: draft.id,
+        generation: confessions.getReplyDraft(draft.id)!.generation,
+        outcome,
+      });
+      draftIds.push(draft.id);
+    }
+    expect(confessions.obligations(row.id).replyDrafts).toBe(2);
+    const at = confessions.listReplyDraftsNeedingDecision(row.id)[0]!.body_purge_at!;
+    expect(confessions.purgeExpiredConversationBodies(at).terminalDrafts).toBe(2);
+
+    for (const draftId of draftIds) {
+      const d = confessions.getReplyDraft(draftId)!;
+      expect(d.body).toBeNull();
+      expect(d.outcome).toBe("expired_retention");
+      expect(d.outcome).not.toBe("delivered");
+      expect(d.resolved_by).toBe("system:retention");
+      // 送り直しもできない（本文がもう無い）
+      expect(confessions.claimReplyDraftManualRetry(row.id, draftId, "staff-1")).toBeUndefined();
+    }
+    expect(confessions.listReplyDraftsNeedingDecision(row.id)).toEqual([]);
+    expect(confessions.listUnresolvedReplyDrafts(row.id)).toEqual([]);
+    expect(confessions.obligations(row.id).replyDrafts).toBe(0);
+    expect(confessions.obligations(row.id).total).toBe(0);
+  });
+
+  it("終端化は、既に届いた／人が畳んだ行を書き換えない", () => {
+    const row = seed("yes");
+    const delivered = confessions.recordSenderFollowUp(row.id, "sender-1", "届いた", 90) as {
+      ok: true;
+      followUpId: number;
+    };
+    const c1 = confessions.claimFollowUpRelay(delivered.followUpId)!;
+    confessions.settleFollowUpRelay({ followUpId: delivered.followUpId, generation: c1.generation, outcome: "delivered" });
+    const resolved = confessions.recordSenderFollowUp(row.id, "sender-1", "人が畳んだ", 90) as {
+      ok: true;
+      followUpId: number;
+    };
+    const c2 = confessions.claimFollowUpRelay(resolved.followUpId)!;
+    confessions.settleFollowUpRelay({ followUpId: resolved.followUpId, generation: c2.generation, outcome: "unknown" });
+    confessions.resolveFollowUpManually(row.id, resolved.followUpId, "staff-1");
+
+    confessions.purgeExpiredConversationBodies(confessions.getFollowUp(delivered.followUpId)!.body_purge_at ?? 0);
+    expect(confessions.getFollowUp(delivered.followUpId)!.outcome).toBe("delivered");
+    expect(confessions.getFollowUp(delivered.followUpId)!.relayed_at).not.toBeNull();
+    expect(confessions.getFollowUp(resolved.followUpId)!.outcome).toBe("resolved_manually");
+  });
+
+  it("送信中の下書きは終端化しない（世代の門が決着を持っている）", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "送信中", 90);
+    const claimed = confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    expect(claimed.ok).toBe(true);
+    // 本文だけが保持期限で消えても、飛んでいる試行の決着は奪わない
+    confessions.purgeExpiredConversationBodies(confessions.getReplyDraft(draft.id)!.body_purge_at!);
+    expect(confessions.getReplyDraft(draft.id)!.outcome).toBe("sending");
+    expect(
+      confessions.finalizeStaffReply({
+        draftId: draft.id,
+        generation: confessions.getReplyDraft(draft.id)!.generation,
+        intent: "wait",
+        actorId: "staff-1",
+      }).transition,
+    ).toBe("waiting");
+  });
+});
+
+describe("再オープンは、終わっている会話にだけ成立する", () => {
+  // R35
+  it("進行中の会話を、古い再オープンが壊せない", () => {
+    const row = seed("yes");
+    confessions.senderCloseAtomic(row.id, "sender-1", 90);
+
+    // A が正しく開け直す
+    expect(confessions.reopen(row.id, "staff-A").ok).toBe(true);
+    expect(confessions.get(row.id)!.status).toBe("claimed");
+    // **stage は温存しない。** 誰の番か分からないまま再開させない
+    expect(confessions.get(row.id)!.stage).toBe("active");
+
+    // 新しい返信が成立し、新しい期限ができる
+    const draft = confessions.createReplyDraft(row.id, "staff-A", "続きです", 90);
+    confessions.claimReplyDraft(draft.id, "staff-A", "wait");
+    expect(
+      confessions.finalizeStaffReply({
+        draftId: draft.id,
+        generation: confessions.getReplyDraft(draft.id)!.generation,
+        intent: "wait",
+        actorId: "staff-A",
+      }).transition,
+    ).toBe("waiting");
+    const fresh = confessions.get(row.id)!;
+    expect(fresh.reply_deadline_at).not.toBeNull();
+    expect(fresh.stage).toBe("awaiting_poster");
+    const reopenEvents = () => eventsOf("confession_reopen");
+    const before = reopenEvents();
+
+    // ここで、古い画面に残っていた再オープンが押される
+    const stale = confessions.reopen(row.id, "staff-B");
+    expect(stale.ok).toBe(false);
+    expect(stale.ok === false && stale.code).toBe("not_closed");
+
+    const after = confessions.get(row.id)!;
+    expect(after.reply_deadline_at).toBe(fresh.reply_deadline_at); // 期限は消えない
+    expect(after.stage).toBe("awaiting_poster"); // 番も動かない
+    expect(after.status).toBe("claimed");
+    expect(reopenEvents()).toBe(before); // 嘘の再オープン記録が増えない
+  });
+
+  it("二度押ししても、二度は成立しない", () => {
+    const row = seed("yes");
+    confessions.senderCloseAtomic(row.id, "sender-1", 90);
+    expect(confessions.reopen(row.id, "staff-1").ok).toBe(true);
+    const second = confessions.reopen(row.id, "staff-1");
+    expect(second.ok).toBe(false);
+    expect(eventsOf("confession_reopen")).toBe(1);
+  });
+});
+
+describe("終わった会話から、新しい外向きの送信を始めない", () => {
+  const stuckDraft = (rowId: number, outcome: "failed" | "unknown") => {
+    const draft = confessions.createReplyDraft(rowId, "staff-1", "未確定の返信", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    confessions.finishReplyDraft({
+      draftId: draft.id,
+      generation: confessions.getReplyDraft(draft.id)!.generation,
+      outcome,
+    });
+    return draft.id;
+  };
+
+  // R36a / R36b
+  for (const outcome of ["failed", "unknown"] as const) {
+    it(`${outcome} の返信も、投稿者が終了したあとは送り直せない`, () => {
+      const row = seed("yes");
+      const draftId = stuckDraft(row.id, outcome);
+      confessions.senderCloseAtomic(row.id, "sender-1", 90);
+
+      const before = confessions.getReplyDraft(draftId)!;
+      expect(confessions.claimReplyDraftManualRetry(row.id, draftId, "staff-1")).toBeUndefined();
+      const after = confessions.getReplyDraft(draftId)!;
+      expect(after.outcome).toBe(outcome); // 状態を動かさない
+      expect(after.body).toBe("未確定の返信"); // 本文も消さない
+      expect(after.generation).toBe(before.generation); // 試行も進めない
+      expect(after.executed_by).toBe(before.executed_by);
+      // 「これ以上送らない」だけは通る（未確定のまま埋もれさせない）
+      expect(confessions.resolveReplyDraftManually(row.id, draftId, "staff-1")!.outcome).toBe("resolved_manually");
+    });
+  }
+
+  it("期限切れの自動終了のあとも送り直せない", () => {
+    const row = seed("yes");
+    const draftId = stuckDraft(row.id, "unknown");
+    const first = confessions.createReplyDraft(row.id, "staff-1", "待ちの返信", 90);
+    confessions.claimReplyDraft(first.id, "staff-1", "wait");
+    confessions.finalizeStaffReply({
+      draftId: first.id,
+      generation: confessions.getReplyDraft(first.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+    });
+    const deadline = confessions.get(row.id)!.reply_deadline_at!;
+    expect(confessions.autoCloseExpiredAtomic(row.id, deadline, 90).ok).toBe(true);
+    expect(confessions.claimReplyDraftManualRetry(row.id, draftId, "staff-1")).toBeUndefined();
+  });
+
+  // R36c
+  it("明示的に再オープンすれば、送り直せる", () => {
+    const row = seed("yes");
+    const draftId = stuckDraft(row.id, "unknown");
+    confessions.senderCloseAtomic(row.id, "sender-1", 90);
+    expect(confessions.claimReplyDraftManualRetry(row.id, draftId, "staff-1")).toBeUndefined();
+
+    expect(confessions.reopen(row.id, "staff-1").ok).toBe(true);
+    const claimed = confessions.claimReplyDraftManualRetry(row.id, draftId, "staff-1");
+    expect(claimed?.body).toBe("未確定の返信");
+    expect(claimed?.executed_by).toBe("staff-1");
+  });
+});
+
+describe("置き換わった試行も、届いた1通を宙ぶらりんにしない", () => {
+  // R37（core 側の durable な部分）
+  it("superseded でも、その1通の収束義務は残る（会話は動かさない）", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "行き違った返信", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const stale = confessions.getReplyDraft(draft.id)!.generation;
+    // 回収 → 別の試行が始まる
+    confessions.recoverOrphanedEffects("system:startup", afterLeaseR5());
+    confessions.claimReplyDraftManualRetry(row.id, draft.id, "staff-2");
+
+    const result = confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: stale,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: "dm-1", messageId: "msg-superseded" },
+    });
+    expect(result.transition).toBe("superseded");
+    // 会話は動かない
+    expect(confessions.get(row.id)!.reply_deadline_at).toBeNull();
+    expect(confessions.get(row.id)!.status).not.toBe("closed");
+    expect(eventsOf("confession_reply_wait")).toBe(0);
+
+    // それでも、その1通は直しに行く義務が durable に残る
+    const pending = confessions.listPendingRenders();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]!.message_id).toBe("msg-superseded");
+    expect(pending[0]!.render_kind).toBe("superseded");
+    expect(confessions.obligations(row.id).pendingRenders).toBe(1);
+    // superseded の行は、案件の状態を何も持たない
+    expect(pending[0]!.deadline_at).toBeNull();
+    expect(pending[0]!.closed_by_sender).toBeNull();
+  });
+
+  it("宛先が分からない superseded は、義務を作らない（true unknown）", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const stale = confessions.getReplyDraft(draft.id)!.generation;
+    confessions.recoverOrphanedEffects("system:startup", afterLeaseR5());
+    confessions.claimReplyDraftManualRetry(row.id, draft.id, "staff-2");
+    confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: stale,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: null,
+    });
+    expect(confessions.listPendingRenders()).toEqual([]);
+  });
+});
+
+describe("収束の決着も、取った世代の持ち主だけができる", () => {
+  const queued = () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: confessions.getReplyDraft(draft.id)!.generation,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: "dm-1", messageId: "msg-1" },
+    });
+    return { row, render: confessions.listPendingRenders()[0]! };
+  };
+
+  // R38
+  it("古い renderer の callback は、新しい所有者の実行を書き換えない", () => {
+    const { row, render } = queued();
+    const first = confessions.claimRender(render.id)!;
+    // 所有者が死に、別の実行が引き取る
+    confessions.recoverOrphanedEffects("system:startup", afterLeaseR5());
+    const second = confessions.claimRender(render.id)!;
+    expect(second.generation).toBeGreaterThan(first.generation);
+
+    // ここで、古い実行の結末がようやく帰ってくる
+    const stale = confessions.settleRender({ renderId: render.id, generation: first.generation, state: "settled" });
+    expect(stale.won).toBe(false);
+    expect(confessions.pendingRendersFor(row.id)[0]!.state).toBe("rendering");
+    expect(confessions.obligations(row.id).pendingRenders).toBe(1);
+
+    // 現役の実行だけが決着できる
+    const live = confessions.settleRender({ renderId: render.id, generation: second.generation, state: "settled" });
+    expect(live.won).toBe(true);
+    expect(confessions.pendingRendersFor(row.id)).toEqual([]);
+  });
+
+  it("別インスタンスの実行は、世代が合っていても決着できない", () => {
+    const { row, render } = queued();
+    const other = new Confessions(db, new EventLog(db), "other-instance");
+    const claimed = other.claimRender(render.id)!;
+    // 世代は正しいが、所有者が違う
+    expect(confessions.settleRender({ renderId: render.id, generation: claimed.generation, state: "settled" }).won).toBe(
+      false,
+    );
+    expect(other.settleRender({ renderId: render.id, generation: claimed.generation, state: "settled" }).won).toBe(true);
+    expect(confessions.obligations(row.id).pendingRenders).toBe(0);
+  });
+});
+
+describe("会話を動かした人は、送信の所有権を取った人と一致する", () => {
+  it("所有権を取っていない人の名前では確定できない", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const generation = confessions.getReplyDraft(draft.id)!.generation;
+
+    // 呼び出し側が誤った actor を渡しても、監査の真実は壊れない
+    const wrong = confessions.finalizeStaffReply({ draftId: draft.id, generation, intent: "wait", actorId: "staff-9" });
+    expect(wrong.transition).toBe("superseded");
+    expect(confessions.get(row.id)!.reply_deadline_at).toBeNull();
+    expect(eventsOf("confession_reply_wait")).toBe(0);
+
+    const right = confessions.finalizeStaffReply({ draftId: draft.id, generation, intent: "wait", actorId: "staff-1" });
+    expect(right.transition).toBe("waiting");
+  });
+
+  it("送り直した人の名前でだけ、終了が成立する", () => {
+    const row = seed("yes");
+    const draft = confessions.createReplyDraft(row.id, "staff-1", "本文", 90);
+    confessions.claimReplyDraft(draft.id, "staff-1", "close");
+    confessions.finishReplyDraft({
+      draftId: draft.id,
+      generation: confessions.getReplyDraft(draft.id)!.generation,
+      outcome: "unknown",
+    });
+    confessions.claimReplyDraftManualRetry(row.id, draft.id, "staff-2");
+    const generation = confessions.getReplyDraft(draft.id)!.generation;
+
+    // 下書きを書いた人の名前では、もう確定できない
+    expect(
+      confessions.finalizeStaffReply({ draftId: draft.id, generation, intent: "close", actorId: "staff-1" }).transition,
+    ).toBe("superseded");
+    expect(confessions.get(row.id)!.status).not.toBe("closed");
+
+    expect(
+      confessions.finalizeStaffReply({ draftId: draft.id, generation, intent: "close", actorId: "staff-2" }).transition,
+    ).toBe("closed");
+    expect(confessions.get(row.id)!.closed_by).toBe("staff-2");
   });
 });
