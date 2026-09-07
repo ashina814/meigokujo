@@ -276,6 +276,30 @@ describe("収束は、プロセスをまたいでも同じ1通へ向かう", () 
     return { client, message, newDms };
   }
 
+  /**
+   * 置き換わった試行（superseded）が残した収束義務を作る。
+   * 会話は動いていないが、届いた1通は直しに行かなければならない。
+   */
+  function seedSupersededRender(ctx: ReturnType<typeof boot>) {
+    const row = ctx.confessions.create("sender-1", { type: "soudan", replyWish: "yes", body: "本文" });
+    ctx.confessions.claim(row.id, "thread-1", "staff-1");
+    const draft = ctx.confessions.createReplyDraft(row.id, "staff-1", "届いている本文", 90);
+    ctx.confessions.claimReplyDraft(draft.id, "staff-1", "wait");
+    const stale = ctx.confessions.getReplyDraft(draft.id)!.generation;
+    // 回収されて、別の試行が現役になる
+    ctx.confessions.recoverOrphanedEffects("system:startup", Math.floor(Date.now() / 1000) + 100000);
+    ctx.confessions.claimReplyDraftManualRetry(row.id, draft.id, "staff-2");
+    const result = ctx.confessions.finalizeStaffReply({
+      draftId: draft.id,
+      generation: stale,
+      intent: "wait",
+      actorId: "staff-1",
+      renderTarget: { channelId: DM_CH, messageId: MSG },
+    });
+    expect(result.transition).toBe("superseded");
+    return { confessionId: row.id, render: ctx.confessions.listPendingRenders()[0]! };
+  }
+
   /** 返信が届いて「返答待ち」で確定した直後の状態（収束はまだ）を作る */
   function seedPendingRender(ctx: ReturnType<typeof boot>) {
     const row = ctx.confessions.create("sender-1", { type: "soudan", replyWish: "yes", body: "本文" });
@@ -347,6 +371,31 @@ describe("収束は、プロセスをまたいでも同じ1通へ向かう", () 
     });
     expect(live.won).toBe(true);
     expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+  });
+
+  it("行き違った1通も、プロセスをまたいで同じメッセージへ収束する", async () => {
+    // ── A が superseded の義務を積んだところで消える ──
+    const a = boot("instance-A");
+    const { confessionId, render } = seedSupersededRender(a);
+    expect(render.render_kind).toBe("superseded");
+    a.confessions.claimRender(render.id);
+
+    // ── 再起動 ──
+    const b = boot("instance-B");
+    killPreviousInstances(b.db, "instance-B");
+    expect(b.confessions.recoverOrphanedEffects("system:startup").renders).toBe(1);
+
+    const world = dmWorld();
+    expect(await convergePendingRenders(world.client as never, b.services)).toBe(1);
+    expect(world.newDms).toEqual([]); // 新しい DM は出ない
+    const edited = JSON.stringify(world.message.edited);
+    expect(edited).toContain("送信処理が別の試行と行き違いました");
+    // 会話の状態は推測しない
+    expect(edited).not.toContain("自動で終了します");
+    expect(edited).not.toContain("このやり取りはここで終了しました");
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+    // 会話そのものは、この試行では動いていない
+    expect(b.confessions.get(confessionId)!.status).not.toBe("closed");
   });
 
   it("A が生きているうちは、B は収束を奪わない", () => {
