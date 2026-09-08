@@ -1287,7 +1287,7 @@ export class Confessions {
         `UPDATE confession_tickets
          SET status='closed', closed_at=?, close_reason='poster_ended', closed_by=?, closed_side='sender',
              reply_deadline_at=NULL, body_purge_at=COALESCE(body_purge_at, ?)
-         WHERE id=? AND user_id=?`,
+         WHERE id=? AND user_id=? AND status<>'closed'`,
       )
       .run(ts, senderId, purgeAt, id, senderId);
     const row = this.get(id);
