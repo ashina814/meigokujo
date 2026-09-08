@@ -835,6 +835,78 @@ describe("編集の前に痕跡を残すから、その隙間で落ちても直�
     expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
   });
 
+  it("痕跡は、編集を始める**前**に存在している", async () => {
+    // **これが順序の要。** 編集のあとに痕跡を書く実装だと、編集が着地したあと
+    // 決着を書く前に落ちたときに、DB には何も残らない。実際の収束経路を通し、
+    // 「編集の途中」で止めた時点で試行が既に durable であることを見る。
+    const a = boot("instance-A");
+    const { confessionId } = seedWaiting(a);
+    const world = dmWorld();
+
+    const gate = world.holdEdit();
+    const converging = convergePendingRenders(world.client as never, a.services);
+    await gate.entered;
+
+    // まだ編集は返ってきていない。それでも痕跡はある
+    const open = a.confessions.listOpenRenderAttempts();
+    expect(open).toHaveLength(1);
+    expect(open[0]!.confession_id).toBe(confessionId);
+    expect(open[0]!.channel_id).toBe(DM_CH);
+    expect(open[0]!.message_id).toBe(MSG);
+    expect(open[0]!.owner_instance).toBe("instance-A");
+    expect(open[0]!.progress).toBe("sending");
+
+    gate.release();
+    await converging;
+    // 決着まで進めば、試行は片付く
+    expect(a.confessions.listOpenRenderAttempts()).toEqual([]);
+  });
+
+  it("新しい世代の決着は、古い試行の「外を触ったかもしれない」を消さない", async () => {
+    const a = boot("instance-A");
+    const { confessionId, renderId } = seedWaiting(a);
+    // ── A: 触る痕跡だけ残して落ちる ──
+    const { attemptId } = aTouchesOutsideThenDies(a, confessionId, renderId);
+
+    // ── B: 同じ収束の行を引き取り、自分の試行で正しく決着させる ──
+    a.db.prepare("UPDATE confession_pending_renders SET state='pending' WHERE id=?").run(renderId);
+    const b = boot("instance-B");
+    const claimedByB = b.confessions.claimRender(renderId)!;
+    const attemptB = b.confessions.beginRenderAttempt({
+      renderId,
+      confessionId,
+      generation: claimedByB.generation,
+      channelId: DM_CH,
+      messageId: MSG,
+    });
+    const settled = b.confessions.finishRenderAttempt({
+      attemptId: attemptB,
+      renderId,
+      generation: claimedByB.generation,
+      outcome: "delivered",
+    });
+    expect(settled.won).toBe(true);
+
+    // **A の試行は片付いていない。** 同じ行の決着に巻き込んで消してはいけない
+    const stillOpen = b.confessions.listOpenRenderAttempts();
+    expect(stillOpen).toHaveLength(1);
+    expect(stillOpen[0]!.id).toBe(attemptId);
+
+    // だから回収がそれを見つけ、同じメッセージへの収束義務へ寄せられる
+    killPreviousInstances(b.db, "instance-B");
+    const recovered = b.confessions.recoverOrphanedEffects(
+      "system:sweep",
+      Math.floor(Date.now() / 1000) + CONFESSION_INSTANCE_LEASE_SECONDS + 1,
+    );
+    expect(recovered.renderAttempts).toBe(1);
+    expect(b.confessions.pendingRendersFor(confessionId).length).toBeGreaterThan(0);
+
+    const world = dmWorld();
+    expect(await convergePendingRenders(world.client as never, b.services)).toBeGreaterThan(0);
+    expect(world.newDms).toEqual([]);
+    expect(b.confessions.obligations(confessionId).pendingRenders).toBe(0);
+  });
+
   // R52
   it("決着と修復のあいだに隙間は無い（同じトランザクションで書く）", () => {
     const a = boot("instance-A");
