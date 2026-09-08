@@ -762,7 +762,13 @@ describe("プロセスが落ちても、送信中が永遠に残らない", () =
     settleFollow(f.followUpId, "delivered");
 
     const after = restart();
-    expect(after.recoverOrphanedEffects("system:startup", afterLease())).toEqual({ ackAttempts: 0, replyDrafts: 0, followUps: 0, renders: 0 });
+    expect(after.recoverOrphanedEffects("system:startup", afterLease())).toEqual({
+      ackAttempts: 0,
+      replyDrafts: 0,
+      followUps: 0,
+      renders: 0,
+      renderAttempts: 0,
+    });
     expect(after.getFollowUp(f.followUpId)!.outcome).toBe("delivered");
   });
 });

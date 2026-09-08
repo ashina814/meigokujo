@@ -386,6 +386,29 @@ export interface OrphanRecovery {
   readonly followUps: number;
   /** 収束の途中で放置された表示（`rendering` のまま残ったもの） */
   readonly renders: number;
+  /** 結末を誰も見届けなかった外部編集の試行（修復へ寄せたもの） */
+  readonly renderAttempts: number;
+}
+
+/**
+ * Discord のメッセージを外から書き換える試行。**編集の前に durable に置く。**
+ *
+ * `progress`:
+ * - `sending`   … これから触る／触っている最中（誰も結末を見届けていない）
+ * - `delivered` / `failed` / `unknown` … 決着に負けた試行の外部結末（監査用に残す）
+ * - `resolved`  … 決着に勝ち、その世代の収束として片付いた
+ */
+export interface RenderAttemptRow {
+  id: number;
+  render_id: number;
+  confession_id: number;
+  generation: number;
+  owner_instance: string | null;
+  channel_id: string;
+  message_id: string;
+  progress: string;
+  started_at: number;
+  finished_at: number | null;
 }
 
 /** 担当者の自由返信の下書き。Discord へ送る前に必ずここへ置き、行の消費で二重送信を防ぐ */
@@ -559,6 +582,19 @@ export class Confessions {
         created_at      INTEGER NOT NULL,
         settled_at      INTEGER
       );
+      CREATE TABLE IF NOT EXISTS confession_render_attempts (
+        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+        render_id      INTEGER NOT NULL,
+        confession_id  INTEGER NOT NULL,
+        generation     INTEGER NOT NULL,
+        owner_instance TEXT,
+        channel_id     TEXT NOT NULL,
+        message_id     TEXT NOT NULL,
+        progress       TEXT NOT NULL,
+        started_at     INTEGER NOT NULL,
+        finished_at    INTEGER
+      );
+      CREATE INDEX IF NOT EXISTS idx_confession_render_attempt_open ON confession_render_attempts(progress, id);
       CREATE INDEX IF NOT EXISTS idx_confession_render_open ON confession_pending_renders(state, id);
       CREATE INDEX IF NOT EXISTS idx_confession_render_case ON confession_pending_renders(confession_id, state);
     `);
@@ -1548,6 +1584,95 @@ export class Confessions {
   }
 
   /**
+   * **Discord を触る前に、触ろうとしていることを DB へ残す。**
+   *
+   * 収束の決着（世代・所有者の門）は正しいが、それは編集の**あと**に書かれる。
+   * 編集が着地したあと、決着を書く前にプロセスが死ぬと、DB には「外を触ったかも
+   * しれない」という痕跡が何も残らない——新しい世代が settled を書いていれば、
+   * 誰も修復の必要性を知れないまま、投稿者の画面だけが古い姿で固まる。
+   *
+   * だから外部送信の試行そのものを、**編集の前に** durable な行として置く。
+   * 落ちた場合はこの行が `sending` のまま残り、貸出の切れた所有者の置き土産として
+   * 回収され、同じメッセージへの収束（冪等な編集）へ寄せられる。
+   */
+  beginRenderAttempt(input: {
+    renderId: number;
+    confessionId: number;
+    generation: number;
+    channelId: string;
+    messageId: string;
+    atTs?: number;
+  }): number {
+    const info = this.db
+      .prepare(
+        `INSERT INTO confession_render_attempts
+           (render_id, confession_id, generation, owner_instance, channel_id, message_id, progress, started_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'sending', ?)`,
+      )
+      .run(
+        input.renderId,
+        input.confessionId,
+        input.generation,
+        this.instanceId,
+        input.channelId,
+        input.messageId,
+        input.atTs ?? now(),
+      );
+    return Number(info.lastInsertRowid);
+  }
+
+  /**
+   * 外部編集の結末と、収束の決着と、必要なら修復の義務を**1つのトランザクション**で書く。
+   *
+   * 分けて書くと「決着には負けたが、修復を積む前に落ちた」という隙間ができる——
+   * まさに durable にしたかったところに穴が残る。ここで全部を一度に確定させるので、
+   * その隙間は構造として存在しない。
+   */
+  finishRenderAttempt(input: {
+    attemptId: number;
+    renderId: number;
+    generation: number;
+    outcome: DeliveryOutcome;
+  }): { won: boolean; state: string | undefined; repairId: number | null; row: PendingRenderRow | undefined } {
+    const ts = now();
+    let repairId: number | null = null;
+    const apply = this.db.transaction(() => {
+      const settled = this.settleRender({
+        renderId: input.renderId,
+        generation: input.generation,
+        state: input.outcome === "delivered" ? "settled" : "failed",
+      });
+      const attempt = this.db
+        .prepare("SELECT * FROM confession_render_attempts WHERE id=?")
+        .get(input.attemptId) as RenderAttemptRow | undefined;
+      if (!settled.won && attempt && input.outcome !== "failed") {
+        // 決着には負けたが、外は触ったかもしれない（`failed` だけは触っていないと確定）。
+        // 同じメッセージをいまの姿へ収束させ直す義務を、同じ境界で残す。
+        repairId = this.queueRenderRepair({
+          confessionId: attempt.confession_id,
+          channelId: attempt.channel_id,
+          messageId: attempt.message_id,
+          atTs: ts,
+        });
+      }
+      // 試行としては決着済み。結末そのものは監査のために残す
+      this.db
+        .prepare("UPDATE confession_render_attempts SET progress=?, finished_at=? WHERE id=? AND progress='sending'")
+        .run(settled.won ? "resolved" : input.outcome, ts, input.attemptId);
+      return settled;
+    });
+    const settled = apply();
+    return { won: settled.won, state: settled.state, repairId, row: settled.row };
+  }
+
+  /** 決着していない外部編集の試行（落ちた所有者の置き土産） */
+  listOpenRenderAttempts(): RenderAttemptRow[] {
+    return this.db
+      .prepare("SELECT * FROM confession_render_attempts WHERE progress='sending' ORDER BY id")
+      .all() as RenderAttemptRow[];
+  }
+
+  /**
    * **古い実行が、外の1通を書き換えてしまったかもしれないときの修復。**
    *
    * DB の門（世代・所有者）は決着を守るが、**Discord への編集は門より前に起きている。**
@@ -1568,6 +1693,15 @@ export class Confessions {
     channelId: string;
     messageId: string;
     atTs?: number;
+    /**
+     * 重複防止を外す。**結末を誰も見届けていない試行の回収でだけ使う。**
+     *
+     * その場合、外の編集が「まだ実行していない指示」の収束より先に着地したのか
+     * 後だったのかを知る手立てが無い。先に置かれた指示が正しい姿を書いても、
+     * そのあとに着地されれば元の木阿弥なので、必ず1つ後ろに義務を積む。
+     * 同じメッセージへの編集は冪等なので、余分に1回直すだけで済む。
+     */
+    force?: boolean;
   }): number | null {
     const ts = input.atTs ?? now();
     const info = this.db
@@ -1575,7 +1709,7 @@ export class Confessions {
         `INSERT INTO confession_pending_renders
            (confession_id, draft_id, channel_id, message_id, render_kind, state, created_at)
          SELECT ?, NULL, ?, ?, 'current_state', 'pending', ?
-         WHERE NOT EXISTS (
+         WHERE ? = 1 OR NOT EXISTS (
            SELECT 1 FROM confession_pending_renders r
            WHERE r.confession_id=? AND r.channel_id=? AND r.message_id=? AND r.state IN ('pending','failed')
          )`,
@@ -1585,6 +1719,7 @@ export class Confessions {
         input.channelId,
         input.messageId,
         ts,
+        input.force ? 1 : 0,
         input.confessionId,
         input.channelId,
         input.messageId,
@@ -1780,10 +1915,30 @@ export class Confessions {
       const renders = this.db
         .prepare(`UPDATE confession_pending_renders SET state='pending' WHERE state='rendering'${notLive}`)
         .run(...live).changes;
-      return { ackAttempts, replyDrafts, followUps, renders };
+      // **編集の結末を誰も見届けなかった試行。**
+      // 届いたかどうかは分からない（`delivered` とも `failed` とも書かない）。
+      // だが同じメッセージへの収束は冪等なので、修復の義務へ寄せてよい。
+      // 上で `pending` へ戻した行が同じメッセージを持っていれば、修復は積まれない
+      // （その行がこれから正しい姿を書く）。
+      const orphanAttempts = this.db
+        .prepare(`SELECT * FROM confession_render_attempts WHERE progress='sending'${notLive}`)
+        .all(...live) as RenderAttemptRow[];
+      for (const attempt of orphanAttempts) {
+        this.queueRenderRepair({
+          confessionId: attempt.confession_id,
+          channelId: attempt.channel_id,
+          messageId: attempt.message_id,
+          atTs: ts,
+          force: true,
+        });
+        this.db
+          .prepare("UPDATE confession_render_attempts SET progress='unknown', finished_at=? WHERE id=?")
+          .run(ts, attempt.id);
+      }
+      return { ackAttempts, replyDrafts, followUps, renders, renderAttempts: orphanAttempts.length };
     });
     const result = run();
-    if (result.ackAttempts + result.replyDrafts + result.followUps + result.renders > 0) {
+    if (result.ackAttempts + result.replyDrafts + result.followUps + result.renders + result.renderAttempts > 0) {
       this.events.log("confession_orphan_recovered", { actor, payload: { ...result } });
     }
     return result;

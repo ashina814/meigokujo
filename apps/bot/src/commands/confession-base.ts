@@ -1064,31 +1064,33 @@ async function renderClaimed(
           : desired.kind === "reply_closed"
             ? { kind: "closed_by_staff", body: "" }
             : { kind: "reply_after_close", body: "", closedBySender: desired.closedBySender };
+    // **Discord を触る前に、触ろうとしていることを DB へ残す。**
+    // 編集が着地したあと決着を書く前に落ちると、DB には痕跡が何も残らない——
+    // 新しい世代が settled を書いていれば、誰も修復の必要性を知れなくなる。
+    const attemptId = services.confessions.beginRenderAttempt({
+      renderId: claimed.id,
+      confessionId: claimed.confession_id,
+      generation: claimed.generation,
+      channelId: claimed.channel_id,
+      messageId: claimed.message_id,
+    });
     // 本文は元のメッセージに残っている。ここでは「どの結末へ収束させるか」だけを渡し、
     // 本文は取り直した現物から拾う（本文をDBに持ち続けないための形）。
     const outcome = await editDmMessage(client, claimed.channel_id, claimed.message_id, claimed.confession_id, notice);
     // 決着は**取った世代**で。貸出が切れて別インスタンスが引き取ったあとに
     // この callback が帰ってきても、進行中の実行を書き換えない。
-    const settleResult = services.confessions.settleRender({
+    // 試行の決着・収束の決着・（負けた場合の）修復の義務は**同じトランザクション**。
+    const settleResult = services.confessions.finishRenderAttempt({
+      attemptId,
       renderId: claimed.id,
       generation: claimed.generation,
-      state: outcome === "delivered" ? "settled" : "failed",
+      outcome,
     });
     if (!settleResult.won) {
       // **決着には負けた。だが外は既に触っているかもしれない。**
-      // DB の門は settle を守るが、Discord への編集はその前に起きている。
-      // 新しい所有者が書いた最終形の上へ、この古い編集が後から着地すると、
-      // 投稿者の画面だけが古い姿へ戻る。`failed`（Discord が明確に拒否＝
-      // 外は変わっていない）以外は、同じメッセージをいまの案件へ収束させ直す
-      // 義務を durable に残す。新しい DM は送らない。
-      if (outcome !== "failed") {
-        services.confessions.queueRenderRepair({
-          confessionId: claimed.confession_id,
-          channelId: claimed.channel_id,
-          messageId: claimed.message_id,
-        });
-        await refreshPanel(client, services, claimed.confession_id);
-      }
+      // その修復の義務は core が同じトランザクションで置いている（`repairId`）。
+      // ここでするのは、担当者の画面を現状へ合わせることだけ。
+      if (settleResult.repairId !== null) await refreshPanel(client, services, claimed.confession_id);
       return "skipped";
     }
     // **同じ失敗を毎分スレッドへ積まない。** 自動で直せないと確定した1度だけ残す。
