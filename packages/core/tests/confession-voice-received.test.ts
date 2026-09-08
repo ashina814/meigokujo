@@ -13,7 +13,9 @@ describe("トートの耳・受領確認クローズ", () => {
       body: "返信は不要ですが、伝えておきたいことです。",
     });
 
-    const closed = confessions.close(row.id, "staff", "voice_received", 7);
+    const result = confessions.close(row.id, "staff", "voice_received", 7);
+    expect(result.ok).toBe(true);
+    const closed = confessions.get(row.id);
 
     expect(closed?.status).toBe("closed");
     expect(closed?.close_reason).toBe("voice_received");

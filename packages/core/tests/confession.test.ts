@@ -42,7 +42,9 @@ describe("Confessions", () => {
 
   it("claim でスレッドを紐付け、byThread で引ける", () => {
     const row = ctx.confessions.create("user:carol", { type: "soudan" });
-    const claimed = ctx.confessions.claim(row.id, "thread:123", "user:staff");
+    const result = ctx.confessions.claim(row.id, "thread:123", "user:staff");
+    expect(result.ok).toBe(true);
+    const claimed = ctx.confessions.get(row.id);
     expect(claimed?.status).toBe("claimed");
     expect(claimed?.thread_id).toBe("thread:123");
     expect(claimed?.claimed_by).toBe("user:staff");
@@ -53,7 +55,9 @@ describe("Confessions", () => {
 
   it("close で終結し、closed_at が入る", () => {
     const row = ctx.confessions.create("user:dave");
-    const closed = ctx.confessions.close(row.id, "user:staff");
+    const result = ctx.confessions.close(row.id, "user:staff");
+    expect(result.ok).toBe(true);
+    const closed = ctx.confessions.get(row.id);
     expect(closed?.status).toBe("closed");
     expect(closed?.closed_at).not.toBeNull();
   });
@@ -92,14 +96,17 @@ describe("Confessions", () => {
   it("クローズは理由・担当者・purge予定を記録し、reopenで戻せる", () => {
     const row = ctx.confessions.create("user:a", { body: "秘密" });
     ctx.confessions.claim(row.id, "thread:1", "user:staff");
-    const closed = ctx.confessions.close(row.id, "user:staff", "resolved", 90);
+    const result = ctx.confessions.close(row.id, "user:staff", "resolved", 90);
+    expect(result.ok).toBe(true);
+    const closed = ctx.confessions.get(row.id);
     expect(closed?.status).toBe("closed");
     expect(closed?.close_reason).toBe("resolved");
     expect(closed?.closed_by).toBe("user:staff");
     expect(closed?.body_purge_at).toBeGreaterThan(closed!.closed_at!);
     const re = ctx.confessions.reopen(row.id, "user:staff");
-    expect(re?.status).toBe("claimed");
-    expect(re?.close_reason).toBeNull();
+    expect(re.ok).toBe(true);
+    expect(ctx.confessions.get(row.id)?.status).toBe("claimed");
+    expect(ctx.confessions.get(row.id)?.close_reason).toBeNull();
   });
 
   it("本文purge: 本文だけNULL化しメタは残る。listPurgeable/extendRetention", () => {
