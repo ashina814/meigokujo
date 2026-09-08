@@ -938,6 +938,34 @@ describe("編集の前に痕跡を残すから、その隙間で落ちても直�
     );
   });
 
+  it("結末が分からない callback も、決着に負けたら修復を残す", () => {
+    // **「届いた」ときだけ直す、では足りない。** 応答が得られなかった編集は、
+    // 着地したかもしれない。触っていないと確定しているのは `failed` だけ。
+    const a = boot("instance-A");
+    const { confessionId, renderId } = seedWaiting(a);
+    const { generation, attemptId } = aTouchesOutsideThenDies(a, confessionId, renderId);
+
+    a.db.prepare("UPDATE confession_pending_renders SET state='pending' WHERE id=?").run(renderId);
+    const b = boot("instance-B");
+    const claimedByB = b.confessions.claimRender(renderId)!;
+    b.confessions.settleRender({ renderId, generation: claimedByB.generation, state: "settled" });
+    expect(b.confessions.pendingRendersFor(confessionId)).toEqual([]);
+
+    const result = a.confessions.finishRenderAttempt({
+      attemptId,
+      renderId,
+      generation,
+      outcome: "unknown",
+    });
+    expect(result.won).toBe(false);
+    expect(result.repairId).not.toBeNull();
+    expect(a.confessions.pendingRendersFor(confessionId)).toHaveLength(1);
+    // 届いたことにはしない
+    expect(a.db.prepare("SELECT progress FROM confession_render_attempts WHERE id=?").pluck().get(attemptId)).toBe(
+      "unknown",
+    );
+  });
+
   // R53
   it("確定拒否なら修復を作らないが、書けずに落ちたなら不明として修復へ寄せる", () => {
     // (a) 確定拒否まで書けた
